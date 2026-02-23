@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "access": {
+      "type": "stdio",
+      "command": "python",
+      "args": [
+        "C:\\ruta\\a\\access_mcp_server.py"
+      ],
+      "env": {}
+    }
+  }
+}
