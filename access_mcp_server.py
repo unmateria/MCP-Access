@@ -61,6 +61,12 @@ AC_TYPE: dict[str, int] = {
 }
 
 # ---------------------------------------------------------------------------
+# Caches para reducir COM calls en sesiones largas
+# ---------------------------------------------------------------------------
+_vbe_code_cache: dict = {}        # "type:name" → texto completo del módulo VBE
+_parsed_controls_cache: dict = {} # "form:name" / "report:name" → resultado _parse_controls()
+
+# ---------------------------------------------------------------------------
 # Sesion COM — singleton, mantiene Access vivo entre llamadas
 # ---------------------------------------------------------------------------
 class _Session:
@@ -70,6 +76,7 @@ class _Session:
     """
     _app: Optional[Any] = None
     _db_open: Optional[str] = None
+    _cm_cache: dict = {}   # "type:name" → CodeModule COM object
 
     @classmethod
     def connect(cls, db_path: str) -> Any:
@@ -106,6 +113,10 @@ class _Session:
         log.info("Abriendo BD: %s", path)
         cls._app.OpenCurrentDatabase(path)
         cls._db_open = path
+        # Limpiar caches al cambiar de BD
+        cls._cm_cache.clear()
+        _vbe_code_cache.clear()
+        _parsed_controls_cache.clear()
         log.info("BD abierta OK")
 
     @classmethod
@@ -122,6 +133,9 @@ class _Session:
             finally:
                 cls._app = None
                 cls._db_open = None
+                cls._cm_cache.clear()
+                _vbe_code_cache.clear()
+                _parsed_controls_cache.clear()
 
 
 atexit.register(_Session.quit)
@@ -313,6 +327,7 @@ _VBE_PREFIX: dict[str, str] = {
 def _get_code_module(app: Any, object_type: str, object_name: str) -> Any:
     """
     Devuelve el CodeModule VBE del componente indicado.
+    Cachea el objeto COM para evitar 3 calls en cadena en cada tool VBE.
     Requiere 'Confiar en el acceso al modelo de objetos de proyectos VBA'
     habilitado en las opciones de confianza de Access.
     """
@@ -320,17 +335,35 @@ def _get_code_module(app: Any, object_type: str, object_name: str) -> Any:
         raise ValueError(
             f"object_type '{object_type}' no soporta VBE. Usa 'module', 'form' o 'report'."
         )
+    cache_key = f"{object_type}:{object_name}"
+    cm = _Session._cm_cache.get(cache_key)
+    if cm is not None:
+        return cm
     component_name = _VBE_PREFIX[object_type] + object_name
     try:
         project = app.VBE.VBProjects(1)
         component = project.VBComponents(component_name)
-        return component.CodeModule
+        cm = component.CodeModule
+        _Session._cm_cache[cache_key] = cm
+        return cm
     except Exception as exc:
         raise RuntimeError(
             f"No se pudo acceder al CodeModule '{component_name}'. "
             f"¿Está habilitado 'Confiar en el acceso al modelo de objetos de proyectos VBA' "
             f"en las opciones de confianza de Access?\nError: {exc}"
         )
+
+
+def _cm_all_code(cm: Any, cache_key: str) -> str:
+    """
+    Devuelve el texto completo de un CodeModule usando _vbe_code_cache.
+    En una sesión con múltiples tools sobre el mismo módulo, la lectura COM
+    completa (cm.Lines) se hace una sola vez; las siguientes llamadas usan el cache.
+    """
+    if cache_key not in _vbe_code_cache:
+        total = cm.CountOfLines
+        _vbe_code_cache[cache_key] = cm.Lines(1, total) if total > 0 else ""
+    return _vbe_code_cache[cache_key]
 
 
 def ac_vbe_get_lines(
@@ -340,11 +373,14 @@ def ac_vbe_get_lines(
     """Lee un rango de líneas sin exportar el módulo entero."""
     app = _Session.connect(db_path)
     cm = _get_code_module(app, object_type, object_name)
-    total = cm.CountOfLines
+    cache_key = f"{object_type}:{object_name}"
+    all_code = _cm_all_code(cm, cache_key)
+    all_lines = all_code.splitlines()
+    total = len(all_lines)
     if start_line < 1 or start_line > total:
         raise ValueError(f"start_line {start_line} fuera de rango (1-{total})")
     actual = min(count, total - start_line + 1)
-    return cm.Lines(start_line, actual)
+    return "\n".join(all_lines[start_line - 1 : start_line - 1 + actual])
 
 
 def ac_vbe_get_proc(
@@ -358,14 +394,17 @@ def ac_vbe_get_proc(
     app = _Session.connect(db_path)
     cm = _get_code_module(app, object_type, object_name)
     try:
-        start = cm.ProcStartLine(proc_name, 0)   # 0 = vbext_pk_Proc
+        start = cm.ProcStartLine(proc_name, 0)   # 0 = vbext_pk_Proc (COM call — rápido)
         body  = cm.ProcBodyLine(proc_name, 0)
         count = cm.ProcCountLines(proc_name, 0)
     except Exception as exc:
         raise RuntimeError(
             f"Procedimiento '{proc_name}' no encontrado en '{object_name}': {exc}"
         )
-    code = cm.Lines(start, count)
+    # Extraer el texto desde el cache en vez de un cm.Lines adicional
+    cache_key = f"{object_type}:{object_name}"
+    all_lines = _cm_all_code(cm, cache_key).splitlines()
+    code = "\n".join(all_lines[start - 1 : start - 1 + count])
     return {
         "proc_name":  proc_name,
         "start_line": start,
@@ -384,12 +423,14 @@ def ac_vbe_module_info(
     """
     app = _Session.connect(db_path)
     cm = _get_code_module(app, object_type, object_name)
-    total = cm.CountOfLines
+    cache_key = f"{object_type}:{object_name}"
+    all_code = _cm_all_code(cm, cache_key)
+    all_lines = all_code.splitlines()
+    total = len(all_lines)
     procs: list[dict] = []
     if total > 0:
-        all_code = cm.Lines(1, total)
         seen: set[str] = set()
-        for i, raw_line in enumerate(all_code.splitlines(), start=1):
+        for i, raw_line in enumerate(all_lines, start=1):
             m = re.match(
                 r'^(?:Public\s+|Private\s+|Friend\s+)?'
                 r'(?:Function|Sub|Property\s+(?:Get|Let|Set))\s+(\w+)',
@@ -419,6 +460,7 @@ def ac_vbe_replace_lines(
     - count=0 → inserción pura (no borra nada).
     - new_code='' → borrado puro (no inserta nada).
     new_code puede ser multilínea (\\n o \\r\\n).
+    Devuelve el estado + preview del código insertado para evitar un get_proc adicional.
     """
     app = _Session.connect(db_path)
     cm = _get_code_module(app, object_type, object_name)
@@ -430,11 +472,22 @@ def ac_vbe_replace_lines(
         normalized = new_code.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
         cm.InsertLines(start_line, normalized)
         inserted = len(new_code.splitlines())
+    # Invalidar cache de texto (el módulo cambió)
+    cache_key = f"{object_type}:{object_name}"
+    _vbe_code_cache.pop(cache_key, None)
     end = start_line + count - 1 if count > 0 else start_line
-    return (
+    status = (
         f"OK: líneas {start_line}–{end} reemplazadas "
         f"({count} eliminadas, {inserted} insertadas)"
     )
+    if new_code:
+        lines = new_code.splitlines()
+        preview = (
+            new_code if len(lines) <= 60
+            else "\n".join(lines[:60]) + f"\n[... +{len(lines) - 60} líneas]"
+        )
+        return f"{status}\n\n{preview}"
+    return status
 
 
 def ac_vbe_find(
@@ -443,14 +496,14 @@ def ac_vbe_find(
 ) -> dict:
     """
     Busca texto en un módulo y devuelve todas las líneas que coinciden.
-    Una sola llamada COM para leer el módulo; la búsqueda se hace en Python.
+    Usa _vbe_code_cache para evitar releer el módulo si ya fue leído.
     """
     app = _Session.connect(db_path)
     cm = _get_code_module(app, object_type, object_name)
-    total = cm.CountOfLines
-    if total == 0:
+    cache_key = f"{object_type}:{object_name}"
+    all_code = _cm_all_code(cm, cache_key)
+    if not all_code:
         return {"found": False, "match_count": 0, "matches": []}
-    all_code = cm.Lines(1, total)
     needle = search_text if match_case else search_text.lower()
     matches: list[dict] = []
     for i, raw_line in enumerate(all_code.splitlines(), start=1):
@@ -612,6 +665,18 @@ def _parse_controls(form_text: str) -> dict:
     return result
 
 
+def _get_parsed_controls(db_path: str, object_type: str, object_name: str) -> dict:
+    """
+    Devuelve el resultado de _parse_controls usando _parsed_controls_cache.
+    Si no está en cache, exporta y parsea (y guarda en cache para futuras llamadas).
+    """
+    cache_key = f"{object_type}:{object_name}"
+    if cache_key not in _parsed_controls_cache:
+        text = ac_get_code(db_path, object_type, object_name)
+        _parsed_controls_cache[cache_key] = _parse_controls(text)
+    return _parsed_controls_cache[cache_key]
+
+
 def ac_list_controls(db_path: str, object_type: str, object_name: str) -> dict:
     """
     Lista todos los controles directos de un formulario o informe con sus
@@ -620,8 +685,7 @@ def ac_list_controls(db_path: str, object_type: str, object_name: str) -> dict:
     """
     if object_type not in ("form", "report"):
         raise ValueError("ac_list_controls solo admite object_type 'form' o 'report'")
-    text = ac_get_code(db_path, object_type, object_name)
-    parsed = _parse_controls(text)
+    parsed = _get_parsed_controls(db_path, object_type, object_name)
     return {
         "count": len(parsed["controls"]),
         "controls": [
@@ -640,8 +704,7 @@ def ac_get_control(
     """
     if object_type not in ("form", "report"):
         raise ValueError("ac_get_control solo admite object_type 'form' o 'report'")
-    text = ac_get_code(db_path, object_type, object_name)
-    parsed = _parse_controls(text)
+    parsed = _get_parsed_controls(db_path, object_type, object_name)
     for c in parsed["controls"]:
         if c["name"].lower() == control_name.lower():
             return c
@@ -925,6 +988,11 @@ def ac_set_code(db_path: str, object_type: str, name: str, code: str) -> str:
     try:
         _write_tmp(tmp, code, encoding="utf-16")
         app.LoadFromText(AC_TYPE[object_type], name, tmp)
+        # Invalidar caches para este objeto (el código y los controles cambiaron)
+        cache_key = f"{object_type}:{name}"
+        _vbe_code_cache.pop(cache_key, None)
+        _Session._cm_cache.pop(cache_key, None)
+        _parsed_controls_cache.pop(cache_key, None)
         return f"OK: '{name}' ({object_type}) importado correctamente en {db_path}"
     finally:
         try:
@@ -985,11 +1053,15 @@ def ac_export_structure(db_path: str, output_path: Optional[str] = None) -> str:
     )
 
     # ── Módulos VBA con firmas ───────────────────────────────────────────────
+    # Leer módulos vía VBE (sin SaveAsText/disco) y calentando el cache de código
+    app = _Session.connect(db_path)
     lines.append(f"## Módulos VBA ({len(modules)})\n")
     for mod_name in modules:
         lines.append(f"### `{mod_name}`")
         try:
-            code = ac_get_code(db_path, "module", mod_name)
+            cm = _get_code_module(app, "module", mod_name)
+            cache_key = f"module:{mod_name}"
+            code = _cm_all_code(cm, cache_key)
             sigs = []
             for line in code.splitlines():
                 stripped = line.strip()
@@ -998,7 +1070,6 @@ def ac_export_structure(db_path: str, output_path: Optional[str] = None) -> str:
                     stripped,
                     re.IGNORECASE,
                 ):
-                    # Limpiar: quitar Attribute lines y quedarse solo con la firma
                     sigs.append(f"  - `{stripped}`")
             if sigs:
                 lines.extend(sigs)
