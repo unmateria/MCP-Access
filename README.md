@@ -1,4 +1,7 @@
-# mcp-access
+![mcpAccess](https://github.com/user-attachments/assets/9fad6eb6-2806-43dd-8fe6-73ea645d56aa)
+
+
+# MCP-Access
 
 MCP server for reading and editing Microsoft Access databases (`.accdb` / `.mdb`) via COM automation.
 
