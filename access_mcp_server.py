@@ -31,6 +31,7 @@ import os
 import re
 import sys
 import tempfile
+import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -442,9 +443,12 @@ def ac_vbe_module_info(
                     continue
                 seen.add(pname)
                 try:
+                    pstart = cm.ProcStartLine(pname, 0)
                     body   = cm.ProcBodyLine(pname, 0)
                     pcount = cm.ProcCountLines(pname, 0)
-                    procs.append({"name": pname, "start_line": i,
+                    # Clamp count para no exceder total_lines
+                    pcount = min(pcount, total - pstart + 1)
+                    procs.append({"name": pname, "start_line": pstart,
                                   "body_line": body, "count": pcount})
                 except Exception:
                     procs.append({"name": pname, "start_line": i})
@@ -464,7 +468,18 @@ def ac_vbe_replace_lines(
     """
     app = _Session.connect(db_path)
     cm = _get_code_module(app, object_type, object_name)
+    total = cm.CountOfLines
+    # Validar límites
+    if start_line < 1 or start_line > total + 1:
+        raise ValueError(
+            f"start_line {start_line} fuera de rango (1–{total})"
+        )
+    clamped = False
     if count > 0:
+        max_count = total - start_line + 1
+        if count > max_count:
+            count = max_count
+            clamped = True
         cm.DeleteLines(start_line, count)
     inserted = 0
     if new_code:
@@ -475,10 +490,13 @@ def ac_vbe_replace_lines(
     # Invalidar cache de texto (el módulo cambió)
     cache_key = f"{object_type}:{object_name}"
     _vbe_code_cache.pop(cache_key, None)
+    new_total = cm.CountOfLines
     end = start_line + count - 1 if count > 0 else start_line
+    clamp_note = " (count ajustado al límite del módulo)" if clamped else ""
     status = (
         f"OK: líneas {start_line}–{end} reemplazadas "
-        f"({count} eliminadas, {inserted} insertadas)"
+        f"({count} eliminadas, {inserted} insertadas){clamp_note} "
+        f"→ módulo ahora tiene {new_total} líneas"
     )
     if new_code:
         lines = new_code.splitlines()
@@ -511,6 +529,131 @@ def ac_vbe_find(
         if needle in haystack:
             matches.append({"line": i, "content": raw_line.rstrip("\r")})
     return {"found": bool(matches), "match_count": len(matches), "matches": matches}
+
+
+def ac_vbe_search_all(
+    db_path: str, search_text: str, match_case: bool = False
+) -> dict:
+    """
+    Busca texto en TODOS los módulos VBA (modules, forms, reports) de la BD.
+    Devuelve {total_matches, results: [{object_type, object_name, matches: [{line, content}]}]}.
+    """
+    app = _Session.connect(db_path)
+    objects = ac_list_objects(db_path, "all")
+    needle = search_text if match_case else search_text.lower()
+    results: list[dict] = []
+    total = 0
+
+    for obj_type in ("module", "form", "report"):
+        for obj_name in objects.get(obj_type, []):
+            try:
+                cm = _get_code_module(app, obj_type, obj_name)
+                cache_key = f"{obj_type}:{obj_name}"
+                all_code = _cm_all_code(cm, cache_key)
+                if not all_code:
+                    continue
+                obj_matches: list[dict] = []
+                for i, raw_line in enumerate(all_code.splitlines(), start=1):
+                    haystack = raw_line if match_case else raw_line.lower()
+                    if needle in haystack:
+                        obj_matches.append({"line": i, "content": raw_line.rstrip("\r")})
+                if obj_matches:
+                    results.append({
+                        "object_type": obj_type,
+                        "object_name": obj_name,
+                        "matches": obj_matches,
+                    })
+                    total += len(obj_matches)
+            except Exception:
+                continue  # skip objects without accessible CodeModule
+
+    return {"total_matches": total, "results": results}
+
+
+def ac_vbe_replace_proc(
+    db_path: str, object_type: str, object_name: str,
+    proc_name: str, new_code: str
+) -> str:
+    """
+    Reemplaza un procedimiento completo (Sub/Function/Property) por nombre.
+    Calcula los límites automáticamente via COM (ProcStartLine/ProcCountLines),
+    eliminando errores de cálculo del caller.
+    Si new_code está vacío, elimina el procedimiento.
+    """
+    app = _Session.connect(db_path)
+
+    # Si el form/report está abierto en Design view (tras ac_set_control_props etc.),
+    # cerrarlo primero para evitar conflictos COM con el VBE ("Error catastrófico")
+    if object_type in ("form", "report"):
+        ac_obj_type = _AC_FORM if object_type == "form" else _AC_REPORT
+        try:
+            app.DoCmd.Close(ac_obj_type, object_name, _AC_SAVE_YES)
+            log.info("ac_vbe_replace_proc: cerrado '%s' en Design view antes de acceder VBE", object_name)
+        except Exception:
+            pass  # no estaba abierto — OK
+
+    # Invalidar cm_cache por si el CodeModule quedó stale tras operación de diseño
+    cache_key = f"{object_type}:{object_name}"
+    _Session._cm_cache.pop(cache_key, None)
+
+    cm = _get_code_module(app, object_type, object_name)
+    try:
+        start = cm.ProcStartLine(proc_name, 0)
+        count = cm.ProcCountLines(proc_name, 0)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Procedimiento '{proc_name}' no encontrado en '{object_name}': {exc}"
+        )
+    # Clamp count al total real del módulo (ProcCountLines puede inflar el último proc)
+    total = cm.CountOfLines
+    count = min(count, total - start + 1)
+    # Borrar procedimiento viejo
+    cm.DeleteLines(start, count)
+    # Insertar nuevo código (si hay)
+    inserted = 0
+    if new_code:
+        normalized = new_code.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+        cm.InsertLines(start, normalized)
+        inserted = len(new_code.splitlines())
+    # Invalidar cache
+    cache_key = f"{object_type}:{object_name}"
+    _vbe_code_cache.pop(cache_key, None)
+    new_total = cm.CountOfLines
+    action = "reemplazado" if new_code else "eliminado"
+    status = (
+        f"OK: proc '{proc_name}' {action} "
+        f"({count} eliminadas, {inserted} insertadas) "
+        f"→ módulo ahora tiene {new_total} líneas"
+    )
+    if new_code:
+        lines = new_code.splitlines()
+        preview = (
+            new_code if len(lines) <= 60
+            else "\n".join(lines[:60]) + f"\n[... +{len(lines) - 60} líneas]"
+        )
+        return f"{status}\n\n{preview}"
+    return status
+
+
+def ac_vbe_append(
+    db_path: str, object_type: str, object_name: str,
+    new_code: str
+) -> str:
+    """
+    Añade código al final de un módulo VBA.
+    Más seguro que replace_lines para insertar nuevas funciones
+    sin necesidad de calcular números de línea.
+    """
+    app = _Session.connect(db_path)
+    cm = _get_code_module(app, object_type, object_name)
+    total = cm.CountOfLines
+    normalized = new_code.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+    cm.InsertLines(total + 1, normalized)
+    inserted = len(new_code.splitlines())
+    cache_key = f"{object_type}:{object_name}"
+    _vbe_code_cache.pop(cache_key, None)
+    new_total = cm.CountOfLines
+    return f"OK: {inserted} líneas añadidas al final → módulo ahora tiene {new_total} líneas"
 
 
 # ---------------------------------------------------------------------------
@@ -547,19 +690,41 @@ def _parse_controls(form_text: str) -> dict:
     Devuelve un dict con:
       controls       — lista de controles con sus propiedades y posición en el texto
       form_indent    — indentación de la línea "Begin Form/Report"
-      ctrl_indent    — indentación de los bloques Begin de controles directos
+      ctrl_indent    — (legacy, se mantiene para compatibilidad) indent del primer control encontrado
       form_begin_idx — índice 0-based de la línea "Begin Form/Report"
       form_end_idx   — índice 0-based del "End" que cierra el bloque Form/Report
-    Nota: controles dentro de TabControl aparecen a mayor profundidad y no se listan.
+
+    Estructura del export de Access:
+      Begin Form              ← form level
+          Begin               ← defaults block (contiene Begin Label, Begin CommandButton con props default)
+          End
+          Begin Section       ← sección (Detail, FormHeader, FormFooter)
+              ...
+              Begin           ← contenedor de controles dentro de la sección
+                  Begin Label ← CONTROL REAL (tiene Name =, ControlType =, etc.)
+                  End
+                  Begin CommandButton
+                  End
+              End
+          End
+          Begin ClassModule   ← código VBA del form
+          End
+      End Form
+
+    El parser busca controles DENTRO de las secciones, identificándolos por tener
+    un tipo conocido (Begin <TypeName>) donde TypeName es un valor de _CTRL_TYPE.
     """
     lines = form_text.splitlines(keepends=True)
-    result = {
+    result: dict = {
         "controls": [],
         "form_indent": "",
         "ctrl_indent": "",
         "form_begin_idx": -1,
         "form_end_idx": -1,
     }
+
+    # Conjunto de nombres de tipo para detección rápida
+    ctrl_type_names = {v for v in _CTRL_TYPE.values()}
 
     # 1. Localizar "Begin Form" o "Begin Report"
     for i, line in enumerate(lines):
@@ -573,10 +738,9 @@ def _parse_controls(form_text: str) -> dict:
     if result["form_begin_idx"] == -1:
         return result
 
-    form_indent = result["form_indent"]
     form_begin = result["form_begin_idx"]
 
-    # 2. Encontrar el "End" que cierra el bloque Form (rastreo de profundidad)
+    # 2. Encontrar el "End" que cierra el bloque Form/Report (rastreo de profundidad)
     depth = 0
     for i in range(form_begin, len(lines)):
         s = lines[i].rstrip("\r\n").lstrip()
@@ -588,34 +752,29 @@ def _parse_controls(form_text: str) -> dict:
                 result["form_end_idx"] = i
                 break
 
-    # 3. Detectar ctrl_indent: primer "Begin" sin calificador después de Begin Form
-    for i in range(form_begin + 1, result["form_end_idx"]):
-        raw = lines[i].rstrip("\r\n")
-        s = raw.lstrip()
-        if s == "Begin":
-            result["ctrl_indent"] = raw[: len(raw) - len(s)]
-            break
+    if result["form_end_idx"] == -1:
+        return result
 
-    ctrl_indent = result["ctrl_indent"]
-    if not ctrl_indent:
-        return result  # form sin controles
-
-    # 4. Extraer bloques de controles al nivel ctrl_indent
+    # 3. Escanear TODOS los bloques "Begin <TypeName>" dentro del form/report
+    #    donde TypeName coincide con un tipo de control conocido.
+    #    Los controles pueden estar a cualquier profundidad dentro de secciones.
     i = form_begin + 1
     while i < result["form_end_idx"]:
         raw = lines[i].rstrip("\r\n")
         s = raw.lstrip()
         indent = raw[: len(raw) - len(s)]
 
-        # Saltar ClassModule
+        # Saltar ClassModule — no contiene controles, solo VBA
         if re.match(r"^Begin\s+ClassModule\s*$", s, re.IGNORECASE):
             break
 
-        if s == "Begin" and indent == ctrl_indent:
+        # Detectar "Begin <TypeName>" donde TypeName es un tipo de control conocido
+        m_ctrl = re.match(r"^Begin\s+(\w+)\s*$", s)
+        if m_ctrl and m_ctrl.group(1) in ctrl_type_names:
             ctrl_start = i
             block: list[str] = [lines[i]]
             props: dict[str, str] = {}
-            depth = 1
+            blk_depth = 1
             ctrl_end = i
             j = i + 1
             while j < len(lines):
@@ -623,15 +782,16 @@ def _parse_controls(form_text: str) -> dict:
                 bl_r = bl.rstrip("\r\n")
                 bl_s = bl_r.lstrip()
                 block.append(bl)
-                if depth == 1:
-                    m = re.match(r"^(\w+)\s*=(.*)", bl_s)
-                    if m:
-                        props[m.group(1)] = m.group(2).strip().strip('"')
-                if bl_s == "Begin":
-                    depth += 1
+                # Solo parsear propiedades al nivel top del control (depth == 1)
+                if blk_depth == 1:
+                    m_prop = re.match(r"^(\w+)\s*=(.*)", bl_s)
+                    if m_prop:
+                        props[m_prop.group(1)] = m_prop.group(2).strip().strip('"')
+                if re.match(r"^Begin\b", bl_s):
+                    blk_depth += 1
                 elif bl_s == "End":
-                    depth -= 1
-                    if depth == 0:
+                    blk_depth -= 1
+                    if blk_depth == 0:
                         ctrl_end = j
                         break
                 j += 1
@@ -642,10 +802,14 @@ def _parse_controls(form_text: str) -> dict:
             except (ValueError, TypeError):
                 ctype = -1
 
+            # Guardar ctrl_indent del primer control encontrado (legacy compat)
+            if not result["ctrl_indent"] and name:
+                result["ctrl_indent"] = indent
+
             result["controls"].append({
                 "name":           name,
                 "control_type":   ctype,
-                "type_name":      _CTRL_TYPE.get(ctype, f"Type{ctype}"),
+                "type_name":      _CTRL_TYPE.get(ctype, m_ctrl.group(1)),
                 "caption":        props.get("Caption", ""),
                 "control_source": props.get("ControlSource", ""),
                 "left":           props.get("Left", ""),
@@ -678,20 +842,17 @@ def _get_parsed_controls(db_path: str, object_type: str, object_name: str) -> di
 
 
 def ac_list_controls(db_path: str, object_type: str, object_name: str) -> dict:
-    """
-    Lista todos los controles directos de un formulario o informe con sus
-    propiedades clave (sin raw_block para no saturar el resultado).
-    Nota: controles dentro de TabControl no aparecen (están a mayor profundidad).
-    """
     if object_type not in ("form", "report"):
         raise ValueError("ac_list_controls solo admite object_type 'form' o 'report'")
     parsed = _get_parsed_controls(db_path, object_type, object_name)
+    controls = [
+        {k: v for k, v in c.items() if k != "raw_block"}
+        for c in parsed["controls"]
+        if c.get("name", "").strip()  # excluir controles sin nombre
+    ]
     return {
-        "count": len(parsed["controls"]),
-        "controls": [
-            {k: v for k, v in c.items() if k != "raw_block"}
-            for c in parsed["controls"]
-        ],
+        "count": len(controls),
+        "controls": controls,
     }
 
 
@@ -849,6 +1010,11 @@ def ac_create_control(
             result["property_errors"] = errors
     finally:
         _save_and_close(app, object_type, object_name)
+        # Invalidar caches — el form cambió en diseño
+        cache_key = f"{object_type}:{object_name}"
+        _parsed_controls_cache.pop(cache_key, None)
+        _Session._cm_cache.pop(cache_key, None)
+        _vbe_code_cache.pop(cache_key, None)
 
     return result
 
@@ -869,6 +1035,11 @@ def ac_delete_control(
             app.DeleteReportControl(object_name, control_name)
     finally:
         _save_and_close(app, object_type, object_name)
+        # Invalidar caches — el form cambió en diseño
+        cache_key = f"{object_type}:{object_name}"
+        _parsed_controls_cache.pop(cache_key, None)
+        _Session._cm_cache.pop(cache_key, None)
+        _vbe_code_cache.pop(cache_key, None)
 
     return f"OK: control '{control_name}' eliminado de '{object_name}'"
 
@@ -901,6 +1072,11 @@ def ac_set_control_props(
                 errors[key] = str(exc)
     finally:
         _save_and_close(app, object_type, object_name)
+        # Invalidar caches — el form cambió en diseño
+        cache_key = f"{object_type}:{object_name}"
+        _parsed_controls_cache.pop(cache_key, None)
+        _Session._cm_cache.pop(cache_key, None)
+        _vbe_code_cache.pop(cache_key, None)
 
     return {"applied": applied, "errors": errors}
 
@@ -986,7 +1162,9 @@ def ac_set_code(db_path: str, object_type: str, name: str, code: str) -> str:
     fd, tmp = tempfile.mkstemp(suffix=".txt", prefix="access_mcp_")
     os.close(fd)
     try:
-        _write_tmp(tmp, code, encoding="utf-16")
+        # Módulos VBA (.bas) esperan ANSI/cp1252; forms/reports/queries/macros esperan UTF-16LE con BOM
+        enc = "cp1252" if object_type == "module" else "utf-16"
+        _write_tmp(tmp, code, encoding=enc)
         app.LoadFromText(AC_TYPE[object_type], name, tmp)
         # Invalidar caches para este objeto (el código y los controles cambiaron)
         cache_key = f"{object_type}:{name}"
@@ -1026,6 +1204,65 @@ def ac_execute_sql(db_path: str, sql: str) -> dict:
     else:
         db.Execute(sql)
         return {"affected_rows": db.RecordsAffected}
+
+
+# Mapa DAO Type → nombre legible
+_DAO_FIELD_TYPE: dict[int, str] = {
+    1: "Boolean", 2: "Byte", 3: "Integer", 4: "Long", 5: "Currency",
+    6: "Single", 7: "Double", 8: "Date/Time", 10: "Text",
+    11: "OLE Object", 12: "Memo", 15: "GUID", 16: "BigInt",
+    20: "Decimal",
+}
+
+
+def ac_table_info(db_path: str, table_name: str) -> dict:
+    """
+    Devuelve la estructura de una tabla Access local o linkada:
+    campos con nombre, tipo, tamaño, required; record_count; is_linked.
+    Usa DAO TableDef.Fields.
+    """
+    app = _Session.connect(db_path)
+    db = app.CurrentDb()
+    try:
+        td = db.TableDefs(table_name)
+    except Exception as exc:
+        raise ValueError(f"Tabla '{table_name}' no encontrada: {exc}")
+
+    is_linked = bool(td.Connect)
+    fields: list[dict] = []
+    for i in range(td.Fields.Count):
+        fld = td.Fields(i)
+        ftype = fld.Type
+        # AutoNumber detection: Long (4) + dbAutoIncrField attribute (16)
+        type_name = _DAO_FIELD_TYPE.get(ftype, f"Type{ftype}")
+        if ftype == 4 and (fld.Attributes & 16):
+            type_name = "AutoNumber"
+        fields.append({
+            "name": fld.Name,
+            "type": type_name,
+            "size": fld.Size,
+            "required": bool(fld.Required),
+        })
+
+    # Record count (puede fallar en linked tables)
+    try:
+        record_count = td.RecordCount
+        if record_count == -1:
+            # Para linked tables, abrir recordset para contar
+            rs = db.OpenRecordset(f"SELECT COUNT(*) AS cnt FROM [{table_name}]")
+            record_count = rs.Fields(0).Value
+            rs.Close()
+    except Exception:
+        record_count = -1
+
+    return {
+        "table_name": table_name,
+        "fields": fields,
+        "record_count": record_count,
+        "is_linked": is_linked,
+        "source_table": td.SourceTableName if is_linked else "",
+        "connect": td.Connect if is_linked else "",
+    }
 
 
 def ac_export_structure(db_path: str, output_path: Optional[str] = None) -> str:
@@ -1127,12 +1364,31 @@ def ac_export_structure(db_path: str, output_path: Optional[str] = None) -> str:
 # ---------------------------------------------------------------------------
 # Definicion de herramientas MCP
 # ---------------------------------------------------------------------------
+# NOTA PARA EL AGENTE:
+# Este MCP es la UNICA forma de leer, modificar o consultar cualquier fichero
+# Microsoft Access (.accdb / .mdb) desde Claude Code. No existe ninguna otra
+# herramienta ni comando que permita acceder al contenido de una base de datos
+# Access. Siempre que el usuario mencione un formulario, modulo, informe, query
+# o cualquier objeto de una base de datos Access, DEBES usar estas tools.
+# Flujo obligatorio para editar VBA:
+#   1. access_list_objects  → descubrir que objetos existen
+#   2. access_get_code      → leer el codigo/definicion actual
+#   3. (modificar el texto en memoria)
+#   4. access_set_code      → escribir el resultado en la BD
+# Para ediciones quirurgicas (una funcion, unas pocas lineas) usa las tools VBE:
+#   access_vbe_module_info → indice de procedimientos con numeros de linea
+#   access_vbe_get_proc    → codigo de un procedimiento concreto
+#   access_vbe_replace_lines → reemplazar lineas sin reimportar el modulo entero
+# ---------------------------------------------------------------------------
 TOOLS = [
     types.Tool(
         name="access_list_objects",
         description=(
-            "Lista los objetos de una base de datos Access (.accdb/.mdb). "
-            "Devuelve un JSON con los nombres agrupados por tipo. "
+            "USAR SIEMPRE COMO PRIMER PASO al trabajar con una base de datos Access (.accdb/.mdb). "
+            "Lista todos los objetos de la BD agrupados por tipo: modulos VBA, formularios, "
+            "informes, queries y macros. "
+            "Sin llamar a esta tool el agente no sabe que formularios, modulos ni objetos "
+            "existen en la base de datos — no intentes adivinarlos. "
             "object_type puede ser 'module', 'form', 'report', 'query', 'macro' o 'all'."
         ),
         inputSchema={
@@ -1146,7 +1402,7 @@ TOOLS = [
                     "type": "string",
                     "enum": ["all", "module", "form", "report", "query", "macro"],
                     "default": "all",
-                    "description": "Tipo de objeto a listar (por defecto: all)",
+                    "description": "Tipo de objeto a listar. Valores: 'module' (VBA módulo), 'form' (formulario), 'report' (informe), 'query' (consulta), 'macro' (macro), 'all' (todos). Por defecto: 'all'",
                 },
             },
             "required": ["db_path"],
@@ -1155,27 +1411,30 @@ TOOLS = [
     types.Tool(
         name="access_get_code",
         description=(
-            "Exporta el codigo o definicion completa de un objeto Access y lo devuelve como texto. "
+            "Lee y devuelve el codigo VBA o la definicion completa de cualquier objeto "
+            "de una base de datos Access (.accdb/.mdb). "
+            "DEBES llamar a esta tool antes de modificar cualquier objeto — nunca escribas "
+            "codigo VBA de Access sin haber leido primero el original con esta tool. "
             "Para modulos VBA devuelve codigo .bas limpio. "
             "Para formularios e informes devuelve el formato interno de Access "
             "(propiedades + seccion Class Module con el VBA). "
-            "Usa este tool ANTES de access_set_code para obtener el texto original."
+            "Es la unica forma de leer el codigo fuente de un objeto Access desde Claude Code."
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 "db_path": {
                     "type": "string",
-                    "description": "Ruta completa al fichero .accdb o .mdb",
+                    "description": "Ruta completa al fichero .accdb o .mdb (ej: C:\\ruta\\database.accdb)",
                 },
                 "object_type": {
                     "type": "string",
                     "enum": ["module", "form", "report", "query", "macro"],
-                    "description": "Tipo del objeto",
+                    "description": "Tipo del objeto: 'module' (VBA módulo), 'form' (formulario), 'report' (informe), 'query' (consulta), 'macro' (macro)",
                 },
                 "object_name": {
                     "type": "string",
-                    "description": "Nombre exacto del objeto (sensible a mayusculas)",
+                    "description": "Nombre exacto del objeto (case-sensitive). Para obtener los nombres válidos, usa primero access_list_objects",
                 },
             },
             "required": ["db_path", "object_type", "object_name"],
@@ -1184,31 +1443,32 @@ TOOLS = [
     types.Tool(
         name="access_set_code",
         description=(
-            "Importa texto como definicion de un objeto en Access. "
+            "Escribe (importa) el codigo modificado de un objeto en la base de datos Access. "
             "Si el objeto ya existe lo SOBREESCRIBE; si no existe lo CREA. "
-            "IMPORTANTE: llama siempre a access_get_code primero para obtener "
-            "el texto original y modificar solo lo necesario, especialmente "
-            "en formularios e informes donde el formato incluye propiedades de controles."
+            "Es la unica forma de guardar cambios en VBA o en la definicion de un objeto Access. "
+            "OBLIGATORIO: llamar siempre a access_get_code primero para obtener "
+            "el texto original y modificar solo lo necesario — especialmente en formularios "
+            "e informes donde el formato incluye propiedades de controles que no debes alterar."
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 "db_path": {
                     "type": "string",
-                    "description": "Ruta completa al fichero .accdb o .mdb",
+                    "description": "Ruta completa al fichero .accdb o .mdb (ej: C:\\ruta\\database.accdb)",
                 },
                 "object_type": {
                     "type": "string",
                     "enum": ["module", "form", "report", "query", "macro"],
-                    "description": "Tipo del objeto",
+                    "description": "Tipo del objeto: 'module' (VBA módulo), 'form' (formulario), 'report' (informe), 'query' (consulta), 'macro' (macro)",
                 },
                 "object_name": {
                     "type": "string",
-                    "description": "Nombre exacto del objeto",
+                    "description": "Nombre exacto del objeto (case-sensitive). Para obtener los nombres válidos, usa primero access_list_objects",
                 },
                 "code": {
                     "type": "string",
-                    "description": "Contenido completo del objeto en formato texto de Access",
+                    "description": "Contenido completo del objeto. IMPORTANTE: para módulos VBA usar texto limpio; para formularios/informes usar el formato completo devuelto por access_get_code. Nunca modifiques el texto sin haber antes obtenido el original con access_get_code",
                 },
             },
             "required": ["db_path", "object_type", "object_name", "code"],
@@ -1217,47 +1477,70 @@ TOOLS = [
     types.Tool(
         name="access_execute_sql",
         description=(
-            "Ejecuta una sentencia SQL en la base de datos via DAO. "
+            "Ejecuta SQL directamente en una base de datos Access (.accdb/.mdb) via DAO. "
+            "Es la unica forma de consultar o modificar datos de tablas Access desde Claude Code. "
             "SELECT devuelve las filas como JSON. "
             "INSERT/UPDATE/DELETE devuelven el numero de filas afectadas. "
-            "Util para tablas locales (las tablas linkadas a SQL Server tambien funcionan)."
+            "Funciona con tablas locales y tablas linkadas a SQL Server."
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 "db_path": {
                     "type": "string",
-                    "description": "Ruta completa al fichero .accdb o .mdb",
+                    "description": "Ruta completa al fichero .accdb o .mdb (ej: C:\\ruta\\database.accdb)",
                 },
                 "sql": {
                     "type": "string",
-                    "description": "Sentencia SQL a ejecutar",
+                    "description": "Sentencia SQL a ejecutar (SELECT, INSERT, UPDATE, DELETE, etc.)",
                 },
             },
             "required": ["db_path", "sql"],
         },
     ),
     types.Tool(
-        name="access_export_structure",
+        name="access_table_info",
         description=(
-            "Genera un fichero Markdown (db_structure.md) con la estructura completa "
-            "de la base de datos: todos los modulos VBA con sus funciones/subs, "
-            "formularios, informes, queries y macros. "
-            "Usalo al inicio del proyecto para crear el indice, y cada vez que "
-            "añadas o elimines objetos en la BD para mantenerlo actualizado."
+            "Devuelve la estructura de una tabla local o linkada de Access: "
+            "campos con nombre, tipo DAO, tamaño, required; record_count; is_linked. "
+            "Usa DAO TableDef.Fields — mas preciso que SELECT TOP 1 para ver tipos de datos."
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 "db_path": {
                     "type": "string",
-                    "description": "Ruta completa al fichero .accdb o .mdb",
+                    "description": "Ruta completa al fichero .accdb o .mdb (ej: C:\\ruta\\database.accdb)",
+                },
+                "table_name": {
+                    "type": "string",
+                    "description": "Nombre exacto de la tabla (case-sensitive)",
+                },
+            },
+            "required": ["db_path", "table_name"],
+        },
+    ),
+    types.Tool(
+        name="access_export_structure",
+        description=(
+            "Genera un fichero Markdown con la estructura completa de una base de datos Access: "
+            "modulos VBA con sus funciones/subs, formularios, informes, queries y macros. "
+            "USAR AL INICIO de cualquier proyecto Access para obtener un indice completo "
+            "de la BD antes de empezar a trabajar. Tambien util para actualizar el indice "
+            "despues de añadir o eliminar objetos."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {
+                    "type": "string",
+                    "description": "Ruta completa al fichero .accdb o .mdb (ej: C:\\ruta\\database.accdb)",
                 },
                 "output_path": {
                     "type": "string",
                     "description": (
-                        "Ruta donde guardar el fichero .md. "
-                        "Por defecto: db_structure.md en el mismo directorio que el .accdb"
+                        "Ruta donde guardar el fichero .md de estructura. "
+                        "Si no se especifica, se crea 'db_structure.md' en el mismo directorio que la base de datos"
                     ),
                 },
             },
@@ -1267,9 +1550,8 @@ TOOLS = [
     types.Tool(
         name="access_close",
         description=(
-            "Cierra la sesion COM con Access y libera el fichero .accdb. "
-            "Recomendado al terminar una sesion de edicion para que otros "
-            "procesos puedan abrir la BD."
+            "Cierra la sesion COM con Access y libera el fichero .accdb/.mdb. "
+            "Llamar al terminar una sesion de edicion para que otros procesos puedan abrir la BD."
         ),
         inputSchema={
             "type": "object",
@@ -1281,18 +1563,19 @@ TOOLS = [
     types.Tool(
         name="access_vbe_get_lines",
         description=(
-            "Lee un rango de líneas de un módulo VBA directamente via VBE COM, "
-            "sin exportar el fichero entero. Ideal para inspeccionar una zona concreta "
-            "antes de editarla. object_type: 'module', 'form' o 'report'."
+            "Lee un rango de lineas de un modulo VBA de Access directamente via VBE COM, "
+            "sin exportar el fichero entero. Mas eficiente que access_get_code "
+            "cuando solo necesitas inspeccionar una zona concreta antes de editarla. "
+            "object_type: 'module', 'form' o 'report'."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "db_path":     {"type": "string", "description": "Ruta al .accdb/.mdb"},
-                "object_type": {"type": "string", "enum": ["module", "form", "report"]},
-                "object_name": {"type": "string", "description": "Nombre del módulo/formulario/informe"},
-                "start_line":  {"type": "integer", "description": "Primera línea a leer (1-based)"},
-                "count":       {"type": "integer", "description": "Número de líneas a leer"},
+                "db_path": {"type": "string", "description": "Ruta completa al fichero .accdb o .mdb (ej: C:\\ruta\\database.accdb)"},
+                "object_type": {"type": "string", "enum": ["module", "form", "report"], "description": "Tipo: 'module' (VBA módulo), 'form' (formulario), 'report' (informe)"},
+                "object_name": {"type": "string", "description": "Nombre exacto (case-sensitive). Usa access_list_objects para obtener los nombres válidos"},
+                "start_line":  {"type": "integer", "description": "Primera linea a leer (1-based)"},
+                "count":       {"type": "integer", "description": "Numero de lineas a leer"},
             },
             "required": ["db_path", "object_type", "object_name", "start_line", "count"],
         },
@@ -1300,17 +1583,17 @@ TOOLS = [
     types.Tool(
         name="access_vbe_get_proc",
         description=(
-            "Devuelve el código completo de un procedimiento (Sub/Function/Property) "
-            "buscándolo por nombre via VBE. Mucho más eficiente que access_get_code "
-            "cuando solo interesa una función. "
+            "Devuelve el codigo completo de un procedimiento VBA (Sub/Function/Property) "
+            "de un objeto Access buscandolo por nombre via VBE. "
+            "Mucho mas eficiente que access_get_code cuando solo interesa una funcion concreta. "
             "Devuelve: start_line, body_line (donde empieza el cuerpo), count, code."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "db_path":     {"type": "string", "description": "Ruta al .accdb/.mdb"},
-                "object_type": {"type": "string", "enum": ["module", "form", "report"]},
-                "object_name": {"type": "string", "description": "Nombre del módulo/formulario/informe"},
+                "db_path": {"type": "string", "description": "Ruta completa al fichero .accdb o .mdb (ej: C:\\ruta\\database.accdb)"},
+                "object_type": {"type": "string", "enum": ["module", "form", "report"], "description": "Tipo: 'module' (VBA módulo), 'form' (formulario), 'report' (informe)"},
+                "object_name": {"type": "string", "description": "Nombre exacto (case-sensitive). Usa access_list_objects para obtener los nombres válidos"},
                 "proc_name":   {"type": "string", "description": "Nombre exacto del Sub/Function/Property"},
             },
             "required": ["db_path", "object_type", "object_name", "proc_name"],
@@ -1319,17 +1602,17 @@ TOOLS = [
     types.Tool(
         name="access_vbe_module_info",
         description=(
-            "Devuelve el número total de líneas y la lista de procedimientos "
-            "(con start_line, body_line y count de cada uno) de un módulo VBA. "
-            "Úsalo como índice rápido para saber qué hay y dónde antes de editar, "
-            "sin necesidad de descargar el código completo."
+            "Devuelve el numero total de lineas y el indice completo de procedimientos "
+            "(con start_line, body_line y count de cada uno) de un modulo VBA de Access. "
+            "USAR ANTES de access_vbe_get_proc o access_vbe_replace_lines para saber "
+            "exactamente donde esta cada funcion sin descargar el codigo completo."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "db_path":     {"type": "string", "description": "Ruta al .accdb/.mdb"},
-                "object_type": {"type": "string", "enum": ["module", "form", "report"]},
-                "object_name": {"type": "string", "description": "Nombre del módulo/formulario/informe"},
+                "db_path": {"type": "string", "description": "Ruta completa al fichero .accdb o .mdb (ej: C:\\ruta\\database.accdb)"},
+                "object_type": {"type": "string", "enum": ["module", "form", "report"], "description": "Tipo: 'module' (VBA módulo), 'form' (formulario), 'report' (informe)"},
+                "object_name": {"type": "string", "description": "Nombre exacto (case-sensitive). Usa access_list_objects para obtener los nombres válidos"},
             },
             "required": ["db_path", "object_type", "object_name"],
         },
@@ -1337,21 +1620,25 @@ TOOLS = [
     types.Tool(
         name="access_vbe_replace_lines",
         description=(
-            "Reemplaza líneas en un módulo VBA directamente via VBE COM, "
-            "sin exportar ni reimportar el módulo entero. "
-            "Borra 'count' líneas desde 'start_line' e inserta 'new_code' en su lugar. "
-            "count=0 → inserción pura. new_code='' → borrado puro. "
-            "new_code puede ser multilínea (separado por \\n)."
+            "Reemplaza lineas en un modulo VBA de Access directamente via VBE COM, "
+            "sin exportar ni reimportar el modulo entero. "
+            "Usar para ediciones quirurgicas: modificar una funcion, añadir declaraciones, etc. "
+            "Borra 'count' lineas desde 'start_line' e inserta 'new_code' en su lugar. "
+            "count=0 → insercion pura. new_code='' → borrado puro. "
+            "new_code puede ser multilinea (separado por \\n). "
+            "Valida limites automaticamente: si count excede el final del modulo, se ajusta. "
+            "Devuelve el nuevo total de lineas del modulo. "
+            "Para reemplazar funciones enteras, preferir access_vbe_replace_proc (mas seguro)."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "db_path":     {"type": "string", "description": "Ruta al .accdb/.mdb"},
-                "object_type": {"type": "string", "enum": ["module", "form", "report"]},
-                "object_name": {"type": "string", "description": "Nombre del módulo/formulario/informe"},
-                "start_line":  {"type": "integer", "description": "Primera línea afectada (1-based)"},
-                "count":       {"type": "integer", "description": "Líneas a eliminar (0 = solo insertar)"},
-                "new_code":    {"type": "string",  "description": "Código nuevo ('' = solo borrar)"},
+                "db_path": {"type": "string", "description": "Ruta completa al fichero .accdb o .mdb (ej: C:\\ruta\\database.accdb)"},
+                "object_type": {"type": "string", "enum": ["module", "form", "report"], "description": "Tipo: 'module' (VBA módulo), 'form' (formulario), 'report' (informe)"},
+                "object_name": {"type": "string", "description": "Nombre exacto (case-sensitive). Usa access_list_objects para obtener los nombres válidos"},
+                "start_line":  {"type": "integer", "description": "Primera linea afectada (1-based)"},
+                "count":       {"type": "integer", "description": "Lineas a eliminar (0 = solo insertar)"},
+                "new_code":    {"type": "string",  "description": "Codigo nuevo ('' = solo borrar)"},
             },
             "required": ["db_path", "object_type", "object_name", "start_line", "count", "new_code"],
         },
@@ -1359,35 +1646,94 @@ TOOLS = [
     types.Tool(
         name="access_vbe_find",
         description=(
-            "Busca texto en un módulo VBA y devuelve todas las líneas que coinciden "
-            "con su número de línea. Una sola llamada COM; la búsqueda se hace en Python. "
+            "Busca texto en un modulo VBA de Access y devuelve todas las lineas que coinciden "
+            "con su numero de linea. Usar para localizar variables, llamadas a funciones, "
+            "o cualquier patron de texto antes de editar. "
             "Devuelve: found, match_count, matches [{line, content}]."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "db_path":     {"type": "string", "description": "Ruta al .accdb/.mdb"},
-                "object_type": {"type": "string", "enum": ["module", "form", "report"]},
-                "object_name": {"type": "string", "description": "Nombre del módulo/formulario/informe"},
+                "db_path": {"type": "string", "description": "Ruta completa al fichero .accdb o .mdb (ej: C:\\ruta\\database.accdb)"},
+                "object_type": {"type": "string", "enum": ["module", "form", "report"], "description": "Tipo: 'module' (VBA módulo), 'form' (formulario), 'report' (informe)"},
+                "object_name": {"type": "string", "description": "Nombre exacto (case-sensitive). Usa access_list_objects para obtener los nombres válidos"},
                 "search_text": {"type": "string", "description": "Texto a buscar"},
-                "match_case":  {"type": "boolean", "description": "Distinguir mayúsculas (default: false)", "default": False},
+                "match_case":  {"type": "boolean", "description": "Distinguir mayusculas (default: false)", "default": False},
             },
             "required": ["db_path", "object_type", "object_name", "search_text"],
+        },
+    ),
+    types.Tool(
+        name="access_vbe_search_all",
+        description=(
+            "Busca texto en TODOS los modulos VBA de la base de datos Access "
+            "(modules, forms, reports) de una sola vez. "
+            "Ideal para refactoring o localizar donde se usa una funcion/variable "
+            "sin tener que llamar access_vbe_find una vez por cada objeto. "
+            "Devuelve: total_matches, results [{object_type, object_name, matches: [{line, content}]}]."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta completa al fichero .accdb o .mdb (ej: C:\\ruta\\database.accdb)"},
+                "search_text": {"type": "string", "description": "Texto a buscar en todos los modulos"},
+                "match_case":  {"type": "boolean", "description": "Distinguir mayusculas (default: false)", "default": False},
+            },
+            "required": ["db_path", "search_text"],
+        },
+    ),
+    types.Tool(
+        name="access_vbe_replace_proc",
+        description=(
+            "Reemplaza un procedimiento VBA completo (Sub/Function/Property) por nombre. "
+            "Calcula los limites automaticamente via COM — NO necesitas saber los numeros de linea. "
+            "Si new_code esta vacio, elimina el procedimiento. "
+            "Mas seguro que access_vbe_replace_lines para reemplazar funciones enteras."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta completa al fichero .accdb o .mdb (ej: C:\\ruta\\database.accdb)"},
+                "object_type": {"type": "string", "enum": ["module", "form", "report"], "description": "Tipo: 'module' (VBA módulo), 'form' (formulario), 'report' (informe)"},
+                "object_name": {"type": "string", "description": "Nombre exacto (case-sensitive). Usa access_list_objects para obtener los nombres válidos"},
+                "proc_name":   {"type": "string", "description": "Nombre exacto del Sub/Function/Property a reemplazar o eliminar"},
+                "new_code":    {"type": "string", "description": "Codigo nuevo completo del procedimiento. Vacio ('') para eliminar el proc"},
+            },
+            "required": ["db_path", "object_type", "object_name", "proc_name", "new_code"],
+        },
+    ),
+    types.Tool(
+        name="access_vbe_append",
+        description=(
+            "Añade codigo al final de un modulo VBA de Access. "
+            "Mas seguro que replace_lines para insertar nuevas funciones o declaraciones "
+            "sin necesidad de calcular numeros de linea."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta completa al fichero .accdb o .mdb (ej: C:\\ruta\\database.accdb)"},
+                "object_type": {"type": "string", "enum": ["module", "form", "report"], "description": "Tipo: 'module' (VBA módulo), 'form' (formulario), 'report' (informe)"},
+                "object_name": {"type": "string", "description": "Nombre exacto (case-sensitive). Usa access_list_objects para obtener los nombres válidos"},
+                "new_code":    {"type": "string", "description": "Codigo a añadir al final del modulo. Puede ser multilinea (separado por \\n)"},
+            },
+            "required": ["db_path", "object_type", "object_name", "new_code"],
         },
     ),
     # ── Control-level tools ──────────────────────────────────────────────────
     types.Tool(
         name="access_list_controls",
         description=(
-            "Lista todos los controles directos de un formulario o informe con sus "
-            "propiedades clave: nombre, tipo, caption, control_source, posición y línea. "
-            "No incluye controles dentro de TabControl (están a mayor profundidad). "
-            "Usa este tool como paso previo a access_get_control / access_set_control_props."
+            "Lista todos los controles de un formulario o informe Access con sus "
+            "propiedades clave: nombre, tipo, caption, control_source, posicion y linea. "
+            "USAR como paso previo a access_get_control o access_set_control_props "
+            "para conocer los nombres exactos de los controles antes de modificarlos. "
+            "No incluye controles dentro de TabControl (estan a mayor profundidad)."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "db_path":     {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "db_path": {"type": "string", "description": "Ruta completa al fichero .accdb o .mdb (ej: C:\\ruta\\database.accdb)"},
                 "object_type": {"type": "string", "enum": ["form", "report"]},
                 "object_name": {"type": "string", "description": "Nombre del formulario o informe"},
             },
@@ -1397,45 +1743,41 @@ TOOLS = [
     types.Tool(
         name="access_get_control",
         description=(
-            "Devuelve la definición completa (bloque Begin...End) de un control "
-            "concreto de un formulario o informe, buscado por nombre. "
-            "El raw_block es solo lectura; para modificar propiedades usa access_set_control_props."
+            "Devuelve la definicion completa (bloque Begin...End) de un control concreto "
+            "de un formulario o informe Access, buscado por nombre. "
+            "Para modificar propiedades del control usa access_set_control_props."
+            "No lo uses para nombres de controles sin nombre."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "db_path":      {"type": "string", "description": "Ruta al .accdb/.mdb"},
-                "object_type":  {"type": "string", "enum": ["form", "report"]},
-                "object_name":  {"type": "string", "description": "Nombre del formulario o informe"},
-                "control_name": {"type": "string", "description": "Nombre exacto del control"},
+                "db_path": {"type": "string", "description": "Ruta completa al fichero .accdb o .mdb (ej: C:\\ruta\\database.accdb)"},
+                "object_type": {"type": "string", "enum": ["form", "report"]},
+                "object_name": {"type": "string", "description": "Nombre del formulario o informe"},
+                "control_name": {"type": "string", "description": "Nombre exacto del control (case-sensitive). Usa access_list_controls para obtenerlos"},
             },
             "required": ["db_path", "object_type", "object_name", "control_name"],
         },
     ),
-    # ── Control COM tools (CreateControl / DeleteControl / design mode) ──────
     types.Tool(
         name="access_create_control",
         description=(
-            "Crea un control nuevo en un formulario o informe via COM (CreateControl). "
-            "Abre el objeto en vista diseño, crea el control, asigna propiedades y guarda. "
-            "control_type: nombre ('CommandButton', 'TextBox', 'Label'...) o número (104, 109, 100...). "
-            "props: dict con propiedades del control. Claves especiales (pasadas a CreateControl): "
-            "section (0=Detail, 1=Header, 2=Footer), parent, column_name, left, top, width, height. "
-            "Resto de claves se asignan como propiedades COM (Name, Caption, ControlSource, OnClick...)."
+            "Crea un control nuevo en un formulario o informe Access via COM (CreateControl). "
+            "Abre el objeto en vista diseno, crea el control, asigna propiedades y guarda. "
+            "control_type: nombre ('CommandButton', 'TextBox', 'Label'...) o numero (104, 109, 100...). "
+            "props claves especiales: section (0=Detail,1=Header,2=Footer), parent, column_name, "
+            "left, top, width, height. Resto de claves: Name, Caption, ControlSource, OnClick, etc."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "db_path":      {"type": "string", "description": "Ruta al .accdb/.mdb"},
-                "object_type":  {"type": "string", "enum": ["form", "report"]},
-                "object_name":  {"type": "string", "description": "Nombre del formulario o informe"},
-                "control_type": {"type": "string", "description": "Tipo: nombre ('CommandButton') o número (104)"},
+                "db_path": {"type": "string", "description": "Ruta completa al fichero .accdb o .mdb (ej: C:\\ruta\\database.accdb)"},
+                "object_type": {"type": "string", "enum": ["form", "report"]},
+                "object_name": {"type": "string", "description": "Nombre del formulario o informe"},
+                "control_type": {"type": "string", "description": "Tipo del control: nombre ('CommandButton', 'TextBox', 'Label') o valor numerico (104, 109, 100...)"},
                 "props": {
                     "type": "object",
-                    "description": (
-                        "Propiedades del control. Especiales: section, parent, column_name, "
-                        "left, top, width, height. Resto: Name, Caption, ControlSource, OnClick, etc."
-                    ),
+                    "description": "Propiedades del control. Claves especiales: section (0=Detail,1=Header,2=Footer), parent (nombre del contenedor), column_name, left, top, width, height. Otras propiedades: Name, Caption, ControlSource, Visible, OnClick, etc.",
                     "additionalProperties": True,
                 },
             },
@@ -1445,16 +1787,16 @@ TOOLS = [
     types.Tool(
         name="access_delete_control",
         description=(
-            "Elimina un control de un formulario o informe via COM (DeleteControl). "
-            "Abre el objeto en vista diseño, elimina el control y guarda."
+            "Elimina un control de un formulario o informe Access via COM (DeleteControl). "
+            "Abre el objeto en vista diseno, elimina el control y guarda."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "db_path":      {"type": "string", "description": "Ruta al .accdb/.mdb"},
-                "object_type":  {"type": "string", "enum": ["form", "report"]},
-                "object_name":  {"type": "string", "description": "Nombre del formulario o informe"},
-                "control_name": {"type": "string", "description": "Nombre exacto del control a eliminar"},
+                "db_path": {"type": "string", "description": "Ruta completa al fichero .accdb o .mdb (ej: C:\\ruta\\database.accdb)"},
+                "object_type": {"type": "string", "enum": ["form", "report"]},
+                "object_name": {"type": "string", "description": "Nombre del formulario o informe"},
+                "control_name": {"type": "string", "description": "Nombre exacto del control a eliminar (case-sensitive). Usa access_list_controls para obtenerlo"},
             },
             "required": ["db_path", "object_type", "object_name", "control_name"],
         },
@@ -1462,21 +1804,21 @@ TOOLS = [
     types.Tool(
         name="access_set_control_props",
         description=(
-            "Modifica propiedades de un control existente via COM en vista diseño. "
-            "Abre el formulario/informe en diseño, asigna las propiedades y guarda. "
-            "Los valores numéricos y booleanos se convierten automáticamente. "
-            "Devuelve {applied: [...], errors: {...}} para saber qué se aplicó."
+            "Modifica propiedades de un control existente en un formulario o informe Access "
+            "via COM en vista diseno. Asigna las propiedades indicadas y guarda. "
+            "Los valores numericos y booleanos se convierten automaticamente. "
+            "Devuelve {applied: [...], errors: {...}} para confirmar que se aplico."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "db_path":      {"type": "string", "description": "Ruta al .accdb/.mdb"},
-                "object_type":  {"type": "string", "enum": ["form", "report"]},
-                "object_name":  {"type": "string", "description": "Nombre del formulario o informe"},
-                "control_name": {"type": "string", "description": "Nombre exacto del control"},
+                "db_path": {"type": "string", "description": "Ruta completa al fichero .accdb o .mdb (ej: C:\\ruta\\database.accdb)"},
+                "object_type": {"type": "string", "enum": ["form", "report"]},
+                "object_name": {"type": "string", "description": "Nombre del formulario o informe"},
+                "control_name": {"type": "string", "description": "Nombre exacto del control (case-sensitive). Usa access_list_controls para obtenerlo"},
                 "props": {
                     "type": "object",
-                    "description": "Propiedades a modificar: {Caption: 'OK', Left: 1000, Visible: true, ...}",
+                    "description": "Diccionario de propiedades a modificar. Ejemplos: {Caption: 'Nuevo Texto', Left: 1000, Visible: true, ControlSource: 'Campo'}. Valores numéricos y booleanos se convierten automáticamente",
                     "additionalProperties": True,
                 },
             },
@@ -1484,7 +1826,6 @@ TOOLS = [
         },
     ),
 ]
-
 
 # ---------------------------------------------------------------------------
 # MCP Server
@@ -1496,12 +1837,74 @@ server = Server("access-mcp")
 async def list_tools() -> list[types.Tool]:
     return TOOLS
 
+@server.list_prompts()
+async def list_prompts() -> list[types.Prompt]:
+    return [
+        types.Prompt(
+            name="access-workflow",
+            description=(
+                "Instrucciones de uso del MCP access para trabajar con bases de datos "
+                "Microsoft Access (.accdb/.mdb) desde Claude Code."
+            ),
+            arguments=[
+                types.PromptArgument(
+                    name="db_path",
+                    description="Ruta completa al fichero .accdb o .mdb",
+                    required=False,
+                )
+            ],
+        )
+    ]
+
+@server.get_prompt()
+async def get_prompt(name: str, arguments: dict | None) -> types.GetPromptResult:
+    db_path = (arguments or {}).get("db_path", "<ruta_al_fichero.accdb>")
+    return types.GetPromptResult(
+        description="Workflow obligatorio para trabajar con bases de datos Access",
+        messages=[
+            types.PromptMessage(
+                role="user",
+                content=types.TextContent(
+                    type="text",
+                    text=f"""
+Estoy trabajando con una base de datos Microsoft Access: {db_path}
+
+REGLAS OBLIGATORIAS para el agente:
+1. Cualquier operacion sobre ficheros .accdb o .mdb DEBE hacerse a traves del MCP access.
+   No existe ninguna otra herramienta ni comando de shell que pueda leer o modificar Access.
+
+2. Flujo obligatorio para editar VBA o definiciones de objetos:
+   a) access_list_objects  → descubrir que objetos existen (formularios, modulos, informes...)
+   b) access_get_code      → leer el codigo actual del objeto
+   c) modificar el texto
+   d) access_set_code      → guardar el resultado en la BD
+
+3. Para ediciones de pocas lineas (mas eficiente):
+   a) access_vbe_module_info  → indice de procedimientos con numeros de linea
+   b) access_vbe_get_proc     → codigo del procedimiento concreto
+   c) access_vbe_replace_lines → reemplazar solo las lineas modificadas
+
+4. Nunca adivines nombres de formularios, modulos o controles.
+   Siempre llama primero a access_list_objects o access_list_controls.
+
+5. Nunca escribas codigo VBA sin haber leido antes el original con access_get_code
+   o access_vbe_get_proc. El formato interno de Access es estricto.
+""",
+                ),
+            )
+        ],
+    )
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
-    # Log sin el campo 'code' para no saturar el log
-    log_args = {k: v for k, v in arguments.items() if k != "code"}
-    log.info(">>> %s  %s", name, log_args)
+    # Logging seguro: mostrar código solo como longitud para proteger datos sensibles
+    safe_args = {}
+    for k, v in arguments.items():
+        if k == "code":
+            safe_args[k] = f"<VBA code: {len(v)} chars>"
+        else:
+            safe_args[k] = v
+    log.info(">>> %s  %s", name, safe_args)
 
     try:
         if name == "access_list_objects":
@@ -1528,6 +1931,10 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
 
         elif name == "access_execute_sql":
             result = ac_execute_sql(arguments["db_path"], arguments["sql"])
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        elif name == "access_table_info":
+            result = ac_table_info(arguments["db_path"], arguments["table_name"])
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
         elif name == "access_export_structure":
@@ -1587,6 +1994,31 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
+        elif name == "access_vbe_search_all":
+            result = ac_vbe_search_all(
+                arguments["db_path"],
+                arguments["search_text"],
+                bool(arguments.get("match_case", False)),
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        elif name == "access_vbe_replace_proc":
+            text = ac_vbe_replace_proc(
+                arguments["db_path"],
+                arguments["object_type"],
+                arguments["object_name"],
+                arguments["proc_name"],
+                arguments["new_code"],
+            )
+
+        elif name == "access_vbe_append":
+            text = ac_vbe_append(
+                arguments["db_path"],
+                arguments["object_type"],
+                arguments["object_name"],
+                arguments["new_code"],
+            )
+
         # ── Control-level ────────────────────────────────────────────────────
         elif name == "access_list_controls":
             result = ac_list_controls(
@@ -1638,7 +2070,26 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
 
     except Exception as exc:
         log.error("Error en %s: %s", name, exc, exc_info=True)
-        text = f"ERROR: {exc}"
+
+        # Build detailed error message for the LLM
+        tb_lines = traceback.format_exc().splitlines()
+
+        # Create safe representation of arguments (hide full code)
+        safe_args_display = {}
+        for k, v in arguments.items():
+            if k == "code":
+                safe_args_display[k] = f"<VBA code provided: length {len(v)} chars>"
+            else:
+                safe_args_display[k] = v
+
+        error_msg = (
+            f"ERROR in tool '{name}'\n"
+            f"Type: {type(exc).__name__}\n"
+            f"Message: {exc}\n\n"
+            f"Arguments received:\n{json.dumps(safe_args_display, indent=2, ensure_ascii=False)}\n\n"
+            f"Stack trace (last 5 lines):\n" + "\n".join(tb_lines[-5:])
+        )
+        text = error_msg
 
     log.info("<<< %s  OK", name)
     return [types.TextContent(type="text", text=text)]
