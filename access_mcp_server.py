@@ -367,6 +367,18 @@ def _cm_all_code(cm: Any, cache_key: str) -> str:
     return _vbe_code_cache[cache_key]
 
 
+def _text_matches(
+    needle: str, haystack: str, match_case: bool, use_regex: bool,
+) -> bool:
+    """Compara needle contra haystack: substring plano o regex."""
+    if use_regex:
+        flags = 0 if match_case else re.IGNORECASE
+        return re.search(needle, haystack, flags) is not None
+    if not match_case:
+        return needle.lower() in haystack.lower()
+    return needle in haystack
+
+
 def ac_vbe_get_lines(
     db_path: str, object_type: str, object_name: str,
     start_line: int, count: int
@@ -510,10 +522,10 @@ def ac_vbe_replace_lines(
 
 def ac_vbe_find(
     db_path: str, object_type: str, object_name: str,
-    search_text: str, match_case: bool = False
+    search_text: str, match_case: bool = False, use_regex: bool = False,
 ) -> dict:
     """
-    Busca texto en un módulo y devuelve todas las líneas que coinciden.
+    Busca texto (o regex) en un módulo y devuelve todas las líneas que coinciden.
     Usa _vbe_code_cache para evitar releer el módulo si ya fue leído.
     """
     app = _Session.connect(db_path)
@@ -522,30 +534,33 @@ def ac_vbe_find(
     all_code = _cm_all_code(cm, cache_key)
     if not all_code:
         return {"found": False, "match_count": 0, "matches": []}
-    needle = search_text if match_case else search_text.lower()
     matches: list[dict] = []
     for i, raw_line in enumerate(all_code.splitlines(), start=1):
-        haystack = raw_line if match_case else raw_line.lower()
-        if needle in haystack:
+        if _text_matches(search_text, raw_line, match_case, use_regex):
             matches.append({"line": i, "content": raw_line.rstrip("\r")})
     return {"found": bool(matches), "match_count": len(matches), "matches": matches}
 
 
 def ac_vbe_search_all(
-    db_path: str, search_text: str, match_case: bool = False
+    db_path: str, search_text: str, match_case: bool = False,
+    max_results: int = 100, use_regex: bool = False,
 ) -> dict:
     """
-    Busca texto en TODOS los módulos VBA (modules, forms, reports) de la BD.
-    Devuelve {total_matches, results: [{object_type, object_name, matches: [{line, content}]}]}.
+    Busca texto (o regex) en TODOS los módulos VBA (modules, forms, reports) de la BD.
+    Devuelve {total_matches, results: [...], truncated?: bool}.
     """
     app = _Session.connect(db_path)
     objects = ac_list_objects(db_path, "all")
-    needle = search_text if match_case else search_text.lower()
     results: list[dict] = []
     total = 0
+    truncated = False
 
     for obj_type in ("module", "form", "report"):
+        if truncated:
+            break
         for obj_name in objects.get(obj_type, []):
+            if truncated:
+                break
             try:
                 cm = _get_code_module(app, obj_type, obj_name)
                 cache_key = f"{obj_type}:{obj_name}"
@@ -554,20 +569,151 @@ def ac_vbe_search_all(
                     continue
                 obj_matches: list[dict] = []
                 for i, raw_line in enumerate(all_code.splitlines(), start=1):
-                    haystack = raw_line if match_case else raw_line.lower()
-                    if needle in haystack:
+                    if _text_matches(search_text, raw_line, match_case, use_regex):
                         obj_matches.append({"line": i, "content": raw_line.rstrip("\r")})
+                        total += 1
+                        if total >= max_results:
+                            truncated = True
+                            break
                 if obj_matches:
                     results.append({
                         "object_type": obj_type,
                         "object_name": obj_name,
                         "matches": obj_matches,
                     })
-                    total += len(obj_matches)
             except Exception:
                 continue  # skip objects without accessible CodeModule
 
-    return {"total_matches": total, "results": results}
+    out: dict = {"total_matches": total, "results": results}
+    if truncated:
+        out["truncated"] = True
+    return out
+
+
+def ac_search_queries(
+    db_path: str, search_text: str, match_case: bool = False,
+    max_results: int = 100, use_regex: bool = False,
+) -> dict:
+    """
+    Busca texto (o regex) dentro del SQL de TODAS las queries (consultas) de la BD.
+    Devuelve {total_matches, results: [{query_name, sql}], truncated?: bool}.
+    """
+    app = _Session.connect(db_path)
+    db = app.CurrentDb()
+    results: list[dict] = []
+    total = 0
+    for qd in db.QueryDefs:
+        name = qd.Name
+        if name.startswith("~"):  # skip internal/temp queries
+            continue
+        sql = qd.SQL
+        if _text_matches(search_text, sql, match_case, use_regex):
+            results.append({"query_name": name, "sql": sql.strip()})
+            total += 1
+            if total >= max_results:
+                break
+    out: dict = {"total_matches": total, "results": results}
+    if total >= max_results:
+        out["truncated"] = True
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Find usages — cross-reference search
+# ---------------------------------------------------------------------------
+_CONTROL_SEARCH_PROPS = frozenset({
+    "ControlSource", "RecordSource", "RowSource", "DefaultValue", "ValidationRule",
+})
+
+
+def ac_find_usages(
+    db_path: str, search_text: str, match_case: bool = False,
+    max_results: int = 200, use_regex: bool = False,
+) -> dict:
+    """
+    Busca un nombre (funcion, tabla, campo, variable) en VBA, queries y
+    propiedades de controles de forms/reports. Devuelve resultados agrupados.
+    Reutiliza ac_vbe_search_all y ac_search_queries para VBA y queries.
+    """
+    # 1. VBA matches — delega en ac_vbe_search_all
+    vba_result = ac_vbe_search_all(
+        db_path, search_text, match_case, max_results, use_regex,
+    )
+    # Aplanar: de [{object_type, object_name, matches: [{line, content}]}] a lista plana
+    vba_matches: list[dict] = []
+    for group in vba_result["results"]:
+        for m in group["matches"]:
+            vba_matches.append({
+                "object_type": group["object_type"],
+                "object_name": group["object_name"],
+                "line": m["line"],
+                "content": m["content"],
+            })
+    total = len(vba_matches)
+    truncated = vba_result.get("truncated", False)
+
+    # 2. Query matches — delega en ac_search_queries
+    query_matches: list[dict] = []
+    if not truncated:
+        remaining = max_results - total
+        qry_result = ac_search_queries(
+            db_path, search_text, match_case, remaining, use_regex,
+        )
+        query_matches = qry_result["results"]
+        total += qry_result["total_matches"]
+        truncated = qry_result.get("truncated", False)
+
+    # 3. Control property matches — busca en exports de forms/reports
+    control_matches: list[dict] = []
+    if not truncated:
+        app = _Session.connect(db_path)
+        objects = ac_list_objects(db_path, "all")
+        for obj_type in ("form", "report"):
+            if truncated:
+                break
+            for obj_name in objects.get(obj_type, []):
+                if truncated:
+                    break
+                try:
+                    fd, tmp = tempfile.mkstemp(suffix=".txt", prefix="access_mcp_")
+                    os.close(fd)
+                    try:
+                        app.SaveAsText(AC_TYPE[obj_type], obj_name, tmp)
+                        raw_text, _enc = _read_tmp(tmp)
+                    finally:
+                        try:
+                            os.unlink(tmp)
+                        except OSError:
+                            pass
+                    for line in raw_text.splitlines():
+                        stripped = line.strip()
+                        for prop in _CONTROL_SEARCH_PROPS:
+                            if stripped.startswith(prop + " ="):
+                                value_part = stripped[len(prop) + 2:].strip()
+                                if _text_matches(search_text, value_part, match_case, use_regex):
+                                    control_matches.append({
+                                        "object_type": obj_type,
+                                        "object_name": obj_name,
+                                        "property": prop,
+                                        "value": value_part,
+                                    })
+                                    total += 1
+                                    if total >= max_results:
+                                        truncated = True
+                                    break
+                except Exception:
+                    continue
+
+    out: dict = {
+        "search_text": search_text,
+        "vba_matches": vba_matches,
+        "query_matches": query_matches,
+        "control_matches": control_matches,
+        "total_matches": total,
+    }
+    if truncated:
+        out["truncated"] = True
+    return out
 
 
 def ac_vbe_replace_proc(
@@ -1084,6 +1230,248 @@ def ac_set_control_props(
 # ---------------------------------------------------------------------------
 # Logica de negocio
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Create database
+# ---------------------------------------------------------------------------
+
+def ac_create_database(db_path: str) -> dict:
+    """Crea una BD Access (.accdb) vacía. Error si ya existe."""
+    resolved = str(Path(db_path).resolve())
+    if os.path.exists(resolved):
+        raise FileExistsError(
+            f"Ya existe '{resolved}'. Usa access_execute_sql para modificarla."
+        )
+    # Ensure Access is running
+    if _Session._app is None:
+        _Session._launch()
+    app = _Session._app
+    # Close any previously open DB
+    if _Session._db_open is not None:
+        try:
+            app.CloseCurrentDatabase()
+        except Exception:
+            pass
+        _Session._db_open = None
+    try:
+        app.NewCurrentDatabase(resolved)
+    except Exception as exc:
+        raise RuntimeError(f"Error al crear BD: {exc}")
+    # FIX: Close and reopen to ensure CurrentDb() works reliably
+    try:
+        app.CloseCurrentDatabase()
+        app.OpenCurrentDatabase(resolved)
+    except Exception:
+        pass  # If reopen fails, at least the file was created
+    _Session._db_open = resolved
+    _Session._cm_cache.clear()
+    _vbe_code_cache.clear()
+    _parsed_controls_cache.clear()
+    size = os.path.getsize(resolved) if os.path.exists(resolved) else 0
+    return {"db_path": resolved, "status": "created", "size_bytes": size}
+
+
+# ---------------------------------------------------------------------------
+# Create table via DAO
+# ---------------------------------------------------------------------------
+# Mapa de nombres de tipo → constantes DAO dbType
+_FIELD_TYPE_MAP: dict[str, int] = {
+    "autonumber": 4, "autoincrement": 4,  # dbLong + dbAutoIncrField attribute
+    "long": 4, "integer": 3, "short": 3, "byte": 2,
+    "text": 10, "memo": 12, "currency": 5,
+    "double": 7, "single": 6, "float": 7,
+    "datetime": 8, "date": 8,
+    "boolean": 1, "yesno": 1, "bit": 1,
+    "guid": 15, "ole": 11, "bigint": 16,
+}
+_DB_AUTO_INCR_FIELD = 16  # dbAutoIncrField attribute flag
+
+
+def _set_field_prop(db: Any, table_name: str, field_name: str,
+                    prop_name: str, value: Any) -> None:
+    """Helper interno para establecer propiedad de campo con fallback a CreateProperty."""
+    fld = db.TableDefs(table_name).Fields(field_name)
+    try:
+        fld.Properties(prop_name).Value = value
+    except Exception:
+        prop = fld.CreateProperty(prop_name, 10, value)  # 10 = dbText
+        fld.Properties.Append(prop)
+
+
+def ac_create_table(db_path: str, table_name: str, fields: list[dict]) -> dict:
+    """
+    Crea una tabla Access via DAO con soporte completo de tipos, defaults,
+    descripciones y propiedades — todo en una sola llamada.
+    """
+    app = _Session.connect(db_path)
+    db = app.CurrentDb()
+
+    # Verificar que no existe
+    existing = [db.TableDefs(i).Name for i in range(db.TableDefs.Count)]
+    if table_name in existing:
+        raise ValueError(f"La tabla '{table_name}' ya existe.")
+
+    td = db.CreateTableDef(table_name)
+    pk_fields: list[str] = []
+    created_fields: list[dict] = []
+
+    for fdef in fields:
+        name = fdef["name"]
+        ftype = fdef.get("type", "text").lower()
+        size = fdef.get("size", 0)
+        required = fdef.get("required", False)
+        pk = fdef.get("primary_key", False)
+
+        dao_type = _FIELD_TYPE_MAP.get(ftype)
+        if dao_type is None:
+            raise ValueError(
+                f"Tipo desconocido: '{ftype}'. "
+                f"Validos: {sorted(set(_FIELD_TYPE_MAP.keys()))}"
+            )
+
+        is_auto = ftype in ("autonumber", "autoincrement")
+
+        # Text needs size
+        if dao_type == 10 and size == 0:
+            size = 255
+
+        if size > 0:
+            fld = td.CreateField(name, dao_type, size)
+        else:
+            fld = td.CreateField(name, dao_type)
+
+        if is_auto:
+            fld.Attributes = fld.Attributes | _DB_AUTO_INCR_FIELD
+
+        fld.Required = required or pk
+
+        td.Fields.Append(fld)
+
+        if pk:
+            pk_fields.append(name)
+
+        created_fields.append({
+            "name": name,
+            "type": ftype,
+            "size": size if size > 0 else None,
+        })
+
+    # Create primary key index
+    if pk_fields:
+        idx = td.CreateIndex("PrimaryKey")
+        idx.Primary = True
+        idx.Unique = True
+        for pk_name in pk_fields:
+            idx_fld = idx.CreateField(pk_name)
+            idx.Fields.Append(idx_fld)
+        td.Indexes.Append(idx)
+
+    db.TableDefs.Append(td)
+    db.TableDefs.Refresh()
+
+    # Set defaults and descriptions via field properties (post-creation)
+    for fdef in fields:
+        name = fdef["name"]
+        default = fdef.get("default")
+        description = fdef.get("description")
+        if default is not None:
+            try:
+                _set_field_prop(db, table_name, name, "DefaultValue", str(default))
+            except Exception as e:
+                log.warning("Error setting default for %s.%s: %s", table_name, name, e)
+        if description is not None:
+            try:
+                _set_field_prop(db, table_name, name, "Description", description)
+            except Exception as e:
+                log.warning("Error setting description for %s.%s: %s", table_name, name, e)
+
+    return {
+        "table_name": table_name,
+        "fields": created_fields,
+        "primary_key": pk_fields,
+        "status": "created",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Alter table via DAO
+# ---------------------------------------------------------------------------
+def ac_alter_table(
+    db_path: str, table_name: str, action: str,
+    field_name: str, new_name: str | None = None,
+    field_type: str = "text", size: int = 0,
+    required: bool = False, default: Any = None,
+    description: str | None = None, confirm: bool = False,
+) -> dict:
+    """
+    Modifica la estructura de una tabla Access via DAO.
+    Acciones: add_field, delete_field (requiere confirm=true), rename_field.
+    """
+    app = _Session.connect(db_path)
+    db = app.CurrentDb()
+    td = db.TableDefs(table_name)
+
+    if action == "add_field":
+        ftype = field_type.lower()
+        dao_type = _FIELD_TYPE_MAP.get(ftype)
+        if dao_type is None:
+            raise ValueError(
+                f"Tipo desconocido: '{ftype}'. "
+                f"Validos: {sorted(set(_FIELD_TYPE_MAP.keys()))}"
+            )
+        is_auto = ftype in ("autonumber", "autoincrement")
+        if dao_type == 10 and size == 0:
+            size = 255
+        if size > 0:
+            fld = td.CreateField(field_name, dao_type, size)
+        else:
+            fld = td.CreateField(field_name, dao_type)
+        if is_auto:
+            fld.Attributes = fld.Attributes | _DB_AUTO_INCR_FIELD
+        fld.Required = required
+        td.Fields.Append(fld)
+        td.Fields.Refresh()
+        if default is not None:
+            try:
+                _set_field_prop(db, table_name, field_name, "DefaultValue", str(default))
+            except Exception as e:
+                log.warning("Error setting default for %s.%s: %s", table_name, field_name, e)
+        if description is not None:
+            try:
+                _set_field_prop(db, table_name, field_name, "Description", description)
+            except Exception as e:
+                log.warning("Error setting description for %s.%s: %s", table_name, field_name, e)
+        return {"action": "field_added", "table": table_name, "field": field_name, "type": ftype}
+
+    elif action == "delete_field":
+        if not confirm:
+            return {
+                "error": (
+                    f"Eliminar campo '{field_name}' de '{table_name}' es destructivo. "
+                    "Usa confirm=true para confirmar."
+                )
+            }
+        td.Fields.Delete(field_name)
+        return {"action": "field_deleted", "table": table_name, "field": field_name}
+
+    elif action == "rename_field":
+        if not new_name:
+            raise ValueError("rename_field requiere new_name")
+        fld = td.Fields(field_name)
+        fld.Name = new_name
+        return {"action": "field_renamed", "table": table_name,
+                "old_name": field_name, "new_name": new_name}
+
+    else:
+        raise ValueError(
+            f"Accion desconocida: '{action}'. "
+            "Validas: add_field, delete_field, rename_field"
+        )
+
+
+# ---------------------------------------------------------------------------
+# List objects
+# ---------------------------------------------------------------------------
+
 def ac_list_objects(db_path: str, object_type: str = "all") -> dict:
     """Devuelve un dict {tipo: [nombres...]} con los objetos de la BD."""
     app = _Session.connect(db_path)
@@ -1091,6 +1479,7 @@ def ac_list_objects(db_path: str, object_type: str = "all") -> dict:
     # CurrentData  → objetos de datos (tablas, queries)
     # CurrentProject → objetos de codigo (forms, reports, modulos, macros)
     containers = {
+        "table":  app.CurrentData.AllTables,
         "query":  app.CurrentData.AllQueries,
         "form":   app.CurrentProject.AllForms,
         "report": app.CurrentProject.AllReports,
@@ -1105,9 +1494,47 @@ def ac_list_objects(db_path: str, object_type: str = "all") -> dict:
         if k not in containers:
             continue
         col = containers[k]
-        result[k] = [col.Item(i).Name for i in range(col.Count)]
+        names = [col.Item(i).Name for i in range(col.Count)]
+        if k == "table":
+            # Filter out system and temp tables
+            names = [n for n in names if not n.startswith("MSys") and not n.startswith("~")]
+        result[k] = names
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Delete object
+# ---------------------------------------------------------------------------
+
+def ac_delete_object(
+    db_path: str, object_type: str, object_name: str, confirm: bool = False,
+) -> dict:
+    """Elimina un objeto Access (module, form, report, query, macro) via DoCmd.DeleteObject."""
+    if object_type not in AC_TYPE:
+        raise ValueError(
+            f"object_type '{object_type}' invalido. Validos: {list(AC_TYPE)}"
+        )
+    if not confirm:
+        raise ValueError(
+            "Operacion destructiva: se requiere confirm=true para eliminar un objeto."
+        )
+    app = _Session.connect(db_path)
+    try:
+        app.DoCmd.DeleteObject(AC_TYPE[object_type], object_name)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Error al eliminar {object_type} '{object_name}': {exc}"
+        )
+    finally:
+        _vbe_code_cache.clear()
+        _parsed_controls_cache.clear()
+        _Session._cm_cache.clear()
+    return {
+        "action": "deleted",
+        "object_type": object_type,
+        "object_name": object_name,
+    }
 
 
 def ac_get_code(db_path: str, object_type: str, name: str) -> str:
@@ -1179,29 +1606,69 @@ def ac_set_code(db_path: str, object_type: str, name: str, code: str) -> str:
             pass
 
 
-def ac_execute_sql(db_path: str, sql: str) -> dict:
+_DESTRUCTIVE_PREFIXES = ("DELETE", "DROP", "TRUNCATE", "ALTER")
+
+
+def _serialize_value(val: Any) -> Any:
+    """Convierte tipos COM no serializables a JSON-safe."""
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val.isoformat()
+    try:
+        from decimal import Decimal
+        if isinstance(val, Decimal):
+            return float(val)
+    except ImportError:
+        pass
+    if isinstance(val, bytes):
+        return f"<binary {len(val)} bytes>"
+    return val
+
+
+def ac_execute_sql(
+    db_path: str, sql: str, limit: int = 500,
+    confirm_destructive: bool = False,
+) -> dict:
     """
     Ejecuta SQL en la BD via DAO.
-    SELECT  → devuelve {rows: [...], count: N}
+    SELECT  → devuelve {rows: [...], count: N, truncated?: bool}
     Otros   → devuelve {affected_rows: N}
+    DELETE/DROP/TRUNCATE/ALTER requieren confirm_destructive=True.
     """
     app = _Session.connect(db_path)
     db = app.CurrentDb()
+    normalized = sql.strip().upper()
 
-    if sql.strip().upper().startswith("SELECT"):
+    if normalized.startswith("SELECT"):
+        limit = max(1, min(limit, 10000))
         rs = db.OpenRecordset(sql)
         fields = [rs.Fields(i).Name for i in range(rs.Fields.Count)]
         rows: list[dict] = []
         if not rs.EOF:
             rs.MoveFirst()
-            while not rs.EOF:
+            while not rs.EOF and len(rows) < limit:
                 rows.append(
-                    {fields[i]: rs.Fields(i).Value for i in range(len(fields))}
+                    {fields[i]: _serialize_value(rs.Fields(i).Value)
+                     for i in range(len(fields))}
                 )
                 rs.MoveNext()
+        truncated = not rs.EOF
         rs.Close()
-        return {"rows": rows, "count": len(rows)}
+        result: dict = {"rows": rows, "count": len(rows)}
+        if truncated:
+            result["truncated"] = True
+        return result
     else:
+        if any(normalized.startswith(p) for p in _DESTRUCTIVE_PREFIXES):
+            if not confirm_destructive:
+                return {
+                    "error": (
+                        "SQL destructivo detectado. "
+                        "Usa confirm_destructive=true para ejecutar: "
+                        + sql[:100]
+                    )
+                }
         db.Execute(sql)
         return {"affected_rows": db.RecordsAffected}
 
@@ -1213,6 +1680,35 @@ _DAO_FIELD_TYPE: dict[int, str] = {
     11: "OLE Object", 12: "Memo", 15: "GUID", 16: "BigInt",
     20: "Decimal",
 }
+
+# Mapa DAO Relation Attributes → nombre legible
+_REL_ATTR: dict[int, str] = {
+    1: "Unique", 2: "DontEnforce", 256: "UpdateCascade", 4096: "DeleteCascade",
+}
+
+# Access output / transfer constants
+_AC_OUTPUT_REPORT = 3      # acOutputReport
+_AC_IMPORT = 0             # acImport
+_AC_EXPORT = 1             # acExport
+_AC_EXPORT_DELIM = 2       # acExportDelim (CSV export)
+_AC_SPREADSHEET_XLSX = 10  # acSpreadsheetTypeExcel12Xml
+_AC_CMD_COMPILE = 126      # acCmdCompileAndSaveAllModules
+
+# DAO QueryDef type constants
+_QUERYDEF_TYPE: dict[int, str] = {
+    0: "Select", 16: "Crosstab", 32: "Delete", 48: "Update",
+    64: "Append", 80: "MakeTable", 96: "DDL", 112: "SQLPassThrough",
+    128: "Union", 240: "Action",
+}
+
+# Common startup properties
+_STARTUP_PROPS = [
+    "AppTitle", "AppIcon", "StartupForm", "StartupShowDBWindow",
+    "StartupShowStatusBar", "StartupShortcutMenuBar",
+    "AllowShortcutMenus", "AllowFullMenus", "AllowBuiltInToolbars",
+    "AllowToolbarChanges", "AllowBreakIntoCode", "AllowSpecialKeys",
+    "AllowBypassKey", "AllowDatasheetSchema",
+]
 
 
 def ac_table_info(db_path: str, table_name: str) -> dict:
@@ -1354,11 +1850,772 @@ def ac_export_structure(db_path: str, output_path: Optional[str] = None) -> str:
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(content)
 
-    return (
-        f"OK: estructura exportada a `{output_path}` — "
-        f"{len(modules)} módulos, {len(forms)} formularios, "
-        f"{len(reports)} informes, {len(queries)} queries."
-    )
+    return f"[Guardado en `{output_path}`]\n\n{content}"
+
+
+# ---------------------------------------------------------------------------
+# Database properties
+# ---------------------------------------------------------------------------
+
+def ac_get_db_property(db_path: str, name: str) -> dict:
+    """Lee una propiedad de la BD o una opcion de la aplicacion Access."""
+    app = _Session.connect(db_path)
+    db = app.CurrentDb()
+    try:
+        val = db.Properties(name).Value
+        return {"name": name, "value": val, "source": "database"}
+    except Exception:
+        pass
+    try:
+        val = app.GetOption(name)
+        return {"name": name, "value": val, "source": "application"}
+    except Exception as exc:
+        raise ValueError(
+            f"Propiedad '{name}' no encontrada en CurrentDb().Properties "
+            f"ni en Application.GetOption. Error: {exc}"
+        )
+
+
+def ac_set_db_property(
+    db_path: str, name: str, value: Any,
+    prop_type: Optional[int] = None,
+) -> dict:
+    """Establece una propiedad de la BD o una opcion de la aplicacion Access."""
+    app = _Session.connect(db_path)
+    db = app.CurrentDb()
+    coerced = _coerce_prop(value)
+
+    # Try DB-level property
+    try:
+        db.Properties(name).Value = coerced
+        return {"name": name, "value": coerced, "source": "database", "action": "updated"}
+    except Exception:
+        pass
+
+    # Try Application option
+    try:
+        app.SetOption(name, coerced)
+        return {"name": name, "value": coerced, "source": "application", "action": "updated"}
+    except Exception:
+        pass
+
+    # Property doesn't exist — create it
+    if prop_type is None:
+        if isinstance(coerced, bool):
+            prop_type = 1   # dbBoolean
+        elif isinstance(coerced, int):
+            prop_type = 4   # dbLong
+        else:
+            prop_type = 10  # dbText
+    try:
+        prop = db.CreateProperty(name, prop_type, coerced)
+        db.Properties.Append(prop)
+        return {"name": name, "value": coerced, "source": "database", "action": "created"}
+    except Exception as exc:
+        raise RuntimeError(
+            f"No se pudo crear propiedad '{name}'. "
+            f"prop_type: 1=Boolean, 4=Long, 10=Text. Error: {exc}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Linked tables
+# ---------------------------------------------------------------------------
+
+def ac_list_linked_tables(db_path: str) -> dict:
+    """Lista todas las tablas vinculadas con informacion de conexion."""
+    app = _Session.connect(db_path)
+    db = app.CurrentDb()
+    linked: list[dict] = []
+    for i in range(db.TableDefs.Count):
+        td = db.TableDefs(i)
+        conn = td.Connect
+        if not conn:
+            continue
+        name = td.Name
+        if name.startswith("~") or name.startswith("MSys"):
+            continue
+        linked.append({
+            "name": name,
+            "source_table": td.SourceTableName,
+            "connect_string": conn,
+            "is_odbc": conn.upper().startswith("ODBC;"),
+        })
+    return {"count": len(linked), "linked_tables": linked}
+
+
+def ac_relink_table(
+    db_path: str, table_name: str, new_connect: str,
+    relink_all: bool = False,
+) -> dict:
+    """Cambia la cadena de conexion de una tabla vinculada y refresca."""
+    app = _Session.connect(db_path)
+    db = app.CurrentDb()
+    relinked: list[dict] = []
+
+    try:
+        ref_td = db.TableDefs(table_name)
+    except Exception as exc:
+        raise ValueError(f"Tabla '{table_name}' no encontrada: {exc}")
+    if not ref_td.Connect:
+        raise ValueError(f"'{table_name}' no es una tabla vinculada")
+
+    if relink_all:
+        old_connect = ref_td.Connect
+        for i in range(db.TableDefs.Count):
+            td = db.TableDefs(i)
+            if td.Connect == old_connect:
+                old = td.Connect
+                td.Connect = new_connect
+                td.RefreshLink()
+                relinked.append({"name": td.Name, "old_connect": old, "new_connect": new_connect})
+    else:
+        old = ref_td.Connect
+        ref_td.Connect = new_connect
+        ref_td.RefreshLink()
+        relinked.append({"name": table_name, "old_connect": old, "new_connect": new_connect})
+
+    return {"relinked_count": len(relinked), "tables": relinked}
+
+
+# ---------------------------------------------------------------------------
+# Relationships
+# ---------------------------------------------------------------------------
+
+def ac_list_relationships(db_path: str) -> dict:
+    """Lista todas las relaciones entre tablas de la BD."""
+    app = _Session.connect(db_path)
+    db = app.CurrentDb()
+    rels: list[dict] = []
+    for i in range(db.Relations.Count):
+        rel = db.Relations(i)
+        name = rel.Name
+        if name.startswith("MSys"):
+            continue
+        fields: list[dict] = []
+        for j in range(rel.Fields.Count):
+            fld = rel.Fields(j)
+            fields.append({"local": fld.Name, "foreign": fld.ForeignName})
+        attrs = rel.Attributes
+        attr_flags = [label for bit, label in _REL_ATTR.items() if attrs & bit]
+        rels.append({
+            "name": name,
+            "table": rel.Table,
+            "foreign_table": rel.ForeignTable,
+            "fields": fields,
+            "attributes": attrs,
+            "attribute_flags": attr_flags,
+        })
+    return {"count": len(rels), "relationships": rels}
+
+
+def ac_create_relationship(
+    db_path: str, name: str, table: str, foreign_table: str,
+    fields: list[dict], attributes: int = 0,
+) -> dict:
+    """Crea una relacion entre dos tablas via DAO."""
+    app = _Session.connect(db_path)
+    db = app.CurrentDb()
+    rel = db.CreateRelation(name, table, foreign_table, attributes)
+    for fmap in fields:
+        local_name = fmap.get("local")
+        foreign_name = fmap.get("foreign")
+        if not local_name or not foreign_name:
+            raise ValueError(f"Cada campo debe tener 'local' y 'foreign'. Recibido: {fmap}")
+        fld = rel.CreateField(local_name)
+        fld.ForeignName = foreign_name
+        rel.Fields.Append(fld)
+    try:
+        db.Relations.Append(rel)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Error al crear relacion '{name}' entre '{table}' y '{foreign_table}': {exc}"
+        )
+    attr_flags = [label for bit, label in _REL_ATTR.items() if attributes & bit]
+    return {
+        "name": name, "table": table, "foreign_table": foreign_table,
+        "fields": fields, "attributes": attributes,
+        "attribute_flags": attr_flags, "status": "created",
+    }
+
+
+def ac_delete_relationship(db_path: str, name: str) -> dict:
+    """Elimina una relacion entre tablas por nombre."""
+    app = _Session.connect(db_path)
+    db = app.CurrentDb()
+    try:
+        db.Relations.Delete(name)
+    except Exception as exc:
+        raise RuntimeError(f"Error al eliminar relacion '{name}': {exc}")
+    return {"action": "deleted", "name": name}
+
+
+# ---------------------------------------------------------------------------
+# VBA References
+# ---------------------------------------------------------------------------
+
+def ac_list_references(db_path: str) -> dict:
+    """Lista todas las referencias VBA del proyecto."""
+    app = _Session.connect(db_path)
+    try:
+        refs_col = app.VBE.ActiveVBProject.References
+    except Exception as exc:
+        raise RuntimeError(f"No se pudo acceder al VBE. Error: {exc}")
+    refs: list[dict] = []
+    for i in range(1, refs_col.Count + 1):  # VBA collections are 1-based
+        ref = refs_col(i)
+        try:
+            is_broken = bool(ref.IsBroken)
+        except Exception:
+            is_broken = True
+        try:
+            built_in = bool(ref.BuiltIn)
+        except Exception:
+            built_in = False
+        refs.append({
+            "name": ref.Name,
+            "description": ref.Description,
+            "full_path": ref.FullPath,
+            "guid": ref.GUID if ref.GUID else "",
+            "major": ref.Major,
+            "minor": ref.Minor,
+            "is_broken": is_broken,
+            "built_in": built_in,
+        })
+    return {"count": len(refs), "references": refs}
+
+
+def ac_manage_reference(
+    db_path: str, action: str,
+    name: Optional[str] = None,
+    path: Optional[str] = None,
+    guid: Optional[str] = None,
+    major: int = 0, minor: int = 0,
+) -> dict:
+    """Agrega o elimina una referencia VBA del proyecto."""
+    app = _Session.connect(db_path)
+    try:
+        refs = app.VBE.ActiveVBProject.References
+    except Exception as exc:
+        raise RuntimeError(f"No se pudo acceder al VBE. Error: {exc}")
+
+    if action == "add":
+        if guid:
+            try:
+                ref = refs.AddFromGuid(guid, major, minor)
+                result = {"action": "added", "name": ref.Name, "guid": guid, "major": major, "minor": minor}
+            except Exception as exc:
+                raise RuntimeError(f"Error al agregar referencia por GUID '{guid}': {exc}")
+        elif path:
+            try:
+                ref = refs.AddFromFile(path)
+                result = {"action": "added", "name": ref.Name, "full_path": path}
+            except Exception as exc:
+                raise RuntimeError(f"Error al agregar referencia desde '{path}': {exc}")
+        else:
+            raise ValueError("Para action='add' se requiere 'guid' o 'path'")
+    elif action == "remove":
+        if not name:
+            raise ValueError("Para action='remove' se requiere 'name'")
+        found = None
+        for i in range(1, refs.Count + 1):
+            ref = refs(i)
+            if ref.Name.lower() == name.lower():
+                found = ref
+                break
+        if found is None:
+            raise ValueError(f"Referencia '{name}' no encontrada")
+        try:
+            if found.BuiltIn:
+                raise ValueError(f"'{name}' es built-in y no se puede eliminar")
+        except AttributeError:
+            pass  # BuiltIn property not available in old Access versions
+        try:
+            refs.Remove(found)
+            result = {"action": "removed", "name": name}
+        except Exception as exc:
+            raise RuntimeError(f"Error al eliminar referencia '{name}': {exc}")
+    else:
+        raise ValueError(f"action debe ser 'add' o 'remove', recibido: '{action}'")
+
+    # References affect VBE compilation — clear code caches
+    _vbe_code_cache.clear()
+    _Session._cm_cache.clear()
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Compact & Repair
+# ---------------------------------------------------------------------------
+
+def ac_compact_repair(db_path: str) -> dict:
+    """Compacta y repara la BD. Cierra, compacta a temp, reemplaza y reabre."""
+    resolved = str(Path(db_path).resolve())
+    app = _Session.connect(resolved)
+    original_size = os.path.getsize(resolved)
+
+    # Close current database (keep Access alive)
+    try:
+        app.CloseCurrentDatabase()
+    except Exception as exc:
+        raise RuntimeError(f"No se pudo cerrar la BD para compactar: {exc}")
+    _Session._db_open = None
+    _Session._cm_cache.clear()
+    _vbe_code_cache.clear()
+    _parsed_controls_cache.clear()
+
+    # Temp/bak paths in same directory (atomic rename)
+    db_dir = os.path.dirname(resolved)
+    db_name, db_ext = os.path.splitext(os.path.basename(resolved))
+    tmp_path = os.path.join(db_dir, f"{db_name}_compact_tmp{db_ext}")
+    bak_path = os.path.join(db_dir, f"{db_name}_compact_bak{db_ext}")
+
+    try:
+        for p in (tmp_path, bak_path):
+            if os.path.exists(p):
+                os.unlink(p)
+
+        try:
+            app.CompactRepair(resolved, tmp_path)
+        except Exception as exc:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise RuntimeError(f"Error en CompactRepair: {exc}")
+
+        if not os.path.exists(tmp_path):
+            raise RuntimeError("CompactRepair no genero el fichero de salida")
+        compacted_size = os.path.getsize(tmp_path)
+
+        # Atomic swap: original → .bak, tmp → original
+        os.rename(resolved, bak_path)
+        try:
+            os.rename(tmp_path, resolved)
+        except Exception:
+            os.rename(bak_path, resolved)  # rollback
+            raise
+
+        try:
+            os.unlink(bak_path)
+        except OSError:
+            pass
+
+    except Exception:
+        # Try to reopen whatever is at the original path
+        try:
+            if os.path.exists(resolved):
+                app.OpenCurrentDatabase(resolved)
+                _Session._db_open = resolved
+        except Exception:
+            pass
+        raise
+
+    # Reopen compacted database
+    try:
+        app.OpenCurrentDatabase(resolved)
+        _Session._db_open = resolved
+    except Exception as exc:
+        raise RuntimeError(f"BD compactada OK pero error al reabrir: {exc}")
+
+    saved = original_size - compacted_size
+    return {
+        "original_size": original_size,
+        "compacted_size": compacted_size,
+        "saved_bytes": saved,
+        "saved_pct": round(saved / original_size * 100, 1) if original_size > 0 else 0,
+        "status": "compacted",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Query management
+# ---------------------------------------------------------------------------
+
+def ac_manage_query(
+    db_path: str, action: str, query_name: str,
+    sql: Optional[str] = None, new_name: Optional[str] = None,
+    confirm: bool = False,
+) -> dict:
+    """Crea, modifica, renombra, elimina o lee una QueryDef."""
+    app = _Session.connect(db_path)
+    db = app.CurrentDb()
+
+    if action == "create":
+        if not sql:
+            raise ValueError("action='create' requiere 'sql'")
+        qd = db.CreateQueryDef(query_name, sql)
+        return {"action": "created", "query_name": query_name, "sql": sql}
+
+    elif action == "modify":
+        if not sql:
+            raise ValueError("action='modify' requiere 'sql'")
+        try:
+            qd = db.QueryDefs(query_name)
+        except Exception as exc:
+            raise ValueError(f"Query '{query_name}' no encontrada: {exc}")
+        qd.SQL = sql
+        return {"action": "modified", "query_name": query_name, "sql": sql}
+
+    elif action == "delete":
+        if not confirm:
+            return {"error": f"Eliminar query '{query_name}' requiere confirm=true"}
+        try:
+            db.QueryDefs(query_name)  # verify exists
+        except Exception as exc:
+            raise ValueError(f"Query '{query_name}' no encontrada: {exc}")
+        db.QueryDefs.Delete(query_name)
+        return {"action": "deleted", "query_name": query_name}
+
+    elif action == "rename":
+        if not new_name:
+            raise ValueError("action='rename' requiere 'new_name'")
+        try:
+            qd = db.QueryDefs(query_name)
+        except Exception as exc:
+            raise ValueError(f"Query '{query_name}' no encontrada: {exc}")
+        qd.Name = new_name
+        return {"action": "renamed", "old_name": query_name, "new_name": new_name}
+
+    elif action == "get_sql":
+        try:
+            qd = db.QueryDefs(query_name)
+        except Exception as exc:
+            raise ValueError(f"Query '{query_name}' no encontrada: {exc}")
+        qd_type = _QUERYDEF_TYPE.get(qd.Type, f"Unknown({qd.Type})")
+        return {"query_name": query_name, "sql": qd.SQL, "type": qd_type}
+
+    else:
+        raise ValueError(f"action debe ser create/modify/delete/rename/get_sql, recibido: '{action}'")
+
+
+# ---------------------------------------------------------------------------
+# Indexes
+# ---------------------------------------------------------------------------
+
+def ac_list_indexes(db_path: str, table_name: str) -> dict:
+    """Lista los indices de una tabla."""
+    app = _Session.connect(db_path)
+    db = app.CurrentDb()
+    try:
+        td = db.TableDefs(table_name)
+    except Exception as exc:
+        raise ValueError(f"Tabla '{table_name}' no encontrada: {exc}")
+
+    indexes = []
+    for i in range(td.Indexes.Count):
+        idx = td.Indexes(i)
+        fields = []
+        for j in range(idx.Fields.Count):
+            f = idx.Fields(j)
+            fields.append({
+                "name": f.Name,
+                "order": "desc" if f.Attributes & 1 else "asc",
+            })
+        indexes.append({
+            "name": idx.Name,
+            "fields": fields,
+            "primary": bool(idx.Primary),
+            "unique": bool(idx.Unique),
+            "foreign": bool(idx.Foreign),
+        })
+    return {"table_name": table_name, "count": len(indexes), "indexes": indexes}
+
+
+def ac_manage_index(
+    db_path: str, table_name: str, action: str, index_name: str,
+    fields: Optional[list] = None,
+    primary: bool = False, unique: bool = False,
+) -> dict:
+    """Crea o elimina un indice en una tabla."""
+    app = _Session.connect(db_path)
+    db = app.CurrentDb()
+    try:
+        td = db.TableDefs(table_name)
+    except Exception as exc:
+        raise ValueError(f"Tabla '{table_name}' no encontrada: {exc}")
+
+    if action == "create":
+        if not fields:
+            raise ValueError("action='create' requiere 'fields' [{name, order?}]")
+        idx = td.CreateIndex(index_name)
+        idx.Primary = primary
+        idx.Unique = unique
+        for fdef in fields:
+            fname = fdef if isinstance(fdef, str) else fdef["name"]
+            fld = idx.CreateField(fname)
+            if isinstance(fdef, dict) and fdef.get("order", "asc").lower() == "desc":
+                fld.Attributes = 1  # dbDescending
+            idx.Fields.Append(fld)
+        td.Indexes.Append(idx)
+        return {
+            "action": "created", "table_name": table_name,
+            "index_name": index_name, "fields": fields,
+            "primary": primary, "unique": unique,
+        }
+
+    elif action == "delete":
+        try:
+            td.Indexes(index_name)  # verify exists
+        except Exception as exc:
+            raise ValueError(f"Indice '{index_name}' no encontrado en '{table_name}': {exc}")
+        td.Indexes.Delete(index_name)
+        return {"action": "deleted", "table_name": table_name, "index_name": index_name}
+
+    else:
+        raise ValueError(f"action debe ser create/delete, recibido: '{action}'")
+
+
+# ---------------------------------------------------------------------------
+# Compile VBA
+# ---------------------------------------------------------------------------
+
+def ac_compile_vba(db_path: str) -> dict:
+    """Compila y guarda todos los modulos VBA."""
+    app = _Session.connect(db_path)
+    try:
+        app.RunCommand(_AC_CMD_COMPILE)
+    except Exception as exc:
+        raise RuntimeError(f"Error de compilacion VBA: {exc}")
+    # Invalidate caches — compilation may change module state
+    _vbe_code_cache.clear()
+    _Session._cm_cache.clear()
+    return {"status": "compiled"}
+
+
+# ---------------------------------------------------------------------------
+# Run macro
+# ---------------------------------------------------------------------------
+
+def ac_run_macro(db_path: str, macro_name: str) -> dict:
+    """Ejecuta una macro de Access."""
+    app = _Session.connect(db_path)
+    try:
+        app.DoCmd.RunMacro(macro_name)
+    except Exception as exc:
+        raise RuntimeError(f"Error al ejecutar macro '{macro_name}': {exc}")
+    return {"macro_name": macro_name, "status": "executed"}
+
+
+# ---------------------------------------------------------------------------
+# Run VBA procedure
+# ---------------------------------------------------------------------------
+
+def ac_run_vba(
+    db_path: str, procedure: str, args: Optional[list] = None,
+) -> dict:
+    """Ejecuta un Sub/Function VBA via Application.Run."""
+    app = _Session.connect(db_path)
+    call_args = args or []
+    if len(call_args) > 30:
+        raise ValueError("Application.Run soporta max 30 argumentos.")
+    try:
+        if call_args:
+            result = app.Run(procedure, *call_args)
+        else:
+            result = app.Run(procedure)
+    except Exception as exc:
+        raise RuntimeError(f"Error al ejecutar '{procedure}': {exc}")
+    # COM puede devolver tipos no serializables; convertir a str si es necesario
+    if result is not None:
+        try:
+            json.dumps(result)
+        except (TypeError, ValueError):
+            result = str(result)
+    return {"procedure": procedure, "result": result, "status": "executed"}
+
+
+# ---------------------------------------------------------------------------
+# Output report (PDF, XLS)
+# ---------------------------------------------------------------------------
+
+_OUTPUT_FORMATS: dict[str, str] = {
+    "pdf": "PDF Format (*.pdf)",
+    "xlsx": "Microsoft Excel (*.xlsx)",
+    "rtf": "Rich Text Format (*.rtf)",
+    "txt": "MS-DOS Text (*.txt)",
+}
+
+def ac_output_report(
+    db_path: str, report_name: str,
+    output_path: Optional[str] = None, fmt: str = "pdf",
+) -> dict:
+    """Exporta un report a PDF, XLSX, RTF o TXT."""
+    app = _Session.connect(db_path)
+    fmt_lower = fmt.lower()
+    format_string = _OUTPUT_FORMATS.get(fmt_lower)
+    if not format_string:
+        raise ValueError(f"Formato '{fmt}' no soportado. Usar: {list(_OUTPUT_FORMATS.keys())}")
+
+    ext_map = {"pdf": ".pdf", "xlsx": ".xlsx", "rtf": ".rtf", "txt": ".txt"}
+    if output_path is None:
+        resolved = str(Path(db_path).resolve())
+        db_dir = os.path.dirname(resolved)
+        output_path = os.path.join(db_dir, f"{report_name}{ext_map[fmt_lower]}")
+
+    output_path = str(Path(output_path).resolve())
+    try:
+        app.DoCmd.OutputTo(_AC_OUTPUT_REPORT, report_name, format_string, output_path)
+    except Exception as exc:
+        raise RuntimeError(f"Error al exportar report '{report_name}': {exc}")
+
+    size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
+    return {
+        "report_name": report_name, "output_path": output_path,
+        "format": fmt_lower, "size_bytes": size,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Transfer data (import/export Excel/CSV)
+# ---------------------------------------------------------------------------
+
+def ac_transfer_data(
+    db_path: str, action: str, file_path: str, table_name: str,
+    has_headers: bool = True, file_type: str = "xlsx",
+    range_: Optional[str] = None, spec_name: Optional[str] = None,
+) -> dict:
+    """Importa o exporta datos entre Access y Excel/CSV."""
+    app = _Session.connect(db_path)
+    file_path = str(Path(file_path).resolve())
+    ft = file_type.lower()
+
+    if action == "import":
+        transfer_type_spreadsheet = _AC_IMPORT      # 0
+        transfer_type_text = 0                       # acImportDelim
+    elif action == "export":
+        transfer_type_spreadsheet = _AC_EXPORT       # 1
+        transfer_type_text = _AC_EXPORT_DELIM        # 2
+    else:
+        raise ValueError(f"action debe ser 'import' o 'export', recibido: '{action}'")
+
+    try:
+        if ft in ("xlsx", "xls", "excel"):
+            app.DoCmd.TransferSpreadsheet(
+                transfer_type_spreadsheet,
+                _AC_SPREADSHEET_XLSX,
+                table_name,
+                file_path,
+                has_headers,
+                range_ or "",
+            )
+        elif ft in ("csv", "txt", "text"):
+            app.DoCmd.TransferText(
+                transfer_type_text,
+                spec_name or "",
+                table_name,
+                file_path,
+                has_headers,
+            )
+        else:
+            raise ValueError(f"file_type '{file_type}' no soportado. Usar: xlsx, csv")
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"Error en TransferData ({action} {ft}): {exc}")
+
+    return {"action": action, "file_type": ft, "table_name": table_name, "file_path": file_path}
+
+
+# ---------------------------------------------------------------------------
+# Field properties
+# ---------------------------------------------------------------------------
+
+def ac_get_field_properties(db_path: str, table_name: str, field_name: str) -> dict:
+    """Lee todas las propiedades de un campo."""
+    app = _Session.connect(db_path)
+    db = app.CurrentDb()
+    try:
+        td = db.TableDefs(table_name)
+    except Exception as exc:
+        raise ValueError(f"Tabla '{table_name}' no encontrada: {exc}")
+    try:
+        fld = td.Fields(field_name)
+    except Exception as exc:
+        raise ValueError(f"Campo '{field_name}' no encontrado en '{table_name}': {exc}")
+
+    props = {}
+    for i in range(fld.Properties.Count):
+        try:
+            p = fld.Properties(i)
+            val = p.Value
+            # Skip binary/complex values
+            if isinstance(val, (str, int, float, bool)) or val is None:
+                props[p.Name] = val
+        except Exception:
+            pass  # Some properties throw COM errors when read
+    return {"table_name": table_name, "field_name": field_name, "properties": props}
+
+
+def ac_set_field_property(
+    db_path: str, table_name: str, field_name: str,
+    property_name: str, value: Any,
+) -> dict:
+    """Establece una propiedad de un campo. Crea la propiedad si no existe."""
+    app = _Session.connect(db_path)
+    db = app.CurrentDb()
+    try:
+        td = db.TableDefs(table_name)
+    except Exception as exc:
+        raise ValueError(f"Tabla '{table_name}' no encontrada: {exc}")
+    try:
+        fld = td.Fields(field_name)
+    except Exception as exc:
+        raise ValueError(f"Campo '{field_name}' no encontrado en '{table_name}': {exc}")
+
+    coerced = _coerce_prop(value)
+
+    # Try to set existing property
+    try:
+        fld.Properties(property_name).Value = coerced
+        return {
+            "table_name": table_name, "field_name": field_name,
+            "property_name": property_name, "value": coerced, "action": "updated",
+        }
+    except Exception:
+        pass
+
+    # Create property
+    if isinstance(coerced, bool):
+        prop_type = 1   # dbBoolean
+    elif isinstance(coerced, int):
+        prop_type = 4   # dbLong
+    else:
+        prop_type = 10  # dbText
+    try:
+        prop = fld.CreateProperty(property_name, prop_type, coerced)
+        fld.Properties.Append(prop)
+        return {
+            "table_name": table_name, "field_name": field_name,
+            "property_name": property_name, "value": coerced, "action": "created",
+        }
+    except Exception as exc:
+        raise RuntimeError(
+            f"No se pudo establecer '{property_name}' en {table_name}.{field_name}: {exc}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Startup options
+# ---------------------------------------------------------------------------
+
+def ac_list_startup_options(db_path: str) -> dict:
+    """Lista las opciones de startup comunes con sus valores actuales."""
+    app = _Session.connect(db_path)
+    db = app.CurrentDb()
+    options = []
+    for name in _STARTUP_PROPS:
+        val = None
+        source = "<not set>"
+        try:
+            val = db.Properties(name).Value
+            source = "database"
+        except Exception:
+            try:
+                val = app.GetOption(name)
+                source = "application"
+            except Exception:
+                pass
+        options.append({"name": name, "value": val, "source": source})
+    return {"count": len(options), "options": options}
 
 
 # ---------------------------------------------------------------------------
@@ -1383,26 +2640,15 @@ def ac_export_structure(db_path: str, output_path: Optional[str] = None) -> str:
 TOOLS = [
     types.Tool(
         name="access_list_objects",
-        description=(
-            "USAR SIEMPRE COMO PRIMER PASO al trabajar con una base de datos Access (.accdb/.mdb). "
-            "Lista todos los objetos de la BD agrupados por tipo: modulos VBA, formularios, "
-            "informes, queries y macros. "
-            "Sin llamar a esta tool el agente no sabe que formularios, modulos ni objetos "
-            "existen en la base de datos — no intentes adivinarlos. "
-            "object_type puede ser 'module', 'form', 'report', 'query', 'macro' o 'all'."
-        ),
+        description="Lista objetos de la BD por tipo (table, module, form, report, query, macro, all). Tablas de sistema (MSys*, ~*) se filtran.",
         inputSchema={
             "type": "object",
             "properties": {
-                "db_path": {
-                    "type": "string",
-                    "description": "Ruta completa al fichero .accdb o .mdb",
-                },
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
                 "object_type": {
                     "type": "string",
-                    "enum": ["all", "module", "form", "report", "query", "macro"],
+                    "enum": ["all", "table", "module", "form", "report", "query", "macro"],
                     "default": "all",
-                    "description": "Tipo de objeto a listar. Valores: 'module' (VBA módulo), 'form' (formulario), 'report' (informe), 'query' (consulta), 'macro' (macro), 'all' (todos). Por defecto: 'all'",
                 },
             },
             "required": ["db_path"],
@@ -1411,31 +2657,15 @@ TOOLS = [
     types.Tool(
         name="access_get_code",
         description=(
-            "Lee y devuelve el codigo VBA o la definicion completa de cualquier objeto "
-            "de una base de datos Access (.accdb/.mdb). "
-            "DEBES llamar a esta tool antes de modificar cualquier objeto — nunca escribas "
-            "codigo VBA de Access sin haber leido primero el original con esta tool. "
-            "Para modulos VBA devuelve codigo .bas limpio. "
-            "Para formularios e informes devuelve el formato interno de Access "
-            "(propiedades + seccion Class Module con el VBA). "
-            "Es la unica forma de leer el codigo fuente de un objeto Access desde Claude Code."
+            "Lee codigo/definicion de un objeto Access. "
+            "Modulos: codigo .bas. Forms/reports: formato interno (props + VBA)."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "db_path": {
-                    "type": "string",
-                    "description": "Ruta completa al fichero .accdb o .mdb (ej: C:\\ruta\\database.accdb)",
-                },
-                "object_type": {
-                    "type": "string",
-                    "enum": ["module", "form", "report", "query", "macro"],
-                    "description": "Tipo del objeto: 'module' (VBA módulo), 'form' (formulario), 'report' (informe), 'query' (consulta), 'macro' (macro)",
-                },
-                "object_name": {
-                    "type": "string",
-                    "description": "Nombre exacto del objeto (case-sensitive). Para obtener los nombres válidos, usa primero access_list_objects",
-                },
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "object_type": {"type": "string", "enum": ["module", "form", "report", "query", "macro"]},
+                "object_name": {"type": "string", "description": "Nombre del objeto"},
             },
             "required": ["db_path", "object_type", "object_name"],
         },
@@ -1443,33 +2673,16 @@ TOOLS = [
     types.Tool(
         name="access_set_code",
         description=(
-            "Escribe (importa) el codigo modificado de un objeto en la base de datos Access. "
-            "Si el objeto ya existe lo SOBREESCRIBE; si no existe lo CREA. "
-            "Es la unica forma de guardar cambios en VBA o en la definicion de un objeto Access. "
-            "OBLIGATORIO: llamar siempre a access_get_code primero para obtener "
-            "el texto original y modificar solo lo necesario — especialmente en formularios "
-            "e informes donde el formato incluye propiedades de controles que no debes alterar."
+            "Importa codigo en la BD. Sobreescribe si existe, crea si no. "
+            "Llamar access_get_code antes para leer el original."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "db_path": {
-                    "type": "string",
-                    "description": "Ruta completa al fichero .accdb o .mdb (ej: C:\\ruta\\database.accdb)",
-                },
-                "object_type": {
-                    "type": "string",
-                    "enum": ["module", "form", "report", "query", "macro"],
-                    "description": "Tipo del objeto: 'module' (VBA módulo), 'form' (formulario), 'report' (informe), 'query' (consulta), 'macro' (macro)",
-                },
-                "object_name": {
-                    "type": "string",
-                    "description": "Nombre exacto del objeto (case-sensitive). Para obtener los nombres válidos, usa primero access_list_objects",
-                },
-                "code": {
-                    "type": "string",
-                    "description": "Contenido completo del objeto. IMPORTANTE: para módulos VBA usar texto limpio; para formularios/informes usar el formato completo devuelto por access_get_code. Nunca modifiques el texto sin haber antes obtenido el original con access_get_code",
-                },
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "object_type": {"type": "string", "enum": ["module", "form", "report", "query", "macro"]},
+                "object_name": {"type": "string", "description": "Nombre del objeto"},
+                "code": {"type": "string", "description": "Contenido completo del objeto"},
             },
             "required": ["db_path", "object_type", "object_name", "code"],
         },
@@ -1477,22 +2690,20 @@ TOOLS = [
     types.Tool(
         name="access_execute_sql",
         description=(
-            "Ejecuta SQL directamente en una base de datos Access (.accdb/.mdb) via DAO. "
-            "Es la unica forma de consultar o modificar datos de tablas Access desde Claude Code. "
-            "SELECT devuelve las filas como JSON. "
-            "INSERT/UPDATE/DELETE devuelven el numero de filas afectadas. "
-            "Funciona con tablas locales y tablas linkadas a SQL Server."
+            "Ejecuta SQL via DAO. SELECT devuelve filas JSON (limit por defecto: 500). "
+            "INSERT/UPDATE devuelven affected_rows. "
+            "DELETE/DROP/ALTER requieren confirm_destructive=true."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "db_path": {
-                    "type": "string",
-                    "description": "Ruta completa al fichero .accdb o .mdb (ej: C:\\ruta\\database.accdb)",
-                },
-                "sql": {
-                    "type": "string",
-                    "description": "Sentencia SQL a ejecutar (SELECT, INSERT, UPDATE, DELETE, etc.)",
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "sql": {"type": "string", "description": "Sentencia SQL"},
+                "limit": {"type": "integer", "default": 500,
+                          "description": "Max filas para SELECT (default: 500, max: 10000)"},
+                "confirm_destructive": {
+                    "type": "boolean", "default": False,
+                    "description": "Requerido para DELETE/DROP/TRUNCATE/ALTER",
                 },
             },
             "required": ["db_path", "sql"],
@@ -1500,22 +2711,12 @@ TOOLS = [
     ),
     types.Tool(
         name="access_table_info",
-        description=(
-            "Devuelve la estructura de una tabla local o linkada de Access: "
-            "campos con nombre, tipo DAO, tamaño, required; record_count; is_linked. "
-            "Usa DAO TableDef.Fields — mas preciso que SELECT TOP 1 para ver tipos de datos."
-        ),
+        description="Estructura de una tabla via DAO: campos, tipos, tamaño, required, record_count, is_linked.",
         inputSchema={
             "type": "object",
             "properties": {
-                "db_path": {
-                    "type": "string",
-                    "description": "Ruta completa al fichero .accdb o .mdb (ej: C:\\ruta\\database.accdb)",
-                },
-                "table_name": {
-                    "type": "string",
-                    "description": "Nombre exacto de la tabla (case-sensitive)",
-                },
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "table_name": {"type": "string", "description": "Nombre de la tabla"},
             },
             "required": ["db_path", "table_name"],
         },
@@ -1523,36 +2724,21 @@ TOOLS = [
     types.Tool(
         name="access_export_structure",
         description=(
-            "Genera un fichero Markdown con la estructura completa de una base de datos Access: "
-            "modulos VBA con sus funciones/subs, formularios, informes, queries y macros. "
-            "USAR AL INICIO de cualquier proyecto Access para obtener un indice completo "
-            "de la BD antes de empezar a trabajar. Tambien util para actualizar el indice "
-            "despues de añadir o eliminar objetos."
+            "Genera Markdown con estructura de la BD: modulos con firmas, forms, reports, queries, macros. "
+            "Escribe a disco y devuelve el contenido."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "db_path": {
-                    "type": "string",
-                    "description": "Ruta completa al fichero .accdb o .mdb (ej: C:\\ruta\\database.accdb)",
-                },
-                "output_path": {
-                    "type": "string",
-                    "description": (
-                        "Ruta donde guardar el fichero .md de estructura. "
-                        "Si no se especifica, se crea 'db_structure.md' en el mismo directorio que la base de datos"
-                    ),
-                },
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "output_path": {"type": "string", "description": "Ruta .md de salida (default: db_structure.md junto a la BD)"},
             },
             "required": ["db_path"],
         },
     ),
     types.Tool(
         name="access_close",
-        description=(
-            "Cierra la sesion COM con Access y libera el fichero .accdb/.mdb. "
-            "Llamar al terminar una sesion de edicion para que otros procesos puedan abrir la BD."
-        ),
+        description="Cierra la sesion COM y libera el .accdb/.mdb.",
         inputSchema={
             "type": "object",
             "properties": {},
@@ -1562,19 +2748,14 @@ TOOLS = [
     # ── VBE line-level tools ─────────────────────────────────────────────────
     types.Tool(
         name="access_vbe_get_lines",
-        description=(
-            "Lee un rango de lineas de un modulo VBA de Access directamente via VBE COM, "
-            "sin exportar el fichero entero. Mas eficiente que access_get_code "
-            "cuando solo necesitas inspeccionar una zona concreta antes de editarla. "
-            "object_type: 'module', 'form' o 'report'."
-        ),
+        description="Lee un rango de lineas de un modulo VBA via VBE COM.",
         inputSchema={
             "type": "object",
             "properties": {
-                "db_path": {"type": "string", "description": "Ruta completa al fichero .accdb o .mdb (ej: C:\\ruta\\database.accdb)"},
-                "object_type": {"type": "string", "enum": ["module", "form", "report"], "description": "Tipo: 'module' (VBA módulo), 'form' (formulario), 'report' (informe)"},
-                "object_name": {"type": "string", "description": "Nombre exacto (case-sensitive). Usa access_list_objects para obtener los nombres válidos"},
-                "start_line":  {"type": "integer", "description": "Primera linea a leer (1-based)"},
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "object_type": {"type": "string", "enum": ["module", "form", "report"]},
+                "object_name": {"type": "string", "description": "Nombre del objeto"},
+                "start_line":  {"type": "integer", "description": "Primera linea (1-based)"},
                 "count":       {"type": "integer", "description": "Numero de lineas a leer"},
             },
             "required": ["db_path", "object_type", "object_name", "start_line", "count"],
@@ -1582,37 +2763,27 @@ TOOLS = [
     ),
     types.Tool(
         name="access_vbe_get_proc",
-        description=(
-            "Devuelve el codigo completo de un procedimiento VBA (Sub/Function/Property) "
-            "de un objeto Access buscandolo por nombre via VBE. "
-            "Mucho mas eficiente que access_get_code cuando solo interesa una funcion concreta. "
-            "Devuelve: start_line, body_line (donde empieza el cuerpo), count, code."
-        ),
+        description="Codigo de un procedimiento VBA por nombre. Devuelve start_line, body_line, count, code.",
         inputSchema={
             "type": "object",
             "properties": {
-                "db_path": {"type": "string", "description": "Ruta completa al fichero .accdb o .mdb (ej: C:\\ruta\\database.accdb)"},
-                "object_type": {"type": "string", "enum": ["module", "form", "report"], "description": "Tipo: 'module' (VBA módulo), 'form' (formulario), 'report' (informe)"},
-                "object_name": {"type": "string", "description": "Nombre exacto (case-sensitive). Usa access_list_objects para obtener los nombres válidos"},
-                "proc_name":   {"type": "string", "description": "Nombre exacto del Sub/Function/Property"},
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "object_type": {"type": "string", "enum": ["module", "form", "report"]},
+                "object_name": {"type": "string", "description": "Nombre del objeto"},
+                "proc_name":   {"type": "string", "description": "Nombre del Sub/Function/Property"},
             },
             "required": ["db_path", "object_type", "object_name", "proc_name"],
         },
     ),
     types.Tool(
         name="access_vbe_module_info",
-        description=(
-            "Devuelve el numero total de lineas y el indice completo de procedimientos "
-            "(con start_line, body_line y count de cada uno) de un modulo VBA de Access. "
-            "USAR ANTES de access_vbe_get_proc o access_vbe_replace_lines para saber "
-            "exactamente donde esta cada funcion sin descargar el codigo completo."
-        ),
+        description="Indice de procedimientos de un modulo VBA: total_lines, procs [{name, start_line, body_line, count}].",
         inputSchema={
             "type": "object",
             "properties": {
-                "db_path": {"type": "string", "description": "Ruta completa al fichero .accdb o .mdb (ej: C:\\ruta\\database.accdb)"},
-                "object_type": {"type": "string", "enum": ["module", "form", "report"], "description": "Tipo: 'module' (VBA módulo), 'form' (formulario), 'report' (informe)"},
-                "object_name": {"type": "string", "description": "Nombre exacto (case-sensitive). Usa access_list_objects para obtener los nombres válidos"},
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "object_type": {"type": "string", "enum": ["module", "form", "report"]},
+                "object_name": {"type": "string", "description": "Nombre del objeto"},
             },
             "required": ["db_path", "object_type", "object_name"],
         },
@@ -1620,102 +2791,98 @@ TOOLS = [
     types.Tool(
         name="access_vbe_replace_lines",
         description=(
-            "Reemplaza lineas en un modulo VBA de Access directamente via VBE COM, "
-            "sin exportar ni reimportar el modulo entero. "
-            "Usar para ediciones quirurgicas: modificar una funcion, añadir declaraciones, etc. "
-            "Borra 'count' lineas desde 'start_line' e inserta 'new_code' en su lugar. "
-            "count=0 → insercion pura. new_code='' → borrado puro. "
-            "new_code puede ser multilinea (separado por \\n). "
-            "Valida limites automaticamente: si count excede el final del modulo, se ajusta. "
-            "Devuelve el nuevo total de lineas del modulo. "
-            "Para reemplazar funciones enteras, preferir access_vbe_replace_proc (mas seguro)."
+            "Reemplaza lineas en un modulo VBA via VBE. "
+            "count=0: insercion. new_code='': borrado. Valida limites automaticamente."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "db_path": {"type": "string", "description": "Ruta completa al fichero .accdb o .mdb (ej: C:\\ruta\\database.accdb)"},
-                "object_type": {"type": "string", "enum": ["module", "form", "report"], "description": "Tipo: 'module' (VBA módulo), 'form' (formulario), 'report' (informe)"},
-                "object_name": {"type": "string", "description": "Nombre exacto (case-sensitive). Usa access_list_objects para obtener los nombres válidos"},
-                "start_line":  {"type": "integer", "description": "Primera linea afectada (1-based)"},
-                "count":       {"type": "integer", "description": "Lineas a eliminar (0 = solo insertar)"},
-                "new_code":    {"type": "string",  "description": "Codigo nuevo ('' = solo borrar)"},
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "object_type": {"type": "string", "enum": ["module", "form", "report"]},
+                "object_name": {"type": "string", "description": "Nombre del objeto"},
+                "start_line":  {"type": "integer", "description": "Primera linea (1-based)"},
+                "count":       {"type": "integer", "description": "Lineas a eliminar (0 = insertar)"},
+                "new_code":    {"type": "string",  "description": "Codigo nuevo ('' = borrar)"},
             },
             "required": ["db_path", "object_type", "object_name", "start_line", "count", "new_code"],
         },
     ),
     types.Tool(
         name="access_vbe_find",
-        description=(
-            "Busca texto en un modulo VBA de Access y devuelve todas las lineas que coinciden "
-            "con su numero de linea. Usar para localizar variables, llamadas a funciones, "
-            "o cualquier patron de texto antes de editar. "
-            "Devuelve: found, match_count, matches [{line, content}]."
-        ),
+        description="Busca texto o regex en un modulo VBA. Devuelve matches [{line, content}].",
         inputSchema={
             "type": "object",
             "properties": {
-                "db_path": {"type": "string", "description": "Ruta completa al fichero .accdb o .mdb (ej: C:\\ruta\\database.accdb)"},
-                "object_type": {"type": "string", "enum": ["module", "form", "report"], "description": "Tipo: 'module' (VBA módulo), 'form' (formulario), 'report' (informe)"},
-                "object_name": {"type": "string", "description": "Nombre exacto (case-sensitive). Usa access_list_objects para obtener los nombres válidos"},
-                "search_text": {"type": "string", "description": "Texto a buscar"},
-                "match_case":  {"type": "boolean", "description": "Distinguir mayusculas (default: false)", "default": False},
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "object_type": {"type": "string", "enum": ["module", "form", "report"]},
+                "object_name": {"type": "string", "description": "Nombre del objeto"},
+                "search_text": {"type": "string", "description": "Texto o patron regex a buscar"},
+                "match_case":  {"type": "boolean", "default": False},
+                "use_regex": {"type": "boolean", "default": False,
+                              "description": "true = interpretar search_text como regex"},
             },
             "required": ["db_path", "object_type", "object_name", "search_text"],
         },
     ),
     types.Tool(
         name="access_vbe_search_all",
-        description=(
-            "Busca texto en TODOS los modulos VBA de la base de datos Access "
-            "(modules, forms, reports) de una sola vez. "
-            "Ideal para refactoring o localizar donde se usa una funcion/variable "
-            "sin tener que llamar access_vbe_find una vez por cada objeto. "
-            "Devuelve: total_matches, results [{object_type, object_name, matches: [{line, content}]}]."
-        ),
+        description="Busca texto o regex en TODOS los modulos VBA (modules, forms, reports) de la BD.",
         inputSchema={
             "type": "object",
             "properties": {
-                "db_path": {"type": "string", "description": "Ruta completa al fichero .accdb o .mdb (ej: C:\\ruta\\database.accdb)"},
-                "search_text": {"type": "string", "description": "Texto a buscar en todos los modulos"},
-                "match_case":  {"type": "boolean", "description": "Distinguir mayusculas (default: false)", "default": False},
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "search_text": {"type": "string", "description": "Texto o patron regex a buscar"},
+                "match_case":  {"type": "boolean", "default": False},
+                "max_results": {"type": "integer", "default": 100,
+                                "description": "Max coincidencias totales (default: 100)"},
+                "use_regex": {"type": "boolean", "default": False,
+                              "description": "true = interpretar search_text como regex"},
+            },
+            "required": ["db_path", "search_text"],
+        },
+    ),
+    types.Tool(
+        name="access_search_queries",
+        description="Busca texto o regex en el SQL de TODAS las queries. Devuelve [{query_name, sql}].",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "search_text": {"type": "string", "description": "Texto o patron regex a buscar en el SQL"},
+                "match_case": {"type": "boolean", "default": False},
+                "max_results": {"type": "integer", "default": 100,
+                                "description": "Max queries a devolver (default: 100)"},
+                "use_regex": {"type": "boolean", "default": False,
+                              "description": "true = interpretar search_text como regex"},
             },
             "required": ["db_path", "search_text"],
         },
     ),
     types.Tool(
         name="access_vbe_replace_proc",
-        description=(
-            "Reemplaza un procedimiento VBA completo (Sub/Function/Property) por nombre. "
-            "Calcula los limites automaticamente via COM — NO necesitas saber los numeros de linea. "
-            "Si new_code esta vacio, elimina el procedimiento. "
-            "Mas seguro que access_vbe_replace_lines para reemplazar funciones enteras."
-        ),
+        description="Reemplaza un procedimiento VBA completo por nombre. new_code='' lo elimina.",
         inputSchema={
             "type": "object",
             "properties": {
-                "db_path": {"type": "string", "description": "Ruta completa al fichero .accdb o .mdb (ej: C:\\ruta\\database.accdb)"},
-                "object_type": {"type": "string", "enum": ["module", "form", "report"], "description": "Tipo: 'module' (VBA módulo), 'form' (formulario), 'report' (informe)"},
-                "object_name": {"type": "string", "description": "Nombre exacto (case-sensitive). Usa access_list_objects para obtener los nombres válidos"},
-                "proc_name":   {"type": "string", "description": "Nombre exacto del Sub/Function/Property a reemplazar o eliminar"},
-                "new_code":    {"type": "string", "description": "Codigo nuevo completo del procedimiento. Vacio ('') para eliminar el proc"},
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "object_type": {"type": "string", "enum": ["module", "form", "report"]},
+                "object_name": {"type": "string", "description": "Nombre del objeto"},
+                "proc_name":   {"type": "string", "description": "Nombre del Sub/Function/Property"},
+                "new_code":    {"type": "string", "description": "Codigo nuevo ('' = eliminar)"},
             },
             "required": ["db_path", "object_type", "object_name", "proc_name", "new_code"],
         },
     ),
     types.Tool(
         name="access_vbe_append",
-        description=(
-            "Añade codigo al final de un modulo VBA de Access. "
-            "Mas seguro que replace_lines para insertar nuevas funciones o declaraciones "
-            "sin necesidad de calcular numeros de linea."
-        ),
+        description="Añade codigo al final de un modulo VBA.",
         inputSchema={
             "type": "object",
             "properties": {
-                "db_path": {"type": "string", "description": "Ruta completa al fichero .accdb o .mdb (ej: C:\\ruta\\database.accdb)"},
-                "object_type": {"type": "string", "enum": ["module", "form", "report"], "description": "Tipo: 'module' (VBA módulo), 'form' (formulario), 'report' (informe)"},
-                "object_name": {"type": "string", "description": "Nombre exacto (case-sensitive). Usa access_list_objects para obtener los nombres válidos"},
-                "new_code":    {"type": "string", "description": "Codigo a añadir al final del modulo. Puede ser multilinea (separado por \\n)"},
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "object_type": {"type": "string", "enum": ["module", "form", "report"]},
+                "object_name": {"type": "string", "description": "Nombre del objeto"},
+                "new_code":    {"type": "string", "description": "Codigo a añadir"},
             },
             "required": ["db_path", "object_type", "object_name", "new_code"],
         },
@@ -1723,38 +2890,27 @@ TOOLS = [
     # ── Control-level tools ──────────────────────────────────────────────────
     types.Tool(
         name="access_list_controls",
-        description=(
-            "Lista todos los controles de un formulario o informe Access con sus "
-            "propiedades clave: nombre, tipo, caption, control_source, posicion y linea. "
-            "USAR como paso previo a access_get_control o access_set_control_props "
-            "para conocer los nombres exactos de los controles antes de modificarlos. "
-            "No incluye controles dentro de TabControl (estan a mayor profundidad)."
-        ),
+        description="Lista controles de un form/report con nombre, tipo, caption, control_source, posicion.",
         inputSchema={
             "type": "object",
             "properties": {
-                "db_path": {"type": "string", "description": "Ruta completa al fichero .accdb o .mdb (ej: C:\\ruta\\database.accdb)"},
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
                 "object_type": {"type": "string", "enum": ["form", "report"]},
-                "object_name": {"type": "string", "description": "Nombre del formulario o informe"},
+                "object_name": {"type": "string", "description": "Nombre del form/report"},
             },
             "required": ["db_path", "object_type", "object_name"],
         },
     ),
     types.Tool(
         name="access_get_control",
-        description=(
-            "Devuelve la definicion completa (bloque Begin...End) de un control concreto "
-            "de un formulario o informe Access, buscado por nombre. "
-            "Para modificar propiedades del control usa access_set_control_props."
-            "No lo uses para nombres de controles sin nombre."
-        ),
+        description="Definicion completa (Begin...End) de un control por nombre.",
         inputSchema={
             "type": "object",
             "properties": {
-                "db_path": {"type": "string", "description": "Ruta completa al fichero .accdb o .mdb (ej: C:\\ruta\\database.accdb)"},
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
                 "object_type": {"type": "string", "enum": ["form", "report"]},
-                "object_name": {"type": "string", "description": "Nombre del formulario o informe"},
-                "control_name": {"type": "string", "description": "Nombre exacto del control (case-sensitive). Usa access_list_controls para obtenerlos"},
+                "object_name": {"type": "string", "description": "Nombre del form/report"},
+                "control_name": {"type": "string", "description": "Nombre del control"},
             },
             "required": ["db_path", "object_type", "object_name", "control_name"],
         },
@@ -1762,22 +2918,20 @@ TOOLS = [
     types.Tool(
         name="access_create_control",
         description=(
-            "Crea un control nuevo en un formulario o informe Access via COM (CreateControl). "
-            "Abre el objeto en vista diseno, crea el control, asigna propiedades y guarda. "
-            "control_type: nombre ('CommandButton', 'TextBox', 'Label'...) o numero (104, 109, 100...). "
-            "props claves especiales: section (0=Detail,1=Header,2=Footer), parent, column_name, "
-            "left, top, width, height. Resto de claves: Name, Caption, ControlSource, OnClick, etc."
+            "Crea un control en un form/report via COM. "
+            "control_type: nombre o numero. "
+            "props especiales: section (0=Detail,1=Header,2=Footer), parent, column_name, left, top, width, height."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "db_path": {"type": "string", "description": "Ruta completa al fichero .accdb o .mdb (ej: C:\\ruta\\database.accdb)"},
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
                 "object_type": {"type": "string", "enum": ["form", "report"]},
-                "object_name": {"type": "string", "description": "Nombre del formulario o informe"},
-                "control_type": {"type": "string", "description": "Tipo del control: nombre ('CommandButton', 'TextBox', 'Label') o valor numerico (104, 109, 100...)"},
+                "object_name": {"type": "string", "description": "Nombre del form/report"},
+                "control_type": {"type": "string", "description": "'CommandButton', 'TextBox', 'Label'... o numero (104, 109, 100...)"},
                 "props": {
                     "type": "object",
-                    "description": "Propiedades del control. Claves especiales: section (0=Detail,1=Header,2=Footer), parent (nombre del contenedor), column_name, left, top, width, height. Otras propiedades: Name, Caption, ControlSource, Visible, OnClick, etc.",
+                    "description": "Propiedades: section, parent, column_name, left, top, width, height, Name, Caption, etc.",
                     "additionalProperties": True,
                 },
             },
@@ -1786,43 +2940,469 @@ TOOLS = [
     ),
     types.Tool(
         name="access_delete_control",
-        description=(
-            "Elimina un control de un formulario o informe Access via COM (DeleteControl). "
-            "Abre el objeto en vista diseno, elimina el control y guarda."
-        ),
+        description="Elimina un control de un form/report via COM.",
         inputSchema={
             "type": "object",
             "properties": {
-                "db_path": {"type": "string", "description": "Ruta completa al fichero .accdb o .mdb (ej: C:\\ruta\\database.accdb)"},
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
                 "object_type": {"type": "string", "enum": ["form", "report"]},
-                "object_name": {"type": "string", "description": "Nombre del formulario o informe"},
-                "control_name": {"type": "string", "description": "Nombre exacto del control a eliminar (case-sensitive). Usa access_list_controls para obtenerlo"},
+                "object_name": {"type": "string", "description": "Nombre del form/report"},
+                "control_name": {"type": "string", "description": "Nombre del control"},
             },
             "required": ["db_path", "object_type", "object_name", "control_name"],
         },
     ),
     types.Tool(
         name="access_set_control_props",
-        description=(
-            "Modifica propiedades de un control existente en un formulario o informe Access "
-            "via COM en vista diseno. Asigna las propiedades indicadas y guarda. "
-            "Los valores numericos y booleanos se convierten automaticamente. "
-            "Devuelve {applied: [...], errors: {...}} para confirmar que se aplico."
-        ),
+        description="Modifica propiedades de un control via COM. Numericos/booleanos se convierten automaticamente.",
         inputSchema={
             "type": "object",
             "properties": {
-                "db_path": {"type": "string", "description": "Ruta completa al fichero .accdb o .mdb (ej: C:\\ruta\\database.accdb)"},
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
                 "object_type": {"type": "string", "enum": ["form", "report"]},
-                "object_name": {"type": "string", "description": "Nombre del formulario o informe"},
-                "control_name": {"type": "string", "description": "Nombre exacto del control (case-sensitive). Usa access_list_controls para obtenerlo"},
+                "object_name": {"type": "string", "description": "Nombre del form/report"},
+                "control_name": {"type": "string", "description": "Nombre del control"},
                 "props": {
                     "type": "object",
-                    "description": "Diccionario de propiedades a modificar. Ejemplos: {Caption: 'Nuevo Texto', Left: 1000, Visible: true, ControlSource: 'Campo'}. Valores numéricos y booleanos se convierten automáticamente",
+                    "description": "Propiedades a modificar: {Caption: 'X', Left: 1000, Visible: true, ...}",
                     "additionalProperties": True,
                 },
             },
             "required": ["db_path", "object_type", "object_name", "control_name", "props"],
+        },
+    ),
+    # ── Database properties ──────────────────────────────────────────────────
+    types.Tool(
+        name="access_get_db_property",
+        description="Lee una propiedad de la BD (CurrentDb.Properties) o opcion de Access (GetOption).",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "name": {"type": "string", "description": "Nombre de la propiedad (ej: AppTitle, StartupForm, AllowBypassKey)"},
+            },
+            "required": ["db_path", "name"],
+        },
+    ),
+    types.Tool(
+        name="access_set_db_property",
+        description="Establece una propiedad de la BD o opcion de Access. Crea la propiedad si no existe.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "name": {"type": "string", "description": "Nombre de la propiedad"},
+                "value": {"description": "Valor (string, numero o booleano)"},
+                "prop_type": {"type": "integer", "description": "Tipo DAO para CreateProperty (1=Boolean, 4=Long, 10=Text). Auto-detectado si se omite"},
+            },
+            "required": ["db_path", "name", "value"],
+        },
+    ),
+    # ── Linked tables ────────────────────────────────────────────────────────
+    types.Tool(
+        name="access_list_linked_tables",
+        description="Lista tablas vinculadas con source_table, connect_string, is_odbc.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+            },
+            "required": ["db_path"],
+        },
+    ),
+    types.Tool(
+        name="access_relink_table",
+        description="Cambia connect string de una tabla vinculada y refresca. relink_all=true actualiza todas con la misma conexion.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "table_name": {"type": "string", "description": "Nombre de la tabla vinculada"},
+                "new_connect": {"type": "string", "description": "Nueva cadena de conexion"},
+                "relink_all": {"type": "boolean", "default": False, "description": "true = relink todas con la misma conexion original"},
+            },
+            "required": ["db_path", "table_name", "new_connect"],
+        },
+    ),
+    # ── Relationships ────────────────────────────────────────────────────────
+    types.Tool(
+        name="access_list_relationships",
+        description="Lista relaciones entre tablas: nombre, tablas, campos, cascade flags.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+            },
+            "required": ["db_path"],
+        },
+    ),
+    types.Tool(
+        name="access_create_relationship",
+        description="Crea una relacion entre dos tablas. attributes: 256=cascade update, 4096=cascade delete (combinables con OR).",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "name": {"type": "string", "description": "Nombre de la relacion"},
+                "table": {"type": "string", "description": "Tabla principal (lado uno)"},
+                "foreign_table": {"type": "string", "description": "Tabla foranea (lado muchos)"},
+                "fields": {
+                    "type": "array",
+                    "description": "[{local: 'ID', foreign: 'FK_ID'}, ...]",
+                    "items": {
+                        "type": "object",
+                        "properties": {"local": {"type": "string"}, "foreign": {"type": "string"}},
+                        "required": ["local", "foreign"],
+                    },
+                },
+                "attributes": {"type": "integer", "default": 0, "description": "Bitmask: 256=cascade update, 4096=cascade delete"},
+            },
+            "required": ["db_path", "name", "table", "foreign_table", "fields"],
+        },
+    ),
+    # ── VBA References ───────────────────────────────────────────────────────
+    types.Tool(
+        name="access_list_references",
+        description="Lista referencias VBA: nombre, GUID, path, is_broken, built_in.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+            },
+            "required": ["db_path"],
+        },
+    ),
+    types.Tool(
+        name="access_manage_reference",
+        description="Agrega (add) o elimina (remove) una referencia VBA. add: requiere guid o path. remove: requiere name.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "action": {"type": "string", "enum": ["add", "remove"]},
+                "name": {"type": "string", "description": "[remove] Nombre de la referencia"},
+                "path": {"type": "string", "description": "[add] Ruta al .dll/.tlb/.olb"},
+                "guid": {"type": "string", "description": "[add] GUID de la type library"},
+                "major": {"type": "integer", "default": 0, "description": "[add+guid] Version mayor"},
+                "minor": {"type": "integer", "default": 0, "description": "[add+guid] Version menor"},
+            },
+            "required": ["db_path", "action"],
+        },
+    ),
+    # ── Compact & Repair ─────────────────────────────────────────────────────
+    types.Tool(
+        name="access_compact_repair",
+        description="Compacta y repara la BD. Cierra, compacta a temp, reemplaza original y reabre. Devuelve sizes.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+            },
+            "required": ["db_path"],
+        },
+    ),
+    # ── Query management ────────────────────────────────────────────────────
+    types.Tool(
+        name="access_manage_query",
+        description=(
+            "Gestiona QueryDefs: create, modify, delete (requiere confirm=true), rename, get_sql. "
+            "create/modify requieren sql."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "action": {"type": "string", "enum": ["create", "modify", "delete", "rename", "get_sql"]},
+                "query_name": {"type": "string", "description": "Nombre de la query"},
+                "sql": {"type": "string", "description": "[create/modify] SQL de la query"},
+                "new_name": {"type": "string", "description": "[rename] Nuevo nombre"},
+                "confirm": {"type": "boolean", "default": False, "description": "[delete] Confirmar eliminacion"},
+            },
+            "required": ["db_path", "action", "query_name"],
+        },
+    ),
+    # ── Indexes ─────────────────────────────────────────────────────────────
+    types.Tool(
+        name="access_list_indexes",
+        description="Lista indices de una tabla: nombre, campos, primary, unique, foreign.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "table_name": {"type": "string", "description": "Nombre de la tabla"},
+            },
+            "required": ["db_path", "table_name"],
+        },
+    ),
+    types.Tool(
+        name="access_manage_index",
+        description="Crea o elimina un indice. create requiere fields [{name, order?}]. primary/unique opcionales.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "table_name": {"type": "string", "description": "Nombre de la tabla"},
+                "action": {"type": "string", "enum": ["create", "delete"]},
+                "index_name": {"type": "string", "description": "Nombre del indice"},
+                "fields": {
+                    "type": "array", "description": "[create] [{name: 'Field', order: 'asc'|'desc'}]",
+                    "items": {
+                        "type": "object",
+                        "properties": {"name": {"type": "string"}, "order": {"type": "string", "default": "asc"}},
+                        "required": ["name"],
+                    },
+                },
+                "primary": {"type": "boolean", "default": False},
+                "unique": {"type": "boolean", "default": False},
+            },
+            "required": ["db_path", "table_name", "action", "index_name"],
+        },
+    ),
+    # ── Compile VBA ─────────────────────────────────────────────────────────
+    types.Tool(
+        name="access_compile_vba",
+        description="Compila y guarda todos los modulos VBA. Devuelve status o error de compilacion.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+            },
+            "required": ["db_path"],
+        },
+    ),
+    # ── Run macro ───────────────────────────────────────────────────────────
+    types.Tool(
+        name="access_run_macro",
+        description="Ejecuta una macro de Access por nombre.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "macro_name": {"type": "string", "description": "Nombre de la macro"},
+            },
+            "required": ["db_path", "macro_name"],
+        },
+    ),
+    # ── Output report ───────────────────────────────────────────────────────
+    types.Tool(
+        name="access_output_report",
+        description="Exporta un report a PDF, XLSX, RTF o TXT. output_path auto-generado si se omite.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "report_name": {"type": "string", "description": "Nombre del report"},
+                "output_path": {"type": "string", "description": "Ruta de salida (auto si se omite)"},
+                "format": {"type": "string", "default": "pdf", "description": "pdf, xlsx, rtf, txt"},
+            },
+            "required": ["db_path", "report_name"],
+        },
+    ),
+    # ── Transfer data ───────────────────────────────────────────────────────
+    types.Tool(
+        name="access_transfer_data",
+        description=(
+            "Import/export datos entre Access y Excel/CSV. "
+            "file_type: xlsx o csv. range solo para Excel, spec_name solo para CSV."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "action": {"type": "string", "enum": ["import", "export"]},
+                "file_path": {"type": "string", "description": "Ruta al fichero Excel/CSV"},
+                "table_name": {"type": "string", "description": "Nombre de la tabla Access"},
+                "has_headers": {"type": "boolean", "default": True},
+                "file_type": {"type": "string", "default": "xlsx", "description": "xlsx o csv"},
+                "range": {"type": "string", "description": "[xlsx] Rango ej: Sheet1!A1:D100"},
+                "spec_name": {"type": "string", "description": "[csv] Import/Export spec guardada en Access"},
+            },
+            "required": ["db_path", "action", "file_path", "table_name"],
+        },
+    ),
+    # ── Field properties ────────────────────────────────────────────────────
+    types.Tool(
+        name="access_get_field_properties",
+        description="Lee todas las propiedades de un campo: DefaultValue, ValidationRule, Description, Format, etc.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "table_name": {"type": "string", "description": "Nombre de la tabla"},
+                "field_name": {"type": "string", "description": "Nombre del campo"},
+            },
+            "required": ["db_path", "table_name", "field_name"],
+        },
+    ),
+    types.Tool(
+        name="access_set_field_property",
+        description="Establece una propiedad de un campo. Crea la propiedad si no existe.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "table_name": {"type": "string", "description": "Nombre de la tabla"},
+                "field_name": {"type": "string", "description": "Nombre del campo"},
+                "property_name": {"type": "string", "description": "Nombre de la propiedad (ej: Description, DefaultValue)"},
+                "value": {"description": "Valor (string, numero o booleano)"},
+            },
+            "required": ["db_path", "table_name", "field_name", "property_name", "value"],
+        },
+    ),
+    # ── Startup options ─────────────────────────────────────────────────────
+    types.Tool(
+        name="access_list_startup_options",
+        description="Lista las 14 opciones de startup comunes con sus valores actuales.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+            },
+            "required": ["db_path"],
+        },
+    ),
+    # ── Create database ────────────────────────────────────────────────────
+    types.Tool(
+        name="access_create_database",
+        description="Crea una BD Access (.accdb) vacia. Error si el fichero ya existe.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta para el nuevo .accdb"},
+            },
+            "required": ["db_path"],
+        },
+    ),
+    # ── Create table via DAO ──────────────────────────────────────────────
+    types.Tool(
+        name="access_create_table",
+        description=(
+            "Crea una tabla Access via DAO con soporte completo: tipos, defaults, "
+            "descripciones y primary key — todo en una sola llamada. "
+            "Mas robusto que CREATE TABLE via SQL, que no soporta DEFAULT ni YESNO en Jet DDL. "
+            "Cada campo acepta: name, type, size, required, primary_key, default, description. "
+            "Tipos validos: autonumber, long, integer, short, byte, text, memo, currency, "
+            "double, single, datetime, boolean/yesno/bit, guid, ole, bigint."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "table_name": {"type": "string", "description": "Nombre de la tabla"},
+                "fields": {
+                    "type": "array",
+                    "description": "Lista de campos [{name, type, size?, required?, primary_key?, default?, description?}]",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "type": {"type": "string", "default": "text"},
+                            "size": {"type": "integer"},
+                            "required": {"type": "boolean", "default": False},
+                            "primary_key": {"type": "boolean", "default": False},
+                            "default": {"description": "Valor default (string, numero o booleano)"},
+                            "description": {"type": "string"},
+                        },
+                        "required": ["name"],
+                    },
+                },
+            },
+            "required": ["db_path", "table_name", "fields"],
+        },
+    ),
+    # ── Alter table via DAO ───────────────────────────────────────────────
+    types.Tool(
+        name="access_alter_table",
+        description=(
+            "Modifica la estructura de una tabla Access via DAO. "
+            "Acciones: add_field (con tipo, size, default, description), "
+            "delete_field (requiere confirm=true), rename_field. "
+            "Mas robusto que ALTER TABLE via SQL en Jet."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "table_name": {"type": "string", "description": "Nombre de la tabla"},
+                "action": {"type": "string", "enum": ["add_field", "delete_field", "rename_field"]},
+                "field_name": {"type": "string", "description": "Nombre del campo"},
+                "new_name": {"type": "string", "description": "[rename_field] Nuevo nombre"},
+                "field_type": {"type": "string", "default": "text", "description": "[add_field] Tipo del campo"},
+                "size": {"type": "integer", "description": "[add_field] Tamaño para Text"},
+                "required": {"type": "boolean", "default": False},
+                "default": {"description": "[add_field] Valor default"},
+                "description": {"type": "string", "description": "[add_field] Descripcion del campo"},
+                "confirm": {"type": "boolean", "default": False, "description": "[delete_field] Confirmar eliminacion"},
+            },
+            "required": ["db_path", "table_name", "action", "field_name"],
+        },
+    ),
+    # ── Delete object ──────────────────────────────────────────────────────
+    types.Tool(
+        name="access_delete_object",
+        description="Elimina un objeto Access (module, form, report, query, macro). Requiere confirm=true.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "object_type": {"type": "string", "enum": ["module", "form", "report", "query", "macro"]},
+                "object_name": {"type": "string", "description": "Nombre del objeto a eliminar"},
+                "confirm": {"type": "boolean", "default": False, "description": "Requerido true para confirmar eliminacion"},
+            },
+            "required": ["db_path", "object_type", "object_name"],
+        },
+    ),
+    # ── Run VBA ────────────────────────────────────────────────────────────
+    types.Tool(
+        name="access_run_vba",
+        description="Ejecuta un Sub/Function VBA via Application.Run. procedure puede ser 'Modulo.NombreSub' o solo 'NombreSub'. Devuelve result si es Function.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "procedure": {"type": "string", "description": "Nombre del procedimiento VBA (ej: MiModulo.MiSub)"},
+                "args": {
+                    "type": "array",
+                    "description": "Argumentos opcionales (max 30)",
+                    "items": {},
+                },
+            },
+            "required": ["db_path", "procedure"],
+        },
+    ),
+    # ── Delete relationship ────────────────────────────────────────────────
+    types.Tool(
+        name="access_delete_relationship",
+        description="Elimina una relacion entre tablas por nombre.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "name": {"type": "string", "description": "Nombre de la relacion a eliminar"},
+            },
+            "required": ["db_path", "name"],
+        },
+    ),
+    # ── Find usages ────────────────────────────────────────────────────────
+    types.Tool(
+        name="access_find_usages",
+        description=(
+            "Busca texto o regex en VBA, SQL de queries y propiedades de controles "
+            "(ControlSource, RecordSource, RowSource, DefaultValue, ValidationRule). "
+            "Devuelve resultados agrupados: vba_matches, query_matches, control_matches."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "search_text": {"type": "string", "description": "Texto o patron regex a buscar"},
+                "match_case": {"type": "boolean", "default": False},
+                "max_results": {"type": "integer", "default": 200,
+                                "description": "Max coincidencias totales (default: 200)"},
+                "use_regex": {"type": "boolean", "default": False,
+                              "description": "true = interpretar search_text como regex"},
+            },
+            "required": ["db_path", "search_text"],
         },
     ),
 ]
@@ -1930,7 +3510,12 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             )
 
         elif name == "access_execute_sql":
-            result = ac_execute_sql(arguments["db_path"], arguments["sql"])
+            result = ac_execute_sql(
+                arguments["db_path"],
+                arguments["sql"],
+                int(arguments.get("limit", 500)),
+                bool(arguments.get("confirm_destructive", False)),
+            )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
         elif name == "access_table_info":
@@ -1991,6 +3576,7 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 arguments["object_name"],
                 arguments["search_text"],
                 bool(arguments.get("match_case", False)),
+                bool(arguments.get("use_regex", False)),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -1999,6 +3585,18 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 arguments["db_path"],
                 arguments["search_text"],
                 bool(arguments.get("match_case", False)),
+                int(arguments.get("max_results", 100)),
+                bool(arguments.get("use_regex", False)),
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        elif name == "access_search_queries":
+            result = ac_search_queries(
+                arguments["db_path"],
+                arguments["search_text"],
+                bool(arguments.get("match_case", False)),
+                int(arguments.get("max_results", 100)),
+                bool(arguments.get("use_regex", False)),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -2062,6 +3660,228 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 arguments["object_name"],
                 arguments["control_name"],
                 dict(arguments.get("props", {})),
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        # ── Database properties ───────────────────────────────────────────
+        elif name == "access_get_db_property":
+            result = ac_get_db_property(arguments["db_path"], arguments["name"])
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        elif name == "access_set_db_property":
+            result = ac_set_db_property(
+                arguments["db_path"],
+                arguments["name"],
+                arguments["value"],
+                arguments.get("prop_type"),
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        # ── Linked tables ─────────────────────────────────────────────────
+        elif name == "access_list_linked_tables":
+            result = ac_list_linked_tables(arguments["db_path"])
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        elif name == "access_relink_table":
+            result = ac_relink_table(
+                arguments["db_path"],
+                arguments["table_name"],
+                arguments["new_connect"],
+                bool(arguments.get("relink_all", False)),
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        # ── Relationships ─────────────────────────────────────────────────
+        elif name == "access_list_relationships":
+            result = ac_list_relationships(arguments["db_path"])
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        elif name == "access_create_relationship":
+            result = ac_create_relationship(
+                arguments["db_path"],
+                arguments["name"],
+                arguments["table"],
+                arguments["foreign_table"],
+                arguments["fields"],
+                int(arguments.get("attributes", 0)),
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        # ── VBA References ────────────────────────────────────────────────
+        elif name == "access_list_references":
+            result = ac_list_references(arguments["db_path"])
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        elif name == "access_manage_reference":
+            result = ac_manage_reference(
+                arguments["db_path"],
+                arguments["action"],
+                name=arguments.get("name"),
+                path=arguments.get("path"),
+                guid=arguments.get("guid"),
+                major=int(arguments.get("major", 0)),
+                minor=int(arguments.get("minor", 0)),
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        # ── Compact & Repair ──────────────────────────────────────────────
+        elif name == "access_compact_repair":
+            result = ac_compact_repair(arguments["db_path"])
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        # ── Query management ─────────────────────────────────────────────
+        elif name == "access_manage_query":
+            result = ac_manage_query(
+                arguments["db_path"],
+                arguments["action"],
+                arguments["query_name"],
+                sql=arguments.get("sql"),
+                new_name=arguments.get("new_name"),
+                confirm=bool(arguments.get("confirm", False)),
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        # ── Indexes ──────────────────────────────────────────────────────
+        elif name == "access_list_indexes":
+            result = ac_list_indexes(arguments["db_path"], arguments["table_name"])
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        elif name == "access_manage_index":
+            result = ac_manage_index(
+                arguments["db_path"],
+                arguments["table_name"],
+                arguments["action"],
+                arguments["index_name"],
+                fields=arguments.get("fields"),
+                primary=bool(arguments.get("primary", False)),
+                unique=bool(arguments.get("unique", False)),
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        # ── Compile VBA ──────────────────────────────────────────────────
+        elif name == "access_compile_vba":
+            result = ac_compile_vba(arguments["db_path"])
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        # ── Run macro ────────────────────────────────────────────────────
+        elif name == "access_run_macro":
+            result = ac_run_macro(arguments["db_path"], arguments["macro_name"])
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        # ── Output report ────────────────────────────────────────────────
+        elif name == "access_output_report":
+            result = ac_output_report(
+                arguments["db_path"],
+                arguments["report_name"],
+                output_path=arguments.get("output_path"),
+                fmt=arguments.get("format", "pdf"),
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        # ── Transfer data ────────────────────────────────────────────────
+        elif name == "access_transfer_data":
+            result = ac_transfer_data(
+                arguments["db_path"],
+                arguments["action"],
+                arguments["file_path"],
+                arguments["table_name"],
+                has_headers=bool(arguments.get("has_headers", True)),
+                file_type=arguments.get("file_type", "xlsx"),
+                range_=arguments.get("range"),
+                spec_name=arguments.get("spec_name"),
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        # ── Field properties ─────────────────────────────────────────────
+        elif name == "access_get_field_properties":
+            result = ac_get_field_properties(
+                arguments["db_path"],
+                arguments["table_name"],
+                arguments["field_name"],
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        elif name == "access_set_field_property":
+            result = ac_set_field_property(
+                arguments["db_path"],
+                arguments["table_name"],
+                arguments["field_name"],
+                arguments["property_name"],
+                arguments["value"],
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        # ── Startup options ──────────────────────────────────────────────
+        elif name == "access_list_startup_options":
+            result = ac_list_startup_options(arguments["db_path"])
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        # ── Create database ─────────────────────────────────────────────
+        elif name == "access_create_database":
+            result = ac_create_database(arguments["db_path"])
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        # ── Create table via DAO ─────────────────────────────────────────
+        elif name == "access_create_table":
+            result = ac_create_table(
+                arguments["db_path"],
+                arguments["table_name"],
+                arguments["fields"],
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        # ── Alter table via DAO ──────────────────────────────────────────
+        elif name == "access_alter_table":
+            result = ac_alter_table(
+                arguments["db_path"],
+                arguments["table_name"],
+                arguments["action"],
+                arguments["field_name"],
+                new_name=arguments.get("new_name"),
+                field_type=arguments.get("field_type", "text"),
+                size=int(arguments.get("size", 0)),
+                required=bool(arguments.get("required", False)),
+                default=arguments.get("default"),
+                description=arguments.get("description"),
+                confirm=bool(arguments.get("confirm", False)),
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        # ── Delete object ────────────────────────────────────────────────
+        elif name == "access_delete_object":
+            result = ac_delete_object(
+                arguments["db_path"],
+                arguments["object_type"],
+                arguments["object_name"],
+                confirm=bool(arguments.get("confirm", False)),
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        # ── Run VBA ──────────────────────────────────────────────────────
+        elif name == "access_run_vba":
+            result = ac_run_vba(
+                arguments["db_path"],
+                arguments["procedure"],
+                args=arguments.get("args"),
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        # ── Delete relationship ──────────────────────────────────────────
+        elif name == "access_delete_relationship":
+            result = ac_delete_relationship(
+                arguments["db_path"],
+                arguments["name"],
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        # ── Find usages ─────────────────────────────────────────────────
+        elif name == "access_find_usages":
+            result = ac_find_usages(
+                arguments["db_path"],
+                arguments["search_text"],
+                bool(arguments.get("match_case", False)),
+                int(arguments.get("max_results", 200)),
+                bool(arguments.get("use_regex", False)),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 

@@ -56,24 +56,32 @@ Add to your MCP config file (`.mcp.json`, `mcp.json`, or client-specific setting
 
 Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 
-## Tools (20)
+## Tools (45)
+
+### Database
+
+| Tool | Description |
+|------|-------------|
+| `access_create_database` | Create a new empty `.accdb` database file |
+| `access_close` | Close the COM session and release the `.accdb` file |
 
 ### Database objects
 
 | Tool | Description |
 |------|-------------|
-| `access_list_objects` | List objects by type (`module`, `form`, `report`, `query`, `macro`, `all`) |
+| `access_list_objects` | List objects by type (`table`, `module`, `form`, `report`, `query`, `macro`, `all`). System tables filtered |
 | `access_get_code` | Export an object's full definition as text |
 | `access_set_code` | Import modified text back (creates or overwrites) |
 | `access_export_structure` | Generate a Markdown index of all modules, forms, reports, queries |
-| `access_close` | Close the COM session and release the `.accdb` file |
+| `access_delete_object` | Delete a module, form, report, query, or macro. Requires `confirm=true` |
 
 ### SQL & tables
 
 | Tool | Description |
 |------|-------------|
-| `access_execute_sql` | Run SQL via DAO — SELECT returns rows as JSON, others return affected count |
+| `access_execute_sql` | Run SQL via DAO — SELECT returns rows as JSON (`limit` default 500). DELETE/DROP/ALTER require `confirm_destructive=true` |
 | `access_table_info` | Show table structure via DAO (fields, types, sizes, required, linked status) |
+| `access_search_queries` | Search text in the SQL of ALL queries at once (find which queries reference a table, field, or keyword) |
 
 ### VBE line-level editing
 
@@ -97,6 +105,98 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 | `access_create_control` | Create a new control via COM in design view |
 | `access_delete_control` | Delete a control via COM |
 | `access_set_control_props` | Modify control properties via COM in design view |
+
+### Database properties
+
+| Tool | Description |
+|------|-------------|
+| `access_get_db_property` | Read a DB property (`CurrentDb.Properties`) or Access option (`GetOption`) |
+| `access_set_db_property` | Set a DB property or Access option — creates the property if it doesn't exist |
+
+### Linked tables
+
+| Tool | Description |
+|------|-------------|
+| `access_list_linked_tables` | List all linked tables with source table, connection string, ODBC flag |
+| `access_relink_table` | Change connection string and refresh link — `relink_all=true` updates all tables with the same original connection |
+
+### Relationships
+
+| Tool | Description |
+|------|-------------|
+| `access_list_relationships` | List table relationships with field mappings and cascade flags |
+| `access_create_relationship` | Create a relationship between two tables (supports cascade update/delete) |
+| `access_delete_relationship` | Delete a relationship by name |
+
+### VBA References
+
+| Tool | Description |
+|------|-------------|
+| `access_list_references` | List VBA project references with GUID, path, broken/built-in status |
+| `access_manage_reference` | Add (by GUID or file path) or remove a VBA reference — guards against removing built-in refs |
+
+### Maintenance
+
+| Tool | Description |
+|------|-------------|
+| `access_compact_repair` | Compact & repair the database — closes, compacts to temp, swaps atomically, reopens |
+
+### Query management
+
+| Tool | Description |
+|------|-------------|
+| `access_manage_query` | Create, modify, delete, rename, or read SQL of a QueryDef. Delete requires `confirm=true` |
+
+### Indexes
+
+| Tool | Description |
+|------|-------------|
+| `access_list_indexes` | List indexes of a table with fields, primary, unique, foreign flags |
+| `access_manage_index` | Create or delete an index. Create requires fields list with optional sort order |
+
+### VBA Compilation
+
+| Tool | Description |
+|------|-------------|
+| `access_compile_vba` | Compile and save all VBA modules (`acCmdCompileAndSaveAllModules`) |
+
+### VBA & macro execution
+
+| Tool | Description |
+|------|-------------|
+| `access_run_macro` | Execute an Access macro by name |
+| `access_run_vba` | Execute a VBA Sub/Function via `Application.Run`. Supports arguments (max 30) and return values |
+
+### Export
+
+| Tool | Description |
+|------|-------------|
+| `access_output_report` | Export a report to PDF, XLSX, RTF, or TXT via `DoCmd.OutputTo` |
+
+### Data transfer
+
+| Tool | Description |
+|------|-------------|
+| `access_transfer_data` | Import/export data between Access and Excel (`.xlsx`) or CSV. Supports range (Excel) and spec_name (CSV) |
+
+### Field properties
+
+| Tool | Description |
+|------|-------------|
+| `access_get_field_properties` | Read all properties of a table field (DefaultValue, ValidationRule, Description, Format, etc.) |
+| `access_set_field_property` | Set a field property — creates the property if it doesn't exist |
+
+### Startup options
+
+| Tool | Description |
+|------|-------------|
+| `access_list_startup_options` | List 14 common startup options (AppTitle, StartupForm, AllowBypassKey, etc.) with current values |
+
+### Cross-reference
+
+| Tool | Description |
+|------|-------------|
+| `access_find_usages` | Search a name across VBA code, query SQL, and control properties (ControlSource, RecordSource, RowSource, DefaultValue, ValidationRule) in one call |
 
 ## Typical workflows
 
@@ -126,6 +226,51 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 - All VBE line numbers are 1-based.
 
 ## Changelog
+
+### v0.5.0 — 2026-03-07
+
+**New tools (5):**
+- `access_create_database` — create a new empty `.accdb` database via `NewCurrentDatabase`
+- `access_delete_object` — delete modules, forms, reports, queries, or macros via `DoCmd.DeleteObject` (requires `confirm=true`)
+- `access_run_vba` — execute VBA Sub/Function via `Application.Run` with optional arguments and return value capture
+- `access_delete_relationship` — delete a table relationship by name via DAO
+- `access_find_usages` — cross-reference search across VBA code, query SQL, and control properties in a single call
+
+**Enhancements:**
+- `access_list_objects` now supports `object_type="table"` via `AllTables` (system/temp tables filtered)
+
+### v0.4.0 — 2026-03-07
+
+**New tools (10):**
+- `access_manage_query` — create, modify, delete, rename, or read SQL of QueryDefs via DAO
+- `access_list_indexes` / `access_manage_index` — list table indexes; create or delete indexes with field order and primary/unique flags
+- `access_compile_vba` — compile and save all VBA modules (acCmdCompileAndSaveAllModules)
+- `access_run_macro` — execute an Access macro by name
+- `access_output_report` — export reports to PDF, XLSX, RTF, or TXT via DoCmd.OutputTo
+- `access_transfer_data` — import/export data between Access and Excel (.xlsx) or CSV via DoCmd.TransferSpreadsheet/TransferText
+- `access_get_field_properties` / `access_set_field_property` — read all field properties; set or create field-level properties (DefaultValue, ValidationRule, Description, etc.)
+- `access_list_startup_options` — list 14 common startup options with current values
+
+### v0.3.0 — 2026-03-07
+
+**New tools (9):**
+- `access_get_db_property` / `access_set_db_property` — read/write database properties (AppTitle, StartupForm, etc.) and Access application options
+- `access_list_linked_tables` / `access_relink_table` — list linked tables with connection info; change connection strings with bulk relink support
+- `access_list_relationships` / `access_create_relationship` — list and create table relationships with cascade flags
+- `access_list_references` / `access_manage_reference` — list VBA references (with broken/built-in detection); add by GUID or path, remove by name
+- `access_compact_repair` — compact & repair with atomic file swap and automatic reopen
+
+### v0.2.1 — 2026-03-07
+
+**New tools:**
+- `access_search_queries` — search text in the SQL of all queries at once (equivalent to iterating `QueryDefs` with `InStr`)
+
+**Improvements:**
+- `access_execute_sql`: added `limit` parameter (default 500, max 10000) to cap SELECT results and prevent token explosions
+- `access_execute_sql`: added `confirm_destructive` flag — DELETE/DROP/TRUNCATE/ALTER now require explicit confirmation
+- `access_vbe_search_all` and `access_search_queries`: added `max_results` parameter (default 100) with `truncated` indicator
+- `access_export_structure`: now returns the Markdown content directly (no extra Read needed)
+- All tool descriptions compacted ~60% to reduce token overhead per MCP session
 
 ### v0.2.0 — 2026-03-05
 
