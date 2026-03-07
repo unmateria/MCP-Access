@@ -183,7 +183,7 @@ def _write_tmp(path: str, content: str, encoding: str = "utf-16") -> None:
 _BINARY_SECTIONS: frozenset[str] = frozenset({
     "PrtMip", "PrtDevMode", "PrtDevModeW",
     "PrtDevNames", "PrtDevNamesW",
-    "RecSrcDt", "GUID",
+    "RecSrcDt", "GUID", "NameMap",
 })
 
 
@@ -887,10 +887,12 @@ def _parse_controls(form_text: str) -> dict:
     form_begin = result["form_begin_idx"]
 
     # 2. Encontrar el "End" que cierra el bloque Form/Report (rastreo de profundidad)
+    #    Importante: detectar tanto "Begin ..." como "Property = Begin" (ej: NameMap = Begin)
+    #    para que sus "End" correspondientes no desbalanceen el contador de profundidad.
     depth = 0
     for i in range(form_begin, len(lines)):
         s = lines[i].rstrip("\r\n").lstrip()
-        if re.match(r"^Begin\b", s):
+        if re.match(r"^Begin\b", s) or re.match(r"^\w+\s*=\s*Begin\s*$", s):
             depth += 1
         elif s == "End":
             depth -= 1
@@ -1034,6 +1036,37 @@ _AC_SAVE_YES = 1  # acSaveYes
 _CTRL_TYPE_BY_NAME: dict[str, int] = {v.lower(): k for k, v in _CTRL_TYPE.items()}
 
 
+# Mapa de nombres de sección a número (para forms y reports)
+_SECTION_MAP: dict[str, int] = {
+    "detail": 0,
+    "header": 1, "formheader": 1, "reportheader": 1,
+    "footer": 2, "formfooter": 2, "reportfooter": 2,
+    "pageheader": 3,
+    "pagefooter": 4,
+    "grouplevel1header": 5, "group1header": 5,
+    "grouplevel1footer": 6, "group1footer": 6,
+    "grouplevel2header": 7, "group2header": 7,
+    "grouplevel2footer": 8, "group2footer": 8,
+}
+
+
+def _resolve_section(section_val) -> int:
+    """Acepta número (0) o nombre ('detail', 'header', 'reportheader', etc.)."""
+    if isinstance(section_val, str):
+        key = section_val.lower().replace(" ", "").replace("_", "")
+        if key in _SECTION_MAP:
+            return _SECTION_MAP[key]
+        try:
+            return int(key)
+        except ValueError:
+            valid = sorted(set(_SECTION_MAP.keys()))
+            raise ValueError(
+                f"Section '{section_val}' no reconocida. "
+                f"Validas: {valid} o numero (0-8)"
+            )
+    return int(_coerce_prop(section_val))
+
+
 def _resolve_ctrl_type(ctrl_type) -> int:
     """Acepta nombre ('CommandButton') o número (104)."""
     if isinstance(ctrl_type, int):
@@ -1119,7 +1152,7 @@ def ac_create_control(
 
     # Extraer parámetros posicionales/estructurales de props (no se asignan como prop)
     props = dict(props)  # copia para no mutar el original
-    section     = int(_coerce_prop(props.pop("section",     0)))
+    section     = _resolve_section(props.pop("section", 0))
     parent      = str(props.pop("parent",      ""))
     column_name = str(props.pop("column_name", ""))
     left        = int(_coerce_prop(props.pop("left",   -1)))
@@ -1129,15 +1162,25 @@ def ac_create_control(
 
     _open_in_design(app, object_type, object_name)
     try:
-        if object_type == "form":
-            ctrl = app.CreateControl(
-                object_name, ctype, section, parent, column_name,
-                left, top, width, height,
-            )
-        else:
-            ctrl = app.CreateReportControl(
-                object_name, ctype, section, parent, column_name,
-                left, top, width, height,
+        try:
+            if object_type == "form":
+                ctrl = app.CreateControl(
+                    object_name, ctype, section, parent, column_name,
+                    left, top, width, height,
+                )
+            else:
+                ctrl = app.CreateReportControl(
+                    object_name, ctype, section, parent, column_name,
+                    left, top, width, height,
+                )
+        except Exception as exc:
+            section_names = [k for k, v in _SECTION_MAP.items() if v == section]
+            raise RuntimeError(
+                f"Error creando control en section={section} "
+                f"({', '.join(section_names) or 'desconocida'}): {exc}. "
+                f"Verifique que la seccion existe en el {object_type}. "
+                f"Secciones validas: 0=Detail, 1=Header, 2=Footer, "
+                f"3=PageHeader, 4=PageFooter"
             )
 
         errors: dict[str, str] = {}
@@ -1219,6 +1262,41 @@ def ac_set_control_props(
     finally:
         _save_and_close(app, object_type, object_name)
         # Invalidar caches — el form cambió en diseño
+        cache_key = f"{object_type}:{object_name}"
+        _parsed_controls_cache.pop(cache_key, None)
+        _Session._cm_cache.pop(cache_key, None)
+        _vbe_code_cache.pop(cache_key, None)
+
+    return {"applied": applied, "errors": errors}
+
+
+def ac_set_form_property(
+    db_path: str, object_type: str, object_name: str, props: dict
+) -> dict:
+    """
+    Establece propiedades a nivel de formulario/informe abriendo en vista diseño.
+    Útil para cambiar RecordSource, Caption, DefaultView, HasModule, etc.
+    props: dict {propiedad: valor}. Los valores se convierten a int/bool automáticamente.
+    Devuelve {"applied": [...], "errors": {...}}.
+    """
+    if object_type not in ("form", "report"):
+        raise ValueError("Solo 'form' o 'report'")
+
+    app = _Session.connect(db_path)
+    _open_in_design(app, object_type, object_name)
+    applied: list[str] = []
+    errors: dict[str, str] = {}
+    try:
+        obj = _get_design_obj(app, object_type, object_name)
+        for key, val in props.items():
+            try:
+                setattr(obj, key, _coerce_prop(val))
+                applied.append(key)
+            except Exception as exc:
+                errors[key] = str(exc)
+    finally:
+        _save_and_close(app, object_type, object_name)
+        # Invalidar caches — las propiedades del form cambiaron
         cache_key = f"{object_type}:{object_name}"
         _parsed_controls_cache.pop(cache_key, None)
         _Session._cm_cache.pop(cache_key, None)
@@ -1565,18 +1643,93 @@ def ac_get_code(db_path: str, object_type: str, name: str) -> str:
             pass
 
 
+def _split_code_behind(code: str) -> tuple[str, str]:
+    """
+    Separa un texto de form/report en (form_text, vba_code).
+    Si el código contiene 'CodeBehindForm' o 'CodeBehindReport', lo separa.
+    Devuelve (form_text_sin_vba, vba_code) donde vba_code puede estar vacío.
+    El form_text se limpia de HasModule si hay VBA (se inyectará después).
+    """
+    # Buscar la línea que marca el inicio del código VBA
+    for marker in ("CodeBehindForm", "CodeBehindReport"):
+        idx = code.find(marker)
+        if idx != -1:
+            form_part = code[:idx].rstrip() + "\n"
+            vba_part = code[idx:].split("\n", 1)
+            vba_code = vba_part[1] if len(vba_part) > 1 else ""
+            # Quitar líneas Attribute VB_ del VBA (se generan automáticamente)
+            vba_lines = []
+            for line in vba_code.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("Attribute VB_"):
+                    continue
+                vba_lines.append(line)
+            vba_code = "\n".join(vba_lines).strip()
+            return form_part, vba_code
+    return code, ""
+
+
+def _inject_vba_after_import(app: Any, object_type: str, name: str, vba_code: str) -> None:
+    """
+    Inyecta código VBA en un form/report después de importarlo.
+    Activa HasModule abriendo en diseño, luego usa VBE para insertar el código.
+    """
+    if not vba_code.strip():
+        return
+
+    # 1. Abrir en diseño y activar HasModule
+    _open_in_design(app, object_type, name)
+    try:
+        obj = _get_design_obj(app, object_type, name)
+        obj.HasModule = True
+    finally:
+        _save_and_close(app, object_type, name)
+
+    # 2. Limpiar cache de VBE (el módulo acaba de crearse)
+    cache_key = f"{object_type}:{name}"
+    _Session._cm_cache.pop(cache_key, None)
+    _vbe_code_cache.pop(cache_key, None)
+
+    # 3. Inyectar código via VBE
+    cm = _get_code_module(app, object_type, name)
+    total = cm.CountOfLines
+
+    # Normalizar line endings a \r\n (VBE lo requiere)
+    vba_code = vba_code.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+    if not vba_code.endswith("\r\n"):
+        vba_code += "\r\n"
+
+    cm.InsertLines(total + 1, vba_code)
+
+    # Invalidar caches
+    _vbe_code_cache.pop(cache_key, None)
+    _Session._cm_cache.pop(cache_key, None)
+
+
 def ac_set_code(db_path: str, object_type: str, name: str, code: str) -> str:
     """
     Importa texto como definicion de un objeto Access (crea o sobreescribe).
     Para formularios e informes re-inyecta automáticamente las secciones binarias
     (PrtMip, PrtDevMode…) desde el export actual, de modo que el caller no necesita
     incluirlas en el código que envía.
+
+    Si el código contiene una sección CodeBehindForm/CodeBehindReport, se separa
+    automáticamente: primero se importa el form/report sin VBA, luego se inyecta
+    el código VBA via VBE (evitando problemas de encoding con LoadFromText).
     """
     if object_type not in AC_TYPE:
         raise ValueError(
             f"object_type '{object_type}' invalido. Validos: {list(AC_TYPE)}"
         )
     app = _Session.connect(db_path)
+
+    # Separar CodeBehindForm/CodeBehindReport si existe
+    vba_code = ""
+    if object_type in ("form", "report"):
+        code, vba_code = _split_code_behind(code)
+        # Quitar HasModule del form text — se activará al inyectar VBA
+        if vba_code:
+            code = re.sub(r"^\s*HasModule\s*=.*$", "", code, flags=re.MULTILINE)
 
     # Si el código no contiene secciones binarias (fue devuelto por ac_get_code
     # con el filtrado activo), las restauramos desde el form/report actual.
@@ -1586,24 +1739,63 @@ def ac_set_code(db_path: str, object_type: str, name: str, code: str) -> str:
         log.info("ac_set_code: restaurando secciones binarias para '%s'", name)
         code = _restore_binary_sections(app, object_type, name, code)
 
+    # Backup del objeto existente por si falla el import
+    backup_tmp = None
+    if object_type in ("form", "report"):
+        try:
+            fd_bk, backup_tmp = tempfile.mkstemp(suffix=".txt", prefix="access_mcp_bk_")
+            os.close(fd_bk)
+            app.SaveAsText(AC_TYPE[object_type], name, backup_tmp)
+        except Exception:
+            # No existe aún — no hay backup que hacer
+            if backup_tmp:
+                try:
+                    os.unlink(backup_tmp)
+                except OSError:
+                    pass
+            backup_tmp = None
+
     fd, tmp = tempfile.mkstemp(suffix=".txt", prefix="access_mcp_")
     os.close(fd)
     try:
         # Módulos VBA (.bas) esperan ANSI/cp1252; forms/reports/queries/macros esperan UTF-16LE con BOM
         enc = "cp1252" if object_type == "module" else "utf-16"
         _write_tmp(tmp, code, encoding=enc)
-        app.LoadFromText(AC_TYPE[object_type], name, tmp)
+        try:
+            app.LoadFromText(AC_TYPE[object_type], name, tmp)
+        except Exception as import_exc:
+            # Restaurar backup si existe
+            if backup_tmp and os.path.exists(backup_tmp):
+                log.warning("ac_set_code: import falló, restaurando backup de '%s'", name)
+                try:
+                    app.LoadFromText(AC_TYPE[object_type], name, backup_tmp)
+                except Exception:
+                    log.error("ac_set_code: no se pudo restaurar backup de '%s'", name)
+            raise import_exc
+
         # Invalidar caches para este objeto (el código y los controles cambiaron)
         cache_key = f"{object_type}:{name}"
         _vbe_code_cache.pop(cache_key, None)
         _Session._cm_cache.pop(cache_key, None)
         _parsed_controls_cache.pop(cache_key, None)
-        return f"OK: '{name}' ({object_type}) importado correctamente en {db_path}"
+
+        # Inyectar VBA si había CodeBehindForm
+        vba_msg = ""
+        if vba_code:
+            _inject_vba_after_import(app, object_type, name, vba_code)
+            vba_msg = " (con VBA inyectado via VBE)"
+
+        return f"OK: '{name}' ({object_type}) importado correctamente en {db_path}{vba_msg}"
     finally:
         try:
             os.unlink(tmp)
         except OSError:
             pass
+        if backup_tmp:
+            try:
+                os.unlink(backup_tmp)
+            except OSError:
+                pass
 
 
 _DESTRUCTIVE_PREFIXES = ("DELETE", "DROP", "TRUNCATE", "ALTER")
@@ -2674,7 +2866,9 @@ TOOLS = [
         name="access_set_code",
         description=(
             "Importa codigo en la BD. Sobreescribe si existe, crea si no. "
-            "Llamar access_get_code antes para leer el original."
+            "Llamar access_get_code antes para leer el original. "
+            "Para forms/reports: soporta CodeBehindForm/CodeBehindReport (VBA se inyecta via VBE). "
+            "Hace backup automatico y restaura si falla el import."
         ),
         inputSchema={
             "type": "object",
@@ -2920,7 +3114,9 @@ TOOLS = [
         description=(
             "Crea un control en un form/report via COM. "
             "control_type: nombre o numero. "
-            "props especiales: section (0=Detail,1=Header,2=Footer), parent, column_name, left, top, width, height."
+            "props especiales: section (0=Detail,1=Header,2=Footer,3=PageHeader,4=PageFooter "
+            "o nombre: 'detail','header','footer','reportheader','pageheader'...), "
+            "parent, column_name, left, top, width, height."
         ),
         inputSchema={
             "type": "object",
@@ -2969,6 +3165,24 @@ TOOLS = [
                 },
             },
             "required": ["db_path", "object_type", "object_name", "control_name", "props"],
+        },
+    ),
+    types.Tool(
+        name="access_set_form_property",
+        description="Establece propiedades a nivel de form/report (RecordSource, Caption, DefaultView, HasModule, etc.) via COM en vista diseño.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "object_type": {"type": "string", "enum": ["form", "report"]},
+                "object_name": {"type": "string", "description": "Nombre del form/report"},
+                "props": {
+                    "type": "object",
+                    "description": "Propiedades a modificar: {RecordSource: 'Tabla', Caption: 'Titulo', HasModule: true, ...}",
+                    "additionalProperties": True,
+                },
+            },
+            "required": ["db_path", "object_type", "object_name", "props"],
         },
     ),
     # ── Database properties ──────────────────────────────────────────────────
@@ -3659,6 +3873,15 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 arguments["object_type"],
                 arguments["object_name"],
                 arguments["control_name"],
+                dict(arguments.get("props", {})),
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        elif name == "access_set_form_property":
+            result = ac_set_form_property(
+                arguments["db_path"],
+                arguments["object_type"],
+                arguments["object_name"],
                 dict(arguments.get("props", {})),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
