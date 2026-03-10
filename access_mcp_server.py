@@ -1362,6 +1362,7 @@ _FIELD_TYPE_MAP: dict[str, int] = {
     "guid": 15, "ole": 11, "bigint": 16,
 }
 _DB_AUTO_INCR_FIELD = 16  # dbAutoIncrField attribute flag
+_DB_ATTACH_SAVE_PWD = 65536  # dbAttachSavePWD — save password in linked table connect string
 
 
 def _set_field_prop(db: Any, table_name: str, field_name: str,
@@ -1694,12 +1695,17 @@ def _inject_vba_after_import(app: Any, object_type: str, name: str, vba_code: st
     cm = _get_code_module(app, object_type, name)
     total = cm.CountOfLines
 
+    # Borrar contenido auto-generado por Access (Option Compare Database, etc.)
+    # para evitar duplicados con el VBA que vamos a inyectar
+    if total > 0:
+        cm.DeleteLines(1, total)
+
     # Normalizar line endings a \r\n (VBE lo requiere)
     vba_code = vba_code.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
     if not vba_code.endswith("\r\n"):
         vba_code += "\r\n"
 
-    cm.InsertLines(total + 1, vba_code)
+    cm.InsertLines(1, vba_code)
 
     # Invalidar caches
     _vbe_code_cache.pop(cache_key, None)
@@ -2152,20 +2158,40 @@ def ac_relink_table(
     if not ref_td.Connect:
         raise ValueError(f"'{table_name}' no es una tabla vinculada")
 
+    # Auto-detect if connect string has UID/PWD → set dbAttachSavePWD
+    _needs_save_pwd = ("UID=" in new_connect.upper() or "PWD=" in new_connect.upper())
+
+    def _relink_one(td_name: str, old_conn: str):
+        """Relink a single table. If dbAttachSavePWD needed, delete+recreate."""
+        if _needs_save_pwd:
+            # Cannot modify Attributes on appended TableDef — must delete+recreate
+            src_table = db.TableDefs(td_name).SourceTableName
+            db.TableDefs.Delete(td_name)
+            db.TableDefs.Refresh()
+            new_td = db.CreateTableDef(td_name)
+            new_td.Connect = new_connect
+            new_td.SourceTableName = src_table
+            new_td.Attributes = _DB_ATTACH_SAVE_PWD
+            db.TableDefs.Append(new_td)
+            db.TableDefs.Refresh()
+        else:
+            td = db.TableDefs(td_name)
+            td.Connect = new_connect
+            td.RefreshLink()
+        relinked.append({"name": td_name, "old_connect": old_conn, "new_connect": new_connect})
+
     if relink_all:
         old_connect = ref_td.Connect
+        names_to_relink = []
         for i in range(db.TableDefs.Count):
             td = db.TableDefs(i)
             if td.Connect == old_connect:
-                old = td.Connect
-                td.Connect = new_connect
-                td.RefreshLink()
-                relinked.append({"name": td.Name, "old_connect": old, "new_connect": new_connect})
+                names_to_relink.append((td.Name, td.Connect))
+        for name, old in names_to_relink:
+            _relink_one(name, old)
     else:
         old = ref_td.Connect
-        ref_td.Connect = new_connect
-        ref_td.RefreshLink()
-        relinked.append({"name": table_name, "old_connect": old, "new_connect": new_connect})
+        _relink_one(table_name, old)
 
     return {"relinked_count": len(relinked), "tables": relinked}
 
