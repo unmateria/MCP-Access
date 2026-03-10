@@ -1,6 +1,3 @@
-![mcpAccess](https://github.com/user-attachments/assets/9d37af7d-b829-4133-8518-44097c8ad8c9)
-
-
 # mcp-access
 
 MCP server for reading and editing Microsoft Access databases (`.accdb` / `.mdb`) via COM automation.
@@ -59,7 +56,7 @@ Add to your MCP config file (`.mcp.json`, `mcp.json`, or client-specific setting
 
 Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 
-## Tools (45)
+## Tools (50)
 
 ### Database
 
@@ -83,6 +80,7 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 | Tool | Description |
 |------|-------------|
 | `access_execute_sql` | Run SQL via DAO — SELECT returns rows as JSON (`limit` default 500). DELETE/DROP/ALTER require `confirm_destructive=true` |
+| `access_execute_batch` | Execute multiple SQL statements in one call. Supports mixed SELECT/INSERT/UPDATE/DELETE with per-statement results, `stop_on_error`, and `confirm_destructive` |
 | `access_table_info` | Show table structure via DAO (fields, types, sizes, required, linked status) |
 | `access_search_queries` | Search text in the SQL of ALL queries at once (find which queries reference a table, field, or keyword) |
 
@@ -108,6 +106,7 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 | `access_create_control` | Create a new control via COM in design view |
 | `access_delete_control` | Delete a control via COM |
 | `access_set_control_props` | Modify control properties via COM in design view |
+| `access_set_multiple_controls` | Modify properties of multiple controls in a single design-view session |
 
 ### Database properties
 
@@ -115,6 +114,7 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 |------|-------------|
 | `access_get_db_property` | Read a DB property (`CurrentDb.Properties`) or Access option (`GetOption`) |
 | `access_set_db_property` | Set a DB property or Access option — creates the property if it doesn't exist |
+| `access_get_form_property` | Read form/report properties (RecordSource, Caption, DefaultView, etc.). Omit `property_names` for all |
 
 ### Linked tables
 
@@ -229,6 +229,13 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 - All VBE line numbers are 1-based.
 
 ## Changelog
+
+### v0.6.0 — 2026-03-10
+
+**New tools (3):**
+- `access_execute_batch` — execute multiple SQL statements in a single call with per-statement results, `stop_on_error` flag, and batch destructive guard
+- `access_get_form_property` — read form/report properties (RecordSource, Caption, DefaultView, HasModule, etc.) via COM in design view
+- `access_set_multiple_controls` — modify properties on multiple controls in a single design-view open/close cycle
 
 ### v0.5.0 — 2026-03-07
 

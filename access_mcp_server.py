@@ -1305,6 +1305,100 @@ def ac_set_form_property(
     return {"applied": applied, "errors": errors}
 
 
+def ac_get_form_property(
+    db_path: str, object_type: str, object_name: str,
+    property_names: list[str] | None = None,
+) -> dict:
+    """
+    Lee propiedades de un form/report abriéndolo en vista diseño.
+    Si property_names es None, lee todas las propiedades legibles.
+    Devuelve {"object": str, "type": str, "properties": {...}}.
+    """
+    if object_type not in ("form", "report"):
+        raise ValueError("Solo 'form' o 'report'")
+
+    app = _Session.connect(db_path)
+    _open_in_design(app, object_type, object_name)
+    properties: dict = {}
+    errors: dict[str, str] = {}
+    try:
+        obj = _get_design_obj(app, object_type, object_name)
+        if property_names:
+            for pname in property_names:
+                try:
+                    properties[pname] = _serialize_value(obj.Properties(pname).Value)
+                except Exception as exc:
+                    errors[pname] = str(exc)
+        else:
+            # Read all readable properties
+            for i in range(obj.Properties.Count):
+                try:
+                    p = obj.Properties(i)
+                    properties[p.Name] = _serialize_value(p.Value)
+                except Exception:
+                    pass  # Skip unreadable properties
+    finally:
+        _save_and_close(app, object_type, object_name)
+
+    result: dict = {
+        "object": object_name,
+        "type": object_type,
+        "properties": properties,
+    }
+    if errors:
+        result["errors"] = errors
+    return result
+
+
+def ac_set_multiple_controls(
+    db_path: str, object_type: str, object_name: str,
+    controls: list[dict],
+) -> dict:
+    """
+    Modifica propiedades de múltiples controles en una sola operación.
+    Abre el form/report en diseño una sola vez.
+    controls: [{"name": str, "props": {prop: val, ...}}, ...]
+    Devuelve {"results": [{"name": str, "applied": [...], "errors": {...}}, ...]}.
+    """
+    if object_type not in ("form", "report"):
+        raise ValueError("Solo 'form' o 'report'")
+    if not controls:
+        return {"error": "No se proporcionaron controles."}
+
+    app = _Session.connect(db_path)
+    _open_in_design(app, object_type, object_name)
+    results: list[dict] = []
+    try:
+        obj = _get_design_obj(app, object_type, object_name)
+        for ctrl_spec in controls:
+            ctrl_name = ctrl_spec["name"]
+            ctrl_props = ctrl_spec.get("props", {})
+            applied: list[str] = []
+            errors: dict[str, str] = {}
+            try:
+                ctrl = obj.Controls(ctrl_name)
+                for key, val in ctrl_props.items():
+                    try:
+                        setattr(ctrl, key, _coerce_prop(val))
+                        applied.append(key)
+                    except Exception as exc:
+                        errors[key] = str(exc)
+            except Exception as exc:
+                errors["_control"] = f"No se encontró '{ctrl_name}': {exc}"
+            entry: dict = {"name": ctrl_name, "applied": applied}
+            if errors:
+                entry["errors"] = errors
+            results.append(entry)
+    finally:
+        _save_and_close(app, object_type, object_name)
+        cache_key = f"{object_type}:{object_name}"
+        _parsed_controls_cache.pop(cache_key, None)
+        _Session._cm_cache.pop(cache_key, None)
+        _vbe_code_cache.pop(cache_key, None)
+
+    return {"results": results}
+
+
 # ---------------------------------------------------------------------------
 # Logica de negocio
 # ---------------------------------------------------------------------------
@@ -1363,6 +1457,7 @@ _FIELD_TYPE_MAP: dict[str, int] = {
 }
 _DB_AUTO_INCR_FIELD = 16  # dbAutoIncrField attribute flag
 _DB_ATTACH_SAVE_PWD = 65536  # dbAttachSavePWD — save password in linked table connect string
+_DB_SEE_CHANGES = 512  # dbSeeChanges — required for ODBC tables with IDENTITY columns
 
 
 def _set_field_prop(db: Any, table_name: str, field_name: str,
@@ -1840,7 +1935,11 @@ def ac_execute_sql(
 
     if normalized.startswith("SELECT"):
         limit = max(1, min(limit, 10000))
-        rs = db.OpenRecordset(sql)
+        try:
+            rs = db.OpenRecordset(sql)
+        except Exception:
+            # Retry with dbSeeChanges for ODBC linked tables with IDENTITY columns
+            rs = db.OpenRecordset(sql, 2, _DB_SEE_CHANGES)  # 2 = dbOpenDynaset
         fields = [rs.Fields(i).Name for i in range(rs.Fields.Count)]
         rows: list[dict] = []
         if not rs.EOF:
@@ -1867,8 +1966,111 @@ def ac_execute_sql(
                         + sql[:100]
                     )
                 }
-        db.Execute(sql)
+        try:
+            db.Execute(sql)
+        except Exception:
+            # Retry with dbSeeChanges for ODBC linked tables with IDENTITY columns
+            db.Execute(sql, _DB_SEE_CHANGES)
         return {"affected_rows": db.RecordsAffected}
+
+
+def ac_execute_batch(
+    db_path: str, statements: list[dict], stop_on_error: bool = True,
+    confirm_destructive: bool = False,
+) -> dict:
+    """
+    Ejecuta múltiples sentencias SQL en una sola llamada.
+    statements: [{sql: str, label?: str}, ...]
+    SELECT devuelve rows (limit 100 por sentencia).
+    INSERT/UPDATE/DELETE devuelve affected_rows.
+    stop_on_error=True para al primer error; False continúa y reporta todos.
+    confirm_destructive aplica a todo el batch.
+    """
+    if not statements:
+        return {"error": "No se proporcionaron sentencias SQL."}
+
+    app = _Session.connect(db_path)
+    db = app.CurrentDb()
+
+    # Pre-scan: check destructive
+    if not confirm_destructive:
+        for i, stmt in enumerate(statements):
+            sql_upper = stmt["sql"].strip().upper()
+            if any(sql_upper.startswith(p) for p in _DESTRUCTIVE_PREFIXES):
+                label = stmt.get("label", f"statement[{i}]")
+                return {
+                    "error": (
+                        f"SQL destructivo en '{label}'. "
+                        "Usa confirm_destructive=true para ejecutar."
+                    )
+                }
+
+    results: list[dict] = []
+    succeeded = 0
+    failed = 0
+
+    for i, stmt in enumerate(statements):
+        sql = stmt["sql"].strip()
+        label = stmt.get("label")
+        entry: dict = {"index": i}
+        if label:
+            entry["label"] = label
+
+        try:
+            sql_upper = sql.upper()
+            if sql_upper.startswith("SELECT"):
+                try:
+                    rs = db.OpenRecordset(sql)
+                except Exception:
+                    rs = db.OpenRecordset(sql, 2, _DB_SEE_CHANGES)
+                fields = [rs.Fields(j).Name for j in range(rs.Fields.Count)]
+                rows: list[dict] = []
+                select_limit = 100
+                if not rs.EOF:
+                    rs.MoveFirst()
+                    while not rs.EOF and len(rows) < select_limit:
+                        rows.append(
+                            {f: _serialize_value(rs.Fields(f).Value) for f in fields}
+                        )
+                        rs.MoveNext()
+                truncated = not rs.EOF
+                rs.Close()
+                entry["status"] = "ok"
+                entry["rows"] = rows
+                entry["count"] = len(rows)
+                if truncated:
+                    entry["truncated"] = True
+            else:
+                try:
+                    db.Execute(sql)
+                except Exception:
+                    db.Execute(sql, _DB_SEE_CHANGES)
+                entry["status"] = "ok"
+                entry["affected_rows"] = db.RecordsAffected
+            succeeded += 1
+
+        except Exception as exc:
+            entry["status"] = "error"
+            entry["error"] = str(exc)
+            failed += 1
+            if stop_on_error:
+                results.append(entry)
+                return {
+                    "total": len(statements),
+                    "succeeded": succeeded,
+                    "failed": failed,
+                    "stopped_at": i,
+                    "results": results,
+                }
+
+        results.append(entry)
+
+    return {
+        "total": len(statements),
+        "succeeded": succeeded,
+        "failed": failed,
+        "results": results,
+    }
 
 
 # Mapa DAO Type → nombre legible
@@ -3645,6 +3847,100 @@ TOOLS = [
             "required": ["db_path", "search_text"],
         },
     ),
+    # ── Batch SQL ─────────────────────────────────────────────────────────
+    types.Tool(
+        name="access_execute_batch",
+        description=(
+            "Ejecuta múltiples sentencias SQL en una sola llamada. "
+            "Cada sentencia puede ser SELECT (devuelve rows, limit 100) o "
+            "INSERT/UPDATE/DELETE (devuelve affected_rows). "
+            "stop_on_error=true para al primer error. "
+            "DELETE/DROP/TRUNCATE/ALTER requieren confirm_destructive=true."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "statements": {
+                    "type": "array",
+                    "description": "Lista de sentencias SQL [{sql: str, label?: str}, ...]",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "sql": {"type": "string", "description": "Sentencia SQL"},
+                            "label": {"type": "string",
+                                      "description": "Etiqueta opcional para identificar la sentencia"},
+                        },
+                        "required": ["sql"],
+                    },
+                },
+                "stop_on_error": {
+                    "type": "boolean", "default": True,
+                    "description": "true = para al primer error (default: true)",
+                },
+                "confirm_destructive": {
+                    "type": "boolean", "default": False,
+                    "description": "Requerido para DELETE/DROP/TRUNCATE/ALTER",
+                },
+            },
+            "required": ["db_path", "statements"],
+        },
+    ),
+    # ── Get form/report property ──────────────────────────────────────────
+    types.Tool(
+        name="access_get_form_property",
+        description=(
+            "Lee propiedades de un form/report (RecordSource, Caption, DefaultView, "
+            "HasModule, etc.). Si property_names se omite, devuelve todas las legibles."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "object_type": {"type": "string", "enum": ["form", "report"]},
+                "object_name": {"type": "string", "description": "Nombre del form/report"},
+                "property_names": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Lista de propiedades a leer. Omitir para leer todas.",
+                },
+            },
+            "required": ["db_path", "object_type", "object_name"],
+        },
+    ),
+    # ── Set multiple controls ─────────────────────────────────────────────
+    types.Tool(
+        name="access_set_multiple_controls",
+        description=(
+            "Modifica propiedades de múltiples controles de un form/report en una sola "
+            "operación. Abre en diseño una sola vez, aplica cambios, guarda y cierra."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "object_type": {"type": "string", "enum": ["form", "report"]},
+                "object_name": {"type": "string", "description": "Nombre del form/report"},
+                "controls": {
+                    "type": "array",
+                    "description": "Lista de controles [{name: str, props: {prop: val}}, ...]",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string", "description": "Nombre del control"},
+                            "props": {
+                                "type": "object",
+                                "additionalProperties": True,
+                                "description": "Propiedades a modificar {Caption: 'X', Left: 1000, ...}",
+                            },
+                        },
+                        "required": ["name", "props"],
+                    },
+                },
+            },
+            "required": ["db_path", "object_type", "object_name", "controls"],
+        },
+    ),
 ]
 
 # ---------------------------------------------------------------------------
@@ -4131,6 +4427,36 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 bool(arguments.get("match_case", False)),
                 int(arguments.get("max_results", 200)),
                 bool(arguments.get("use_regex", False)),
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        # ── Batch SQL ─────────────────────────────────────────────────
+        elif name == "access_execute_batch":
+            result = ac_execute_batch(
+                arguments["db_path"],
+                arguments["statements"],
+                stop_on_error=bool(arguments.get("stop_on_error", True)),
+                confirm_destructive=bool(arguments.get("confirm_destructive", False)),
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        # ── Get form/report property ──────────────────────────────────
+        elif name == "access_get_form_property":
+            result = ac_get_form_property(
+                arguments["db_path"],
+                arguments["object_type"],
+                arguments["object_name"],
+                property_names=arguments.get("property_names"),
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        # ── Set multiple controls ─────────────────────────────────────
+        elif name == "access_set_multiple_controls":
+            result = ac_set_multiple_controls(
+                arguments["db_path"],
+                arguments["object_type"],
+                arguments["object_name"],
+                arguments["controls"],
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
