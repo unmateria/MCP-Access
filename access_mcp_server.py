@@ -25,16 +25,24 @@ Flujo tipico para editar VBA:
 
 import asyncio
 import atexit
+import ctypes
 import json
 import logging
 import os
 import re
 import sys
 import tempfile
+import time
 import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
+
+# DPI awareness — must be set before any window operations
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+except Exception:
+    pass
 
 import mcp.types as types
 from mcp.server import Server
@@ -3039,6 +3047,281 @@ def ac_list_startup_options(db_path: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Screenshot + UI Automation helpers
+# ---------------------------------------------------------------------------
+
+def _capture_window(hwnd: int, max_width: int = 1920) -> tuple:
+    """
+    Capture an Access window using PrintWindow API.
+    Returns (PIL.Image, original_width, original_height).
+    """
+    import win32gui
+    import win32ui
+    from PIL import Image
+
+    # Get window dimensions
+    left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+    w = right - left
+    h = bottom - top
+    if w <= 0 or h <= 0:
+        raise RuntimeError(f"Window has invalid dimensions: {w}x{h}")
+
+    # Create device context and bitmap
+    hwnd_dc = win32gui.GetWindowDC(hwnd)
+    mfc_dc = win32ui.CreateDCFromHandle(hwnd_dc)
+    save_dc = mfc_dc.CreateCompatibleDC()
+    bitmap = win32ui.CreateBitmap()
+    bitmap.CreateCompatibleBitmap(mfc_dc, w, h)
+    save_dc.SelectObject(bitmap)
+
+    # Capture — PW_RENDERFULLCONTENT = 2 (works even if partially obscured)
+    ctypes.windll.user32.PrintWindow(hwnd, save_dc.GetSafeHdc(), 2)
+
+    # Convert to PIL Image
+    bmpinfo = bitmap.GetInfo()
+    bmpstr = bitmap.GetBitmapBits(True)
+    img = Image.frombuffer("RGB", (bmpinfo["bmWidth"], bmpinfo["bmHeight"]),
+                           bmpstr, "raw", "BGRX", 0, 1)
+
+    # Cleanup GDI resources
+    save_dc.DeleteDC()
+    mfc_dc.DeleteDC()
+    win32gui.ReleaseDC(hwnd, hwnd_dc)
+    win32gui.DeleteObject(bitmap.GetHandle())
+
+    original_w, original_h = w, h
+
+    # Resize if wider than max_width
+    if w > max_width:
+        ratio = max_width / w
+        new_h = int(h * ratio)
+        img = img.resize((max_width, new_h), Image.LANCZOS)
+
+    return img, original_w, original_h
+
+
+def ac_screenshot(
+    db_path: str,
+    object_type: str = "",
+    object_name: str = "",
+    output_path: str = "",
+    wait_ms: int = 300,
+    max_width: int = 1920,
+) -> dict:
+    """Capture the Access window as PNG. Optionally opens a form/report first."""
+    import win32gui
+
+    app = _Session.connect(db_path)
+    object_opened = False
+
+    # Open form/report if requested
+    if object_type and object_name:
+        ot = object_type.lower()
+        if ot == "form":
+            app.DoCmd.OpenForm(object_name, 0)  # acNormal
+        elif ot == "report":
+            app.DoCmd.OpenReport(object_name, 2)  # acPreview
+        else:
+            raise ValueError(f"object_type must be 'form' or 'report', got '{object_type}'")
+        object_opened = True
+
+    if wait_ms > 0:
+        time.sleep(wait_ms / 1000.0)
+
+    _h = app.hWndAccessApp
+    hwnd = int(_h() if callable(_h) else _h)
+
+    # Restore if minimized
+    if ctypes.windll.user32.IsIconic(hwnd):
+        ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        time.sleep(0.3)
+
+    img, orig_w, orig_h = _capture_window(hwnd, max_width)
+
+    # Close the object we opened (leave it clean)
+    if object_opened:
+        ot = object_type.lower()
+        try:
+            ac_type_code = 2 if ot == "form" else 3  # acForm / acReport
+            app.DoCmd.Close(ac_type_code, object_name, 1)  # acSaveNo
+        except Exception as e:
+            log.warning("Could not close %s %s: %s", object_type, object_name, e)
+
+    # Determine output path
+    if not output_path:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = os.path.join(tempfile.gettempdir(), f"access_screenshot_{ts}.png")
+
+    # Ensure directory exists
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+
+    img.save(output_path, "PNG")
+    file_size = os.path.getsize(output_path)
+
+    return {
+        "path": output_path,
+        "width": img.width,
+        "height": img.height,
+        "original_width": orig_w,
+        "original_height": orig_h,
+        "file_size": file_size,
+        "object_opened": f"{object_type}:{object_name}" if object_opened else None,
+    }
+
+
+def ac_ui_click(
+    db_path: str,
+    x: int,
+    y: int,
+    image_width: int,
+    click_type: str = "left",
+    wait_after_ms: int = 200,
+) -> dict:
+    """Click at image coordinates on the Access window."""
+    import win32api
+    import win32gui
+
+    app = _Session.connect(db_path)
+    _h = app.hWndAccessApp
+    hwnd = int(_h() if callable(_h) else _h)
+
+    # Bring to foreground
+    ctypes.windll.user32.SetForegroundWindow(hwnd)
+    time.sleep(0.05)
+
+    # Get window rect for coordinate scaling
+    left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+    win_w = right - left
+    win_h = bottom - top
+
+    # Scale image coords → screen coords
+    scale = win_w / image_width
+    screen_x = int(left + x * scale)
+    screen_y = int(top + y * scale)
+
+    # Move cursor and click
+    win32api.SetCursorPos((screen_x, screen_y))
+    time.sleep(0.02)
+
+    MOUSEEVENTF_LEFTDOWN = 0x0002
+    MOUSEEVENTF_LEFTUP = 0x0004
+    MOUSEEVENTF_RIGHTDOWN = 0x0008
+    MOUSEEVENTF_RIGHTUP = 0x0010
+
+    ct = click_type.lower()
+    if ct == "left":
+        win32api.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0)
+        win32api.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0)
+    elif ct == "double":
+        win32api.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0)
+        win32api.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0)
+        time.sleep(0.05)
+        win32api.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0)
+        win32api.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0)
+    elif ct == "right":
+        win32api.mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0)
+        win32api.mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0)
+    else:
+        raise ValueError(f"click_type must be 'left', 'double', or 'right', got '{click_type}'")
+
+    if wait_after_ms > 0:
+        time.sleep(wait_after_ms / 1000.0)
+
+    return {
+        "clicked_screen_x": screen_x,
+        "clicked_screen_y": screen_y,
+        "click_type": ct,
+    }
+
+
+def ac_ui_type(
+    db_path: str,
+    text: str = "",
+    key: str = "",
+    modifiers: str = "",
+    wait_after_ms: int = 100,
+) -> dict:
+    """Type text or send keyboard shortcuts to the Access window."""
+    import win32api
+    import win32gui
+
+    if not text and not key:
+        raise ValueError("Must provide either 'text' or 'key'")
+
+    app = _Session.connect(db_path)
+    _h = app.hWndAccessApp
+    hwnd = int(_h() if callable(_h) else _h)
+
+    # Bring to foreground
+    ctypes.windll.user32.SetForegroundWindow(hwnd)
+    time.sleep(0.05)
+
+    VK_MAP = {
+        "enter": 0x0D, "tab": 0x09, "escape": 0x1B, "backspace": 0x08,
+        "delete": 0x2E, "up": 0x26, "down": 0x28, "left": 0x25, "right": 0x27,
+        "home": 0x24, "end": 0x23, "space": 0x20,
+        "pageup": 0x21, "pagedown": 0x22,
+        "f1": 0x70, "f2": 0x71, "f3": 0x72, "f4": 0x73,
+        "f5": 0x74, "f6": 0x75, "f7": 0x76, "f8": 0x77,
+        "f9": 0x78, "f10": 0x79, "f11": 0x7A, "f12": 0x7B,
+    }
+    MOD_MAP = {
+        "ctrl": 0x11, "shift": 0x10, "alt": 0x12,
+    }
+
+    result_desc = ""
+
+    if text:
+        # Type each character using WM_CHAR
+        WM_CHAR = 0x0102
+        for ch in text:
+            win32api.SendMessage(hwnd, WM_CHAR, ord(ch), 0)
+            time.sleep(0.01)
+        result_desc = f"typed: {text}"
+
+    if key:
+        vk = VK_MAP.get(key.lower())
+        if vk is None:
+            # Try single letter/digit as VkKeyScan
+            if len(key) == 1:
+                vk = ctypes.windll.user32.VkKeyScanW(ord(key)) & 0xFF
+            else:
+                raise ValueError(f"Unknown key: '{key}'. Valid: {list(VK_MAP.keys())}")
+
+        # Press modifiers
+        mod_keys = []
+        if modifiers:
+            for mod in modifiers.lower().split("+"):
+                mod = mod.strip()
+                mvk = MOD_MAP.get(mod)
+                if mvk is None:
+                    raise ValueError(f"Unknown modifier: '{mod}'. Valid: ctrl, shift, alt")
+                mod_keys.append(mvk)
+                win32api.keybd_event(mvk, 0, 0, 0)  # key down
+                time.sleep(0.01)
+
+        # Press and release the key
+        win32api.keybd_event(vk, 0, 0, 0)
+        time.sleep(0.02)
+        win32api.keybd_event(vk, 0, 2, 0)  # KEYEVENTF_KEYUP = 2
+
+        # Release modifiers (reverse order)
+        for mvk in reversed(mod_keys):
+            win32api.keybd_event(mvk, 0, 2, 0)
+
+        mod_str = f"{modifiers}+" if modifiers else ""
+        result_desc = f"key: {mod_str}{key}"
+
+    if wait_after_ms > 0:
+        time.sleep(wait_after_ms / 1000.0)
+
+    return {
+        "action": result_desc,
+        "modifiers": modifiers if modifiers else None,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Definicion de herramientas MCP
 # ---------------------------------------------------------------------------
 # NOTA PARA EL AGENTE:
@@ -3941,6 +4224,97 @@ TOOLS = [
             "required": ["db_path", "object_type", "object_name", "controls"],
         },
     ),
+    # ── Screenshot + UI Automation ────────────────────────────────────────────
+    types.Tool(
+        name="access_screenshot",
+        description="Captura la ventana de Access como PNG. Opcionalmente abre un form/report antes de capturar. Devuelve path, dimensiones y metadatos.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "object_type": {
+                    "type": "string",
+                    "enum": ["form", "report"],
+                    "description": "Tipo de objeto a abrir antes de capturar (opcional)",
+                },
+                "object_name": {
+                    "type": "string",
+                    "description": "Nombre del form/report a abrir (requiere object_type)",
+                },
+                "output_path": {
+                    "type": "string",
+                    "description": "Ruta de salida PNG (auto si se omite)",
+                },
+                "wait_ms": {
+                    "type": "integer",
+                    "default": 300,
+                    "description": "Espera en ms tras abrir objeto (0 = instantaneo)",
+                },
+                "max_width": {
+                    "type": "integer",
+                    "default": 1920,
+                    "description": "Ancho maximo de la imagen en px",
+                },
+            },
+            "required": ["db_path"],
+        },
+    ),
+    types.Tool(
+        name="access_ui_click",
+        description="Click en coordenadas de imagen sobre la ventana de Access. Las coordenadas son relativas a un screenshot previo (image_width requerido para escalar).",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "x": {"type": "integer", "description": "Coordenada X en el espacio de la imagen"},
+                "y": {"type": "integer", "description": "Coordenada Y en el espacio de la imagen"},
+                "image_width": {
+                    "type": "integer",
+                    "description": "Ancho del screenshot usado para las coordenadas",
+                },
+                "click_type": {
+                    "type": "string",
+                    "enum": ["left", "double", "right"],
+                    "default": "left",
+                    "description": "Tipo de click: left, double, right",
+                },
+                "wait_after_ms": {
+                    "type": "integer",
+                    "default": 200,
+                    "description": "Espera en ms tras el click",
+                },
+            },
+            "required": ["db_path", "x", "y", "image_width"],
+        },
+    ),
+    types.Tool(
+        name="access_ui_type",
+        description="Escribe texto o envia atajos de teclado a la ventana de Access. Usar 'text' para texto normal, 'key' para teclas especiales (enter, tab, escape, f1-f12, etc.), 'modifiers' para combinaciones (ctrl, shift, alt).",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "text": {
+                    "type": "string",
+                    "description": "Texto a escribir (caracteres normales)",
+                },
+                "key": {
+                    "type": "string",
+                    "description": "Tecla especial: enter, tab, escape, backspace, delete, up, down, left, right, home, end, f1-f12, space, pageup, pagedown",
+                },
+                "modifiers": {
+                    "type": "string",
+                    "description": "Modificadores: ctrl, shift, alt, ctrl+shift — combinados con key",
+                },
+                "wait_after_ms": {
+                    "type": "integer",
+                    "default": 100,
+                    "description": "Espera en ms tras escribir",
+                },
+            },
+            "required": ["db_path"],
+        },
+    ),
 ]
 
 # ---------------------------------------------------------------------------
@@ -4457,6 +4831,39 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 arguments["object_type"],
                 arguments["object_name"],
                 arguments["controls"],
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        # ── Screenshot + UI Automation ─────────────────────────────────
+        elif name == "access_screenshot":
+            result = ac_screenshot(
+                arguments["db_path"],
+                object_type=arguments.get("object_type", ""),
+                object_name=arguments.get("object_name", ""),
+                output_path=arguments.get("output_path", ""),
+                wait_ms=int(arguments.get("wait_ms", 300)),
+                max_width=int(arguments.get("max_width", 1920)),
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        elif name == "access_ui_click":
+            result = ac_ui_click(
+                arguments["db_path"],
+                x=int(arguments["x"]),
+                y=int(arguments["y"]),
+                image_width=int(arguments["image_width"]),
+                click_type=arguments.get("click_type", "left"),
+                wait_after_ms=int(arguments.get("wait_after_ms", 200)),
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        elif name == "access_ui_type":
+            result = ac_ui_type(
+                arguments["db_path"],
+                text=arguments.get("text", ""),
+                key=arguments.get("key", ""),
+                modifiers=arguments.get("modifiers", ""),
+                wait_after_ms=int(arguments.get("wait_after_ms", 100)),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
