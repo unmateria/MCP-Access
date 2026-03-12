@@ -56,7 +56,7 @@ Add to your MCP config file (`.mcp.json`, `mcp.json`, or client-specific setting
 
 Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 
-## Tools (50)
+## Tools (54)
 
 ### Database
 
@@ -195,6 +195,14 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 |------|-------------|
 | `access_list_startup_options` | List 14 common startup options (AppTitle, StartupForm, AllowBypassKey, etc.) with current values |
 
+### Screenshot & UI automation
+
+| Tool | Description |
+|------|-------------|
+| `access_screenshot` | Capture the Access window as PNG. Optionally opens a form/report first. Returns path, dimensions (original + image), and metadata. Configurable `max_width` (default 1920) and `wait_ms` |
+| `access_ui_click` | Click at image coordinates on the Access window. Coordinates are relative to a previous screenshot (`image_width` required for scaling). Supports `left`, `double`, and `right` click |
+| `access_ui_type` | Type text or send keyboard shortcuts. `text` for normal characters (WM_CHAR), `key` for special keys (enter, tab, escape, f1-f12, arrows, etc.), `modifiers` for combos (ctrl, shift, alt) |
+
 ### Cross-reference
 
 | Tool | Description |
@@ -221,6 +229,17 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 3. access_set_code   → reimport — binary sections are restored automatically
 ```
 
+### Screenshot & UI interaction
+
+```
+1. access_screenshot(db, "form", "myForm")  → capture form as PNG
+2. (LLM reads the image and identifies UI elements)
+3. access_ui_click(db, x=850, y=120, image_width=1920)  → click a button
+4. access_ui_type(db, text="search term")  → type in a field
+5. access_ui_type(db, key="enter")  → press Enter
+6. access_screenshot(db)  → verify the result
+```
+
 ## Notes
 
 - Access runs visible (`Visible = True`) so VBE COM access works correctly.
@@ -229,6 +248,17 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 - All VBE line numbers are 1-based.
 
 ## Changelog
+
+### v0.7.0 — 2026-03-12
+
+**New tools (3):**
+- `access_screenshot` — capture the Access window as PNG using `PrintWindow` API with DPI awareness. Optionally opens a form/report, captures, then closes it. Resizes to configurable `max_width` for token efficiency
+- `access_ui_click` — click at image coordinates on the Access window. Scales from screenshot space to screen space automatically. Supports left, double, and right click
+- `access_ui_type` — type text via `WM_CHAR` or send keyboard shortcuts via `keybd_event`. Supports special keys (enter, tab, escape, F1-F12, arrows) and modifier combos (ctrl, shift, alt)
+
+**Infrastructure:**
+- DPI awareness (`SetProcessDpiAwareness(2)`) set at module load for accurate window dimensions
+- COM `hWndAccessApp` handled for both property and method variants
 
 ### v0.6.0 — 2026-03-10
 
