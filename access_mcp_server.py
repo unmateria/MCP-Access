@@ -1850,7 +1850,7 @@ def ac_set_code(db_path: str, object_type: str, name: str, code: str) -> str:
 
     # Backup del objeto existente por si falla el import
     backup_tmp = None
-    if object_type in ("form", "report"):
+    if object_type in ("form", "report", "module"):
         try:
             fd_bk, backup_tmp = tempfile.mkstemp(suffix=".txt", prefix="access_mcp_bk_")
             os.close(fd_bk)
@@ -1945,9 +1945,12 @@ def ac_execute_sql(
         limit = max(1, min(limit, 10000))
         try:
             rs = db.OpenRecordset(sql)
-        except Exception:
+        except Exception as first_err:
             # Retry with dbSeeChanges for ODBC linked tables with IDENTITY columns
-            rs = db.OpenRecordset(sql, 2, _DB_SEE_CHANGES)  # 2 = dbOpenDynaset
+            try:
+                rs = db.OpenRecordset(sql, 2, _DB_SEE_CHANGES)  # 2 = dbOpenDynaset
+            except Exception:
+                raise RuntimeError(str(first_err)) from first_err
         fields = [rs.Fields(i).Name for i in range(rs.Fields.Count)]
         rows: list[dict] = []
         if not rs.EOF:
@@ -1976,9 +1979,12 @@ def ac_execute_sql(
                 }
         try:
             db.Execute(sql)
-        except Exception:
+        except Exception as first_err:
             # Retry with dbSeeChanges for ODBC linked tables with IDENTITY columns
-            db.Execute(sql, _DB_SEE_CHANGES)
+            try:
+                db.Execute(sql, _DB_SEE_CHANGES)
+            except Exception:
+                raise RuntimeError(str(first_err)) from first_err
         return {"affected_rows": db.RecordsAffected}
 
 
@@ -2029,8 +2035,11 @@ def ac_execute_batch(
             if sql_upper.startswith("SELECT"):
                 try:
                     rs = db.OpenRecordset(sql)
-                except Exception:
-                    rs = db.OpenRecordset(sql, 2, _DB_SEE_CHANGES)
+                except Exception as first_err:
+                    try:
+                        rs = db.OpenRecordset(sql, 2, _DB_SEE_CHANGES)
+                    except Exception:
+                        raise RuntimeError(str(first_err)) from first_err
                 fields = [rs.Fields(j).Name for j in range(rs.Fields.Count)]
                 rows: list[dict] = []
                 select_limit = 100
@@ -2051,8 +2060,11 @@ def ac_execute_batch(
             else:
                 try:
                     db.Execute(sql)
-                except Exception:
-                    db.Execute(sql, _DB_SEE_CHANGES)
+                except Exception as first_err:
+                    try:
+                        db.Execute(sql, _DB_SEE_CHANGES)
+                    except Exception:
+                        raise RuntimeError(str(first_err)) from first_err
                 entry["status"] = "ok"
                 entry["affected_rows"] = db.RecordsAffected
             succeeded += 1
@@ -2377,15 +2389,31 @@ def ac_relink_table(
             # DAO Attributes can't be set reliably from Python COM.
             # Use DoCmd.TransferDatabase with StoreLogin=True instead.
             src_table = db.TableDefs(td_name).SourceTableName
+            old_connect_backup = db.TableDefs(td_name).Connect
             try:
                 app.DoCmd.DeleteObject(0, td_name)  # acTable = 0
             except Exception:
                 pass  # already gone
             # acLink=2, acTable=0
-            app.DoCmd.TransferDatabase(
-                2, "ODBC Database", new_connect,
-                0, src_table, td_name, False, True,  # StoreLogin=True
-            )
+            try:
+                app.DoCmd.TransferDatabase(
+                    2, "ODBC Database", new_connect,
+                    0, src_table, td_name, False, True,  # StoreLogin=True
+                )
+            except Exception as exc:
+                # ROLLBACK: try to restore the old link
+                try:
+                    app.DoCmd.TransferDatabase(
+                        2, "ODBC Database", old_connect_backup,
+                        0, src_table, td_name, False, True,
+                    )
+                    log.warning("ac_relink_table: rollback ok for '%s'", td_name)
+                except Exception:
+                    log.error("ac_relink_table: rollback FAILED for '%s'", td_name)
+                raise RuntimeError(
+                    f"Error relinking '{td_name}': {exc}. "
+                    "Se intentó restaurar el vínculo original."
+                )
         else:
             td = db.TableDefs(td_name)
             td.Connect = new_connect
@@ -4082,7 +4110,7 @@ TOOLS = [
     # ── Run VBA ────────────────────────────────────────────────────────────
     types.Tool(
         name="access_run_vba",
-        description="Ejecuta un Sub/Function VBA via Application.Run. procedure puede ser 'Modulo.NombreSub' o solo 'NombreSub'. Devuelve result si es Function.",
+        description="Ejecuta un Sub/Function VBA via Application.Run. procedure puede ser 'Modulo.NombreSub' o solo 'NombreSub'. Devuelve result si es Function. ADVERTENCIA: Si el procedimiento muestra MsgBox/InputBox, la llamada se bloqueara indefinidamente. Usar access_ui_click/access_ui_type para interactuar con dialogos modales.",
         inputSchema={
             "type": "object",
             "properties": {

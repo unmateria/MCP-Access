@@ -249,6 +249,14 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 
 ## Changelog
 
+### v0.7.2 — 2026-03-13
+
+**Robustness improvements:**
+- `access_relink_table`: added rollback — if `TransferDatabase` fails after deleting the old link, the original link is restored automatically. Previously the table would be left deleted with no replacement
+- `access_execute_sql` / `access_execute_batch`: fixed silent retry swallowing errors. The `dbSeeChanges` retry pattern now preserves the original error message when both attempts fail, instead of showing only the retry error
+- `access_set_code`: backup before import now includes modules (previously only forms/reports). If a module import fails, the original is restored via `LoadFromText`
+- `access_run_vba`: tool description now warns that `MsgBox`/`InputBox` in VBA will block the call indefinitely. Recommends using `access_ui_click`/`access_ui_type` for UI interaction
+
 ### v0.7.1 — 2026-03-13
 
 **Bug fix:**
