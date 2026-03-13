@@ -1464,7 +1464,7 @@ _FIELD_TYPE_MAP: dict[str, int] = {
     "guid": 15, "ole": 11, "bigint": 16,
 }
 _DB_AUTO_INCR_FIELD = 16  # dbAutoIncrField attribute flag
-_DB_ATTACH_SAVE_PWD = 65536  # dbAttachSavePWD — save password in linked table connect string
+_DB_ATTACH_SAVE_PWD = 131072  # dbAttachSavePWD (0x20000) — save password in linked table connect string
 _DB_SEE_CHANGES = 512  # dbSeeChanges — required for ODBC tables with IDENTITY columns
 
 
@@ -2372,18 +2372,20 @@ def ac_relink_table(
     _needs_save_pwd = ("UID=" in new_connect.upper() or "PWD=" in new_connect.upper())
 
     def _relink_one(td_name: str, old_conn: str):
-        """Relink a single table. If dbAttachSavePWD needed, delete+recreate."""
+        """Relink a single table. If dbAttachSavePWD needed, use TransferDatabase."""
         if _needs_save_pwd:
-            # Cannot modify Attributes on appended TableDef — must delete+recreate
+            # DAO Attributes can't be set reliably from Python COM.
+            # Use DoCmd.TransferDatabase with StoreLogin=True instead.
             src_table = db.TableDefs(td_name).SourceTableName
-            db.TableDefs.Delete(td_name)
-            db.TableDefs.Refresh()
-            new_td = db.CreateTableDef(td_name)
-            new_td.Connect = new_connect
-            new_td.SourceTableName = src_table
-            new_td.Attributes = _DB_ATTACH_SAVE_PWD
-            db.TableDefs.Append(new_td)
-            db.TableDefs.Refresh()
+            try:
+                app.DoCmd.DeleteObject(0, td_name)  # acTable = 0
+            except Exception:
+                pass  # already gone
+            # acLink=2, acTable=0
+            app.DoCmd.TransferDatabase(
+                2, "ODBC Database", new_connect,
+                0, src_table, td_name, False, True,  # StoreLogin=True
+            )
         else:
             td = db.TableDefs(td_name)
             td.Connect = new_connect

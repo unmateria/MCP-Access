@@ -121,7 +121,7 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 | Tool | Description |
 |------|-------------|
 | `access_list_linked_tables` | List all linked tables with source table, connection string, ODBC flag |
-| `access_relink_table` | Change connection string and refresh link — `relink_all=true` updates all tables with the same original connection |
+| `access_relink_table` | Change connection string and refresh link — auto-saves credentials (`dbAttachSavePWD`) when UID/PWD detected. `relink_all=true` updates all tables with the same original connection |
 
 ### Relationships
 
@@ -248,6 +248,12 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 - All VBE line numbers are 1-based.
 
 ## Changelog
+
+### v0.7.1 — 2026-03-13
+
+**Bug fix:**
+- Fixed `access_relink_table` not persisting ODBC credentials: `_DB_ATTACH_SAVE_PWD` constant was **65536** (wrong — that's `dbAttachExclusive`) instead of **131072** (`dbAttachSavePWD`). Tables relinked with UID/PWD would lose credentials on next database open, causing login prompts
+- Replaced DAO `CreateTableDef` + `Attributes` approach with `DoCmd.TransferDatabase(acLink, ..., StoreLogin=True)` which works reliably from Python COM (setting `Attributes` before `Append` works in native VBA but fails via pywin32 with Type Mismatch)
 
 ### v0.7.0 — 2026-03-12
 
