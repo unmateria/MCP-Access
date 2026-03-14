@@ -26,6 +26,7 @@ Flujo tipico para editar VBA:
 import asyncio
 import atexit
 import ctypes
+import html as html_mod
 import json
 import logging
 import os
@@ -90,11 +91,27 @@ class _Session:
     @classmethod
     def connect(cls, db_path: str) -> Any:
         resolved = str(Path(db_path).resolve())
+        if cls._app is not None:
+            # Health check: verify COM session is still alive
+            try:
+                _ = cls._app.Visible  # cheap COM property access
+            except Exception:
+                log.warning("COM session stale — auto-reconnecting...")
+                cls._force_cleanup()
         if cls._app is None:
             cls._launch()
         if cls._db_open != resolved:
             cls._switch(resolved)
         return cls._app
+
+    @classmethod
+    def _force_cleanup(cls):
+        """Reset state without calling methods on a dead COM object."""
+        cls._app = None
+        cls._db_open = None
+        cls._cm_cache.clear()
+        _vbe_code_cache.clear()
+        _parsed_controls_cache.clear()
 
     @classmethod
     def _launch(cls) -> None:
@@ -356,6 +373,7 @@ def _get_code_module(app: Any, object_type: str, object_name: str) -> Any:
         _Session._cm_cache[cache_key] = cm
         return cm
     except Exception as exc:
+        _Session._cm_cache.pop(cache_key, None)  # invalidate stale cache entry
         raise RuntimeError(
             f"No se pudo acceder al CodeModule '{component_name}'. "
             f"¿Está habilitado 'Confiar en el acceso al modelo de objetos de proyectos VBA' "
@@ -503,8 +521,10 @@ def ac_vbe_replace_lines(
         cm.DeleteLines(start_line, count)
     inserted = 0
     if new_code:
+        # Decode HTML entities that MCP transport may have encoded (& → &amp; etc.)
+        decoded = html_mod.unescape(new_code)
         # Access VBA espera \r\n como separador de líneas
-        normalized = new_code.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+        normalized = decoded.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
         cm.InsertLines(start_line, normalized)
         inserted = len(new_code.splitlines())
     # Invalidar cache de texto (el módulo cambió)
@@ -801,9 +821,11 @@ def ac_vbe_append(
     app = _Session.connect(db_path)
     cm = _get_code_module(app, object_type, object_name)
     total = cm.CountOfLines
-    normalized = new_code.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+    # Decode HTML entities that MCP transport may have encoded (& → &amp; etc.)
+    decoded = html_mod.unescape(new_code)
+    normalized = decoded.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
     cm.InsertLines(total + 1, normalized)
-    inserted = len(new_code.splitlines())
+    inserted = len(decoded.splitlines())
     cache_key = f"{object_type}:{object_name}"
     _vbe_code_cache.pop(cache_key, None)
     new_total = cm.CountOfLines
@@ -1151,6 +1173,11 @@ def ac_create_control(
       section (default 0=Detail), parent (''), column_name (''),
       left, top, width, height (twips; -1 = automático).
     El resto se asignan como propiedades COM sobre el control creado.
+
+    LIMITACION: Controles ActiveX (type 126/acCustomControl) se crean como contenedores
+    vacios sin inicializacion OLE — .Object sera Nothing. Para ActiveX funcionales
+    (ej: WebBrowser/Shell.Explorer.2), insertar manualmente desde el ribbon de Access:
+    Insertar > Controles ActiveX.
     """
     if object_type not in ("form", "report"):
         raise ValueError("Solo 'form' o 'report'")
@@ -2860,7 +2887,14 @@ def ac_run_macro(db_path: str, macro_name: str) -> dict:
 def ac_run_vba(
     db_path: str, procedure: str, args: Optional[list] = None,
 ) -> dict:
-    """Ejecuta un Sub/Function VBA via Application.Run."""
+    """Ejecuta un Sub/Function VBA via Application.Run.
+
+    IMPORTANTE:
+    - Solo puede ejecutar Subs/Functions en modulos estandar (no en form/report modules).
+      Para form modules, crear un wrapper publico en un modulo estandar.
+    - Si el procedimiento muestra MsgBox/InputBox, la llamada se BLOQUEARA indefinidamente.
+      Usar access_ui_click/access_ui_type para cerrar dialogos modales si esto ocurre.
+    """
     app = _Session.connect(db_path)
     call_args = args or []
     if len(call_args) > 30:
@@ -3138,7 +3172,13 @@ def ac_screenshot(
     wait_ms: int = 300,
     max_width: int = 1920,
 ) -> dict:
-    """Capture the Access window as PNG. Optionally opens a form/report first."""
+    """Capture the Access window as PNG. Optionally opens a form/report first.
+
+    NOTA: Timer events de Access NO se disparan durante la captura (no hay
+    Windows message pump). Si el form usa Form_Timer para inicializacion
+    (ej: WebBrowser navigate), abrir el form manualmente antes, o usar
+    access_run_vba para forzar la inicializacion.
+    """
     import win32gui
 
     app = _Session.connect(db_path)

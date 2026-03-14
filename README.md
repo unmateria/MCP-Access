@@ -103,7 +103,7 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 |------|-------------|
 | `access_list_controls` | List direct controls of a form/report with key properties |
 | `access_get_control` | Get the full definition block of a specific control |
-| `access_create_control` | Create a new control via COM in design view |
+| `access_create_control` | Create a new control via COM in design view. **Note:** ActiveX controls (type 126) are created as empty containers without OLE initialization |
 | `access_delete_control` | Delete a control via COM |
 | `access_set_control_props` | Modify control properties via COM in design view |
 | `access_set_multiple_controls` | Modify properties of multiple controls in a single design-view session |
@@ -168,7 +168,7 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 | Tool | Description |
 |------|-------------|
 | `access_run_macro` | Execute an Access macro by name |
-| `access_run_vba` | Execute a VBA Sub/Function via `Application.Run`. Supports arguments (max 30) and return values |
+| `access_run_vba` | Execute a VBA Sub/Function via `Application.Run` (standard modules only — not form/report modules). Supports arguments (max 30) and return values. **Warning:** MsgBox/InputBox in VBA will block indefinitely |
 
 ### Export
 
@@ -199,7 +199,7 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 
 | Tool | Description |
 |------|-------------|
-| `access_screenshot` | Capture the Access window as PNG. Optionally opens a form/report first. Returns path, dimensions (original + image), and metadata. Configurable `max_width` (default 1920) and `wait_ms` |
+| `access_screenshot` | Capture the Access window as PNG. Optionally opens a form/report first. Returns path, dimensions (original + image), and metadata. Configurable `max_width` (default 1920) and `wait_ms`. **Note:** Timer events do not fire during capture (no message pump) |
 | `access_ui_click` | Click at image coordinates on the Access window. Coordinates are relative to a previous screenshot (`image_width` required for scaling). Supports `left`, `double`, and `right` click |
 | `access_ui_type` | Type text or send keyboard shortcuts. `text` for normal characters (WM_CHAR), `key` for special keys (enter, tab, escape, f1-f12, arrows, etc.), `modifiers` for combos (ctrl, shift, alt) |
 
@@ -244,10 +244,29 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 
 - Access runs visible (`Visible = True`) so VBE COM access works correctly.
 - One Access instance is shared across all tool calls (singleton session). Opening a different `.accdb` closes the previous one.
+- **Auto-reconnect**: if the COM session becomes stale (Access crashed, closed manually, or COM corruption), the server detects it via a health check and reconnects automatically on the next tool call.
 - `access_get_code` strips binary sections (`PrtMip`, `PrtDevMode`, etc.) from form/report exports — `access_set_code` restores them automatically before importing.
 - All VBE line numbers are 1-based.
 
+## Known limitations
+
+- **ActiveX controls** (type 126/acCustomControl) created via `access_create_control` lack OLE initialization — `.Object` will be `Nothing`. Insert ActiveX controls manually from the Access ribbon instead.
+- **`access_run_vba`** can only call procedures in standard modules, not form/report code-behind modules. If VBA shows a `MsgBox` or `InputBox`, the call blocks indefinitely — use `access_ui_click`/`access_ui_type` to dismiss dialogs.
+- **Timer events** (`Form_Timer`) do not fire during MCP tool execution because there is no Windows message pump. Open forms manually or use `access_run_vba` to force initialization before taking screenshots.
+- **`access_vbe_append`** previously HTML-encoded `&` as `&amp;` due to MCP transport escaping. Fixed in v0.7.3 with explicit `html.unescape()` decoding.
+
 ## Changelog
+
+### v0.7.3 — 2026-03-14
+
+**Reliability improvements:**
+- **Auto-reconnect COM**: `_Session.connect()` now performs a health check (`app.Visible`) before every tool call. If the COM session is stale (Access crashed, closed manually, or corrupted), it automatically reconnects instead of failing with cryptic COM errors
+- **`access_vbe_append` / `access_vbe_replace_lines`**: fixed HTML entity encoding bug where `&` was silently converted to `&amp;` by MCP transport. Now applies `html.unescape()` to decode entities before inserting code
+- **VBE cache invalidation**: `_get_code_module` now evicts stale cache entries on failure, preventing cascading "Subscript out of range" errors after `access_set_code` or COM reconnection
+- **Tool descriptions updated** with known limitations:
+  - `access_run_vba`: documents that only standard module procedures work (not form/report modules) and that MsgBox/InputBox blocks indefinitely
+  - `access_create_control`: documents that ActiveX (type 126) creates empty containers without OLE initialization
+  - `access_screenshot`: documents that Timer events do not fire during capture (no message pump)
 
 ### v0.7.2 — 2026-03-13
 
