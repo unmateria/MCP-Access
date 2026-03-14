@@ -15,6 +15,9 @@ MCP server for reading and editing Microsoft Access databases (`.accdb` / `.mdb`
 pip install mcp pywin32
 ```
 
+The easiest way is using claude code itself...
+You plugin it into Claude Code (just copy it to a folder, and tell claude code to install it, then just write /mcp , go to 'mcp-access' and choose reconnect), and just tell your MS Access what it should do. It works even if not database present (it will create everything from scratch). Later you dont have even to touch Access... you can develop all the vba, linked tables, forms, querys etc from Claude Code with normal language. 
+
 ### Enable VBA object model access
 
 `File → Options → Trust Center → Trust Center Settings → Macro Settings`
