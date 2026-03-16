@@ -15,9 +15,6 @@ MCP server for reading and editing Microsoft Access databases (`.accdb` / `.mdb`
 pip install mcp pywin32
 ```
 
-The easiest way is using claude code itself...
-You plugin it into Claude Code (just copy it to a folder, and tell claude code to install it, then just write /mcp , go to 'mcp-access' and choose reconnect), and just tell your MS Access what it should do. It works even if not database present (it will create everything from scratch). Later you dont have even to touch Access... you can develop all the vba, linked tables, forms, querys etc from Claude Code with normal language. 
-
 ### Enable VBA object model access
 
 `File → Options → Trust Center → Trust Center Settings → Macro Settings`
@@ -254,11 +251,16 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 ## Known limitations
 
 - **ActiveX controls** (type 126/acCustomControl) created via `access_create_control` lack OLE initialization — `.Object` will be `Nothing`. Insert ActiveX controls manually from the Access ribbon instead.
-- **`access_run_vba`** can only call procedures in standard modules, not form/report code-behind modules. If VBA shows a `MsgBox` or `InputBox`, the call blocks indefinitely — use `access_ui_click`/`access_ui_type` to dismiss dialogs.
+- **`access_run_vba`** can only call procedures in standard modules, not form/report code-behind modules. If VBA shows a `MsgBox` or `InputBox`, the call blocks indefinitely — use `access_ui_click`/`access_ui_type` to dismiss dialogs. Uses direct `InvokeTypes` to work around pywin32 late-binding bug with `Application.Run`'s 30 optional parameters (see v0.7.4 changelog).
 - **Timer events** (`Form_Timer`) do not fire during MCP tool execution because there is no Windows message pump. Open forms manually or use `access_run_vba` to force initialization before taking screenshots.
 - **`access_vbe_append`** previously HTML-encoded `&` as `&amp;` due to MCP transport escaping. Fixed in v0.7.3 with explicit `html.unescape()` decoding.
 
 ## Changelog
+
+### v0.7.4 — 2026-03-16
+
+**Bug fix:**
+- **`access_run_vba` was completely broken** — every call failed with `DISP_E_BADPARAMCOUNT` (-2147352562). Root cause: pywin32's late-bound `Dispatch` uses `IDispatch.Invoke()` which only passes provided arguments. Access's `Application.Run` has 31 parameters (1 required + 30 optional) and its COM server rejects calls missing `VT_ERROR/DISP_E_PARAMNOTFOUND` markers for the 30 optional params. Fix: new `_invoke_app_run()` helper calls `_oleobj_.InvokeTypes()` directly with full argument types and `pythoncom.Missing` padding — the same COM protocol that early-bound (`EnsureDispatch`) wrappers generate, but without changing the binding model for the other 53 tools
 
 ### v0.7.3 — 2026-03-14
 

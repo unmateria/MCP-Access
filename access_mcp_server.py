@@ -2884,6 +2884,43 @@ def ac_run_macro(db_path: str, macro_name: str) -> dict:
 # Run VBA procedure
 # ---------------------------------------------------------------------------
 
+def _invoke_app_run(app, procedure: str, call_args: list):
+    """Call Application.Run via InvokeTypes — proper COM optional-param protocol.
+
+    pywin32's late-bound Dispatch uses Invoke() which passes only the provided
+    args.  Access.Application.Run has 31 params (1 required + 30 optional) and
+    its COM server rejects calls missing VT_ERROR markers for the optional params
+    with DISP_E_BADPARAMCOUNT (-2147352562).
+
+    InvokeTypes converts pythoncom.Missing -> VT_ERROR/DISP_E_PARAMNOTFOUND,
+    matching what early-bound wrappers (EnsureDispatch / MakeDispatchFuncMethod)
+    generate.
+    """
+    import pythoncom
+
+    dispid = app._oleobj_.GetIDsOfNames(0, "Run")
+
+    # Application.Run signature:
+    #   Function Run(Procedure As String, [Arg1], ..., [Arg30]) As Variant
+    # Arg types: (VT, PARAMFLAGS)
+    #   Procedure:   VT_BSTR(8),    PARAMFLAG_FIN(1)
+    #   Arg1..Arg30: VT_VARIANT(12), PARAMFLAG_FIN|PARAMFLAG_FOPT(17)
+    arg_types = tuple([(8, 1)] + [(12, 17)] * 30)
+
+    # Fill: procedure + user args + padding with Missing
+    n = len(call_args)
+    all_args = [procedure] + list(call_args) + [pythoncom.Missing] * (30 - n)
+
+    return app._oleobj_.InvokeTypes(
+        dispid,
+        0,                           # LCID
+        pythoncom.DISPATCH_METHOD,   # wFlags
+        (12, 0),                     # return type: VT_VARIANT
+        arg_types,
+        *all_args,
+    )
+
+
 def ac_run_vba(
     db_path: str, procedure: str, args: Optional[list] = None,
 ) -> dict:
@@ -2900,10 +2937,7 @@ def ac_run_vba(
     if len(call_args) > 30:
         raise ValueError("Application.Run soporta max 30 argumentos.")
     try:
-        if call_args:
-            result = app.Run(procedure, *call_args)
-        else:
-            result = app.Run(procedure)
+        result = _invoke_app_run(app, procedure, call_args)
     except Exception as exc:
         raise RuntimeError(f"Error al ejecutar '{procedure}': {exc}")
     # COM puede devolver tipos no serializables; convertir a str si es necesario
