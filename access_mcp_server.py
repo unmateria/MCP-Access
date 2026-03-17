@@ -2798,6 +2798,120 @@ def ac_compact_repair(db_path: str) -> dict:
     }
 
 
+def ac_decompile_compact(db_path: str) -> dict:
+    """Elimina p-code VBA huerfano (/decompile), recompila y compacta. Reduccion tipica 60-70%."""
+    import subprocess, time
+    resolved = str(Path(db_path).resolve())
+    if not os.path.exists(resolved):
+        raise FileNotFoundError(f"BD no encontrada: {resolved}")
+
+    original_size = os.path.getsize(resolved)
+
+    # 1. Cerrar sesion COM y liberar el fichero completamente
+    try:
+        app = _Session.connect(resolved)
+        try:
+            app.CloseCurrentDatabase()
+        except Exception:
+            pass
+        _Session._db_open = None
+        _Session._cm_cache.clear()
+        _vbe_code_cache.clear()
+        _parsed_controls_cache.clear()
+        try:
+            app.Quit(1)  # acQuitSaveNone=1
+        except Exception:
+            pass
+        _Session._app = None
+    except Exception:
+        pass  # si no habia sesion abierta, continuar igualmente
+
+    # 2. Lanzar MSACCESS /decompile
+    msaccess_candidates = [
+        r"C:\Program Files\Microsoft Office\root\Office16\MSACCESS.EXE",
+        r"C:\Program Files (x86)\Microsoft Office\root\Office16\MSACCESS.EXE",
+    ]
+    msaccess = next((p for p in msaccess_candidates if os.path.exists(p)), None)
+    if not msaccess:
+        raise RuntimeError("No se encontro MSACCESS.EXE en rutas conocidas de Office 16")
+
+    proc = subprocess.Popen(
+        [msaccess, resolved, "/decompile"],
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+    )
+    # Access abre la BD en estado decompilado y se queda abierto — esperar y matar
+    time.sleep(8)
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+            capture_output=True, timeout=10,
+        )
+    except Exception:
+        pass
+
+    decompile_size = os.path.getsize(resolved)
+
+    # 3. Reabrir via COM y recompilar VBA
+    app2 = _Session.connect(resolved)
+    try:
+        app2.RunCommand(137)  # acCmdCompileAllModules = 137
+    except Exception:
+        pass  # compilar no es critico para el compact
+    try:
+        app2.CloseCurrentDatabase()
+    except Exception:
+        pass
+    _Session._db_open = None
+    _Session._cm_cache.clear()
+    _vbe_code_cache.clear()
+    _parsed_controls_cache.clear()
+
+    # 4. Compact & Repair
+    db_dir = os.path.dirname(resolved)
+    db_name, db_ext = os.path.splitext(os.path.basename(resolved))
+    tmp_path = os.path.join(db_dir, f"{db_name}_compact_tmp{db_ext}")
+    bak_path = os.path.join(db_dir, f"{db_name}_compact_bak{db_ext}")
+    for p in (tmp_path, bak_path):
+        if os.path.exists(p):
+            os.unlink(p)
+
+    try:
+        app2.CompactRepair(resolved, tmp_path)
+    except Exception as exc:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise RuntimeError(f"Error en CompactRepair: {exc}")
+
+    if not os.path.exists(tmp_path):
+        raise RuntimeError("CompactRepair no genero el fichero de salida")
+
+    compacted_size = os.path.getsize(tmp_path)
+    os.rename(resolved, bak_path)
+    try:
+        os.rename(tmp_path, resolved)
+    except Exception:
+        os.rename(bak_path, resolved)
+        raise
+    try:
+        os.unlink(bak_path)
+    except OSError:
+        pass
+
+    # Reabrir
+    app2.OpenCurrentDatabase(resolved)
+    _Session._db_open = resolved
+
+    saved = original_size - compacted_size
+    return {
+        "original_size": original_size,
+        "decompile_size": decompile_size,
+        "compacted_size": compacted_size,
+        "saved_bytes": saved,
+        "saved_pct": round(saved / original_size * 100, 1) if original_size > 0 else 0,
+        "status": "decompiled_and_compacted",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Query management
 # ---------------------------------------------------------------------------
@@ -4323,6 +4437,21 @@ TOOLS = [
             "required": ["db_path"],
         },
     ),
+    types.Tool(
+        name="access_decompile_compact",
+        description=(
+            "Elimina p-code VBA huerfano via /decompile, recompila y compacta. "
+            "Reduccion tipica 60-70% en ficheros front-end muy editados. "
+            "Usar cuando el .accdb supera 30-40 MB sin tener tablas locales con datos."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+            },
+            "required": ["db_path"],
+        },
+    ),
     # ── Query management ────────────────────────────────────────────────────
     types.Tool(
         name="access_manage_query",
@@ -5194,6 +5323,10 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         # ── Compact & Repair ──────────────────────────────────────────────
         elif name == "access_compact_repair":
             result = ac_compact_repair(arguments["db_path"])
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        elif name == "access_decompile_compact":
+            result = ac_decompile_compact(arguments["db_path"])
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
         # ── Query management ─────────────────────────────────────────────

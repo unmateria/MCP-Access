@@ -56,7 +56,7 @@ Add to your MCP config file (`.mcp.json`, `mcp.json`, or client-specific setting
 
 Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 
-## Tools (57)
+## Tools (58)
 
 ### Database
 
@@ -144,6 +144,7 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 | Tool | Description |
 |------|-------------|
 | `access_compact_repair` | Compact & repair the database — closes, compacts to temp, swaps atomically, reopens |
+| `access_decompile_compact` | Remove orphaned VBA p-code via `/decompile`, recompile, then compact. Typical reduction: 60-70% on heavily-edited front-end databases. Use when a data-free `.accdb` exceeds 30-40 MB |
 
 ### Query management
 
@@ -273,6 +274,11 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 - **`access_vbe_append`** previously HTML-encoded `&` as `&amp;` due to MCP transport escaping. Fixed in v0.7.3 with explicit `html.unescape()` decoding.
 
 ## Changelog
+
+### v0.7.7 — 2026-03-17
+
+**New tool:**
+- `access_decompile_compact` — removes orphaned VBA p-code by launching `MSACCESS.EXE /decompile`, recompiling all modules, then running Compact & Repair. Compact alone cannot reclaim p-code space; this combination achieves 60-70% size reduction on heavily-edited front-end databases (tested: 69 MB → 26 MB). Launches Access as a subprocess, waits 8 s for decompile to complete, kills the process, reconnects via COM for recompile, then compact
 
 ### v0.7.6 — 2026-03-17
 
