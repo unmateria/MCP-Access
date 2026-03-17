@@ -56,7 +56,7 @@ Add to your MCP config file (`.mcp.json`, `mcp.json`, or client-specific setting
 
 Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 
-## Tools (54)
+## Tools (57)
 
 ### Database
 
@@ -74,6 +74,7 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 | `access_set_code` | Import modified text back (creates or overwrites) |
 | `access_export_structure` | Generate a Markdown index of all modules, forms, reports, queries |
 | `access_delete_object` | Delete a module, form, report, query, or macro. Requires `confirm=true` |
+| `access_create_form` | Create a new form without triggering the "Save As" MsgBox that blocks COM. Optional `has_header` for header/footer section |
 
 ### SQL & tables
 
@@ -103,7 +104,7 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 |------|-------------|
 | `access_list_controls` | List direct controls of a form/report with key properties |
 | `access_get_control` | Get the full definition block of a specific control |
-| `access_create_control` | Create a new control via COM in design view. **Note:** ActiveX controls (type 126) are created as empty containers without OLE initialization |
+| `access_create_control` | Create a new control via COM in design view. Supports `class_name` for ActiveX (type 119) ProgID initialization. Use type 128 (`acWebBrowser`) for native WebBrowser |
 | `access_delete_control` | Delete a control via COM |
 | `access_set_control_props` | Modify control properties via COM in design view |
 | `access_set_multiple_controls` | Modify properties of multiple controls in a single design-view session |
@@ -161,14 +162,15 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 
 | Tool | Description |
 |------|-------------|
-| `access_compile_vba` | Compile and save all VBA modules (`acCmdCompileAndSaveAllModules`) |
+| `access_compile_vba` | Compile and save all VBA modules. Optional `timeout` to auto-dismiss error MsgBox |
 
 ### VBA & macro execution
 
 | Tool | Description |
 |------|-------------|
 | `access_run_macro` | Execute an Access macro by name |
-| `access_run_vba` | Execute a VBA Sub/Function via `Application.Run` (standard modules only — not form/report modules). Supports arguments (max 30) and return values. **Warning:** MsgBox/InputBox in VBA will block indefinitely |
+| `access_run_vba` | Execute a VBA Sub/Function. Standard modules via `Application.Run`, form modules via `Forms.FormName.Method` syntax (COM). Optional `timeout` auto-dismisses MsgBox/InputBox |
+| `access_eval_vba` | Evaluate a VBA expression via `Application.Eval`. Call form module functions, read form properties, domain functions (DLookup, DCount), VBA built-ins |
 
 ### Export
 
@@ -199,7 +201,7 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 
 | Tool | Description |
 |------|-------------|
-| `access_screenshot` | Capture the Access window as PNG. Optionally opens a form/report first. Returns path, dimensions (original + image), and metadata. Configurable `max_width` (default 1920) and `wait_ms`. **Note:** Timer events do not fire during capture (no message pump) |
+| `access_screenshot` | Capture the Access window as PNG. Optionally opens a form/report first. Returns path, dimensions (original + image), and metadata. Configurable `max_width` (default 1920) and `wait_ms` (pumps Windows messages — Timer events fire, ActiveX initializes) |
 | `access_ui_click` | Click at image coordinates on the Access window. Coordinates are relative to a previous screenshot (`image_width` required for scaling). Supports `left`, `double`, and `right` click |
 | `access_ui_type` | Type text or send keyboard shortcuts. `text` for normal characters (WM_CHAR), `key` for special keys (enter, tab, escape, f1-f12, arrows, etc.), `modifiers` for combos (ctrl, shift, alt) |
 
@@ -208,6 +210,12 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 | Tool | Description |
 |------|-------------|
 | `access_find_usages` | Search a name across VBA code, query SQL, and control properties (ControlSource, RecordSource, RowSource, DefaultValue, ValidationRule) in one call |
+
+### Knowledge base
+
+| Tool | Description |
+|------|-------------|
+| `access_tips` | On-demand tips and gotchas. Topics: `eval`, `controls`, `gotchas`, `sql`, `vbe`, `compile`, `design`. Zero tokens until called |
 
 ## Typical workflows
 
@@ -227,6 +235,15 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 1. access_get_code   → export to text
 2. (edit the text)
 3. access_set_code   → reimport — binary sections are restored automatically
+```
+
+### Creating a new form
+
+```
+1. access_create_form(db, "myForm", has_header=true)  → creates empty form
+2. access_create_control(db, "form", "myForm", "CommandButton", {Name: "btn1", ...})
+3. access_vbe_append(db, "form", "myForm", code)  → add VBA event handlers
+4. access_set_form_property(db, "form", "myForm", {HasModule: true, OnCurrent: "[Event Procedure]"})
 ```
 
 ### Screenshot & UI interaction
@@ -250,12 +267,33 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 
 ## Known limitations
 
-- **ActiveX controls** (type 126/acCustomControl) created via `access_create_control` lack OLE initialization — `.Object` will be `Nothing`. Insert ActiveX controls manually from the Access ribbon instead.
-- **`access_run_vba`** can only call procedures in standard modules, not form/report code-behind modules. If VBA shows a `MsgBox` or `InputBox`, the call blocks indefinitely — use `access_ui_click`/`access_ui_type` to dismiss dialogs. Uses direct `InvokeTypes` to work around pywin32 late-binding bug with `Application.Run`'s 30 optional parameters (see v0.7.4 changelog).
-- **Timer events** (`Form_Timer`) do not fire during MCP tool execution because there is no Windows message pump. Open forms manually or use `access_run_vba` to force initialization before taking screenshots.
+- **ActiveX controls** (type 119 = `acCustomControl`): `access_create_control` now accepts a `class_name` parameter with the ProgID (e.g. `Shell.Explorer.2`) to initialize the OLE control. For WebBrowser specifically, use type 128 (`acWebBrowser`) which creates a native control without OLE complexity. Setting `ctrl.Class` from COM may not work for all ActiveX controls — manual insertion from the ribbon remains the most reliable method.
+- **`access_run_vba`**: Now supports form module procedures via `Forms.FormName.Method` syntax (direct COM access, form must be open). Also supports `timeout` parameter — if exceeded, auto-dismisses MsgBox/InputBox dialogs. For more flexible form interaction, use `access_eval_vba`.
+- **Timer events** (`Form_Timer`): Now fire during `access_screenshot` when `wait_ms > 0` — the wait loop pumps Windows messages via `pythoncom.PumpWaitingMessages()`. Other tools still block the message pump.
 - **`access_vbe_append`** previously HTML-encoded `&` as `&amp;` due to MCP transport escaping. Fixed in v0.7.3 with explicit `html.unescape()` decoding.
 
 ## Changelog
+
+### v0.7.6 — 2026-03-17
+
+**New tool:**
+- `access_create_form` — create a new form safely via COM without the "Save As" MsgBox that blocks the session. Uses `CreateForm()` → `DoCmd.Save(acForm, autoName)` → `DoCmd.Close(acForm, autoName, acSaveNo)` → `DoCmd.Rename(desired, acForm, autoName)`. Optional `has_header=true` to create with header/footer section via `RunCommand(36)`
+
+### v0.7.5 — 2026-03-17
+
+**Known limitations reduced:**
+- **Timer events fixed**: `access_screenshot` now uses `pythoncom.PumpWaitingMessages()` loop during `wait_ms` instead of `time.sleep()`. `Form_Timer` events fire, ActiveX controls initialize, WebBrowser navigates
+- **MsgBox/InputBox timeout**: `access_run_vba` and `access_compile_vba` now accept optional `timeout` (seconds). If exceeded, `_dismiss_access_dialogs()` finds Access modal dialogs (class `#32770`) via `win32gui.EnumWindows` and sends `WM_CLOSE` to dismiss them
+- **Form module support**: New `access_eval_vba` tool — evaluates expressions via `Application.Eval` (form properties, form module functions, domain functions, VBA built-ins). `access_run_vba` now supports `Forms.FormName.Method` syntax for direct COM access to open forms
+- **ActiveX `class_name`**: `access_create_control` now accepts `class_name` parameter for ActiveX (type 119) — sets `ctrl.Class` with ProgID to initialize OLE. Type 128 (`acWebBrowser`) documented as native WebBrowser alternative. New AcControlType constants added (128-134)
+
+**Improvements:**
+- **`access_compile_vba` timeout + error diagnostics**: Optional `timeout` to auto-dismiss MsgBox on compilation error. Reports exact module, line, code context via `VBE.ActiveCodePane`, and captures dialog screenshot
+- **`access_tips`** (new tool): On-demand knowledge base with tips and gotchas (eval, controls, sql, vbe, compile, design, gotchas). Zero tokens until called
+- **`access_list_controls` / `access_get_control`**: Now detect conditional formatting — show `format_conditions` count when a control has `ConditionalFormat` entries
+
+**Bug fix:**
+- **"You already have the database open"** after MCP reconnect: `_switch()` now catches this error and syncs internal state instead of failing. Happens when the MCP server restarts but Access.exe keeps running with the DB open from the previous session
 
 ### v0.7.4 — 2026-03-16
 

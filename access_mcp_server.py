@@ -33,6 +33,7 @@ import os
 import re
 import sys
 import tempfile
+import threading
 import time
 import traceback
 from datetime import datetime
@@ -137,7 +138,15 @@ class _Session:
             except Exception as e:
                 log.warning("Error cerrando BD anterior: %s", e)
         log.info("Abriendo BD: %s", path)
-        cls._app.OpenCurrentDatabase(path)
+        try:
+            cls._app.OpenCurrentDatabase(path)
+        except Exception as e:
+            if "already have the database open" in str(e).lower():
+                # After MCP reconnect, Access may already have this DB open
+                # from the previous server session — just sync our state
+                log.info("BD ya estaba abierta — sincronizando estado")
+            else:
+                raise
         cls._db_open = path
         # Limpiar caches al cambiar de BD
         cls._cm_cache.clear()
@@ -835,6 +844,7 @@ def ac_vbe_append(
 # ---------------------------------------------------------------------------
 # Control-level — parseo del texto de formulario/informe control a control
 # ---------------------------------------------------------------------------
+# SaveAsText type numbers (used by _parse_controls for form/report export parsing)
 _CTRL_TYPE: dict[int, str] = {
     100: "Label",
     101: "Rectangle",
@@ -852,11 +862,23 @@ _CTRL_TYPE: dict[int, str] = {
     113: "ObjectFrame",
     114: "PageBreak",
     118: "Page",
-    119: "TabControl",
+    119: "CustomControl",  # ActiveX in SaveAsText
     122: "Attachment",
     124: "NavigationButton",
     125: "NavigationControl",
     126: "WebBrowser",
+}
+
+# AcControlType enum values (used by CreateControl/CreateReportControl)
+# These are DIFFERENT from SaveAsText type numbers above.
+# Source: https://learn.microsoft.com/en-us/office/vba/api/access.accontroltype
+_AC_CONTROL_TYPE_NAMES: dict[str, int] = {
+    "customcontrol": 119,    # acCustomControl — generic ActiveX
+    "webbrowser": 128,       # acWebBrowser — native WebBrowser (NOT ActiveX)
+    "navigationcontrol": 129,  # acNavigationControl
+    "navigationbutton": 130,   # acNavigationButton
+    "chart": 133,            # acChart
+    "edgebrowser": 134,      # acEdgeBrowser
 }
 
 
@@ -980,11 +1002,19 @@ def _parse_controls(form_text: str) -> dict:
             except (ValueError, TypeError):
                 ctype = -1
 
+            # Count ConditionalFormat entries in the raw block
+            raw_text = "".join(block)
+            fmt_count = sum(
+                1 for bl in block
+                if re.match(r"^\s+ConditionalFormat\d*\s*=\s*Begin\s*$",
+                            bl.rstrip("\r\n"))
+            )
+
             # Guardar ctrl_indent del primer control encontrado (legacy compat)
             if not result["ctrl_indent"] and name:
                 result["ctrl_indent"] = indent
 
-            result["controls"].append({
+            ctrl_entry = {
                 "name":           name,
                 "control_type":   ctype,
                 "type_name":      _CTRL_TYPE.get(ctype, m_ctrl.group(1)),
@@ -997,8 +1027,11 @@ def _parse_controls(form_text: str) -> dict:
                 "visible":        props.get("Visible", ""),
                 "start_line":     ctrl_start + 1,  # 1-based
                 "end_line":       ctrl_end + 1,     # 1-based inclusive
-                "raw_block":      "".join(block),
-            })
+                "raw_block":      raw_text,
+            }
+            if fmt_count > 0:
+                ctrl_entry["format_conditions"] = fmt_count
+            result["controls"].append(ctrl_entry)
             i = ctrl_end + 1
             continue
 
@@ -1061,9 +1094,11 @@ _AC_DESIGN  = 1   # acDesign / acViewDesign
 _AC_FORM    = 2   # acForm   (para DoCmd.Close/Save)
 _AC_REPORT  = 3   # acReport (para DoCmd.Close/Save)
 _AC_SAVE_YES = 1  # acSaveYes
+_AC_SAVE_NO  = 2  # acSaveNo
 
 # Mapa inverso nombre → número de tipo de control
 _CTRL_TYPE_BY_NAME: dict[str, int] = {v.lower(): k for k, v in _CTRL_TYPE.items()}
+_CTRL_TYPE_BY_NAME.update(_AC_CONTROL_TYPE_NAMES)  # include acWebBrowser(128), etc.
 
 
 # Mapa de nombres de sección a número (para forms y reports)
@@ -1134,6 +1169,50 @@ def _coerce_prop(value: Any) -> Any:
     return value
 
 
+def ac_create_form(db_path: str, form_name: str, has_header: bool = False) -> dict:
+    """Crea un form nuevo evitando el MsgBox 'Save As' que bloquea COM.
+
+    CreateForm() genera un form con nombre auto (Form1, Form2...).
+    DoCmd.Save guarda con ese nombre (sin dialog).
+    DoCmd.Close con acSaveNo cierra (ya guardado, sin dialog).
+    DoCmd.Rename renombra al nombre deseado.
+    """
+    app = _Session.connect(db_path)
+    auto_name = None
+    try:
+        form = app.CreateForm()
+        auto_name = form.Name  # e.g. "Form1"
+
+        if has_header:
+            app.RunCommand(36)  # acCmdFormHdrFtr — toggle header/footer
+
+        # Save with auto-name — no dialog (DoCmd.Save uses current name)
+        app.DoCmd.Save(_AC_FORM, auto_name)
+        # Close without prompt (already saved)
+        app.DoCmd.Close(_AC_FORM, auto_name, _AC_SAVE_NO)
+
+        # Rename to desired name
+        if auto_name != form_name:
+            app.DoCmd.Rename(form_name, _AC_FORM, auto_name)
+
+        return {"name": form_name, "created_from": auto_name, "has_header": has_header}
+    except Exception as exc:
+        if auto_name:
+            try:
+                app.DoCmd.Close(_AC_FORM, auto_name, _AC_SAVE_NO)
+            except Exception:
+                pass
+            try:
+                app.DoCmd.DeleteObject(_AC_FORM, auto_name)
+            except Exception:
+                pass
+        raise RuntimeError(f"Error creando form '{form_name}': {exc}")
+    finally:
+        _vbe_code_cache.clear()
+        _parsed_controls_cache.clear()
+        _Session._cm_cache.clear()
+
+
 def _open_in_design(app: Any, object_type: str, object_name: str) -> None:
     """Abre un form/report en vista diseño."""
     try:
@@ -1164,7 +1243,7 @@ def _get_design_obj(app: Any, object_type: str, object_name: str) -> Any:
 
 def ac_create_control(
     db_path: str, object_type: str, object_name: str,
-    control_type: Any, props: dict
+    control_type: Any, props: dict, class_name: Optional[str] = None,
 ) -> dict:
     """
     Crea un control nuevo en un form/report abriéndolo en vista diseño.
@@ -1174,10 +1253,11 @@ def ac_create_control(
       left, top, width, height (twips; -1 = automático).
     El resto se asignan como propiedades COM sobre el control creado.
 
-    LIMITACION: Controles ActiveX (type 126/acCustomControl) se crean como contenedores
-    vacios sin inicializacion OLE — .Object sera Nothing. Para ActiveX funcionales
-    (ej: WebBrowser/Shell.Explorer.2), insertar manualmente desde el ribbon de Access:
-    Insertar > Controles ActiveX.
+    Para controles ActiveX (type 119 = acCustomControl), pasar class_name con el ProgID
+    del control (ej: 'Shell.Explorer.2', 'MSCAL.Calendar.7') para inicializar el OLE.
+
+    Para WebBrowser, usar type 128 (acWebBrowser) en lugar de 119 — crea un control
+    WebBrowser nativo sin necesidad de ActiveX.
     """
     if object_type not in ("form", "report"):
         raise ValueError("Solo 'form' o 'report'")
@@ -1217,6 +1297,13 @@ def ac_create_control(
                 f"Secciones validas: 0=Detail, 1=Header, 2=Footer, "
                 f"3=PageHeader, 4=PageFooter"
             )
+
+        # ActiveX: set ProgID via Class property to initialize OLE
+        if class_name and ctype == 119:  # acCustomControl
+            try:
+                ctrl.Class = class_name
+            except Exception as exc:
+                log.warning("Could not set Class='%s': %s", class_name, exc)
 
         errors: dict[str, str] = {}
         for key, val in props.items():
@@ -2850,16 +2937,189 @@ def ac_manage_index(
 
 
 # ---------------------------------------------------------------------------
+# Tips / knowledge base (on-demand, zero tokens until called)
+# ---------------------------------------------------------------------------
+
+_TIPS: dict[str, str] = {
+    "eval": (
+        "ac_eval_vba can query the Access Object Model without new tools:\n"
+        "  Application.IsCompiled — check if VBA is compiled (no compile triggered)\n"
+        "  SysCmd(10, 2, \"formName\") — check if form is open (acSysCmdGetObjectState=10, acForm=2)\n"
+        "    Returns: 0=closed, 1=open, 2=new, 4=dirty, 8=has new record\n"
+        "  Application.BrokenReference — True if any VBA reference is broken\n"
+        "  Screen.ActiveForm.Name / Screen.ActiveControl.Name — active form/control\n"
+        "  Forms.Count — number of open forms\n"
+        "  TempVars(\"x\") — session-persistent variables (read/write across tools)\n"
+        "  DLookup/DCount/DSum — domain aggregate functions\n"
+        "  TypeName(expr) — inspect type of any expression\n"
+        "  Eval only works for expressions/functions, NOT statements/Subs."
+    ),
+    "controls": (
+        "FormatConditions: access_list_controls / access_get_control show\n"
+        "  'format_conditions' count when a control has conditional formatting.\n"
+        "  ConditionalFormat data in SaveAsText is binary (hex blobs, not readable).\n"
+        "  To read details: use VBA via access_run_vba (FormatConditions collection in Design view).\n"
+        "  To modify: write a temp VBA function with access_vbe_append, call with access_run_vba.\n"
+        "  BE CAREFUL: modifying control properties may break existing conditional formatting.\n\n"
+        "Control types for access_create_control:\n"
+        "  119 = acCustomControl (ActiveX) — use class_name param for ProgID (e.g. 'Shell.Explorer.2')\n"
+        "  128 = acWebBrowser (native, NOT ActiveX — no OLE needed)\n"
+        "  Common: 100=Label, 109=TextBox, 106=ComboBox, 105=ListBox, 104=CommandButton,\n"
+        "          110=CheckBox, 114=SubForm, 122=Image, 101=Rectangle"
+    ),
+    "gotchas": (
+        "COM & ODBC:\n"
+        "  dbSeeChanges (512) — REQUIRED in CurrentDb.Execute for DELETE/UPDATE on ODBC linked tables\n"
+        "  LIKE wildcards — use % for ODBC (not *)\n"
+        "  COM from threads — MUST call pythoncom.CoInitialize() before and CoUninitialize() in finally\n"
+        "  COM apartment threading — can't access COM objects from Timer threads (capture hwnd as int first)\n"
+        "  ListBox.Value — use .Column(0) explicitly, .Value may return wrong column\n"
+        "  ComboBox filtering — never use Change event (infinite loops), use TextBox + LostFocus\n"
+        "  dbAttachSavePWD = 131072 (NOT 65536) — use DoCmd.TransferDatabase, not DAO Attributes\n"
+        "  Multiple JOINs — Access requires nested parentheses: FROM (A JOIN B ON ...) JOIN C ON ...\n\n"
+        "VBA:\n"
+        "  Str() adds leading space to positive numbers — use CStr() instead\n"
+        "  Chr(128) truncates MsgBox text — use ChrW(8364) or \"EUR\" for euro symbol\n"
+        "  ListBox AddItem — column separator is \";\", never use Format \"#,##0.00\" (comma breaks columns)\n"
+        "  GetClipboardFilePath() can throw — always wrap in On Error Resume Next"
+    ),
+    "sql": (
+        "Jet SQL DDL (access_execute_sql):\n"
+        "  YESNO is not valid — use BIT, or better use access_create_table (accepts 'yesno')\n"
+        "  DEFAULT not supported in CREATE TABLE — use access_set_field_property or access_create_table\n"
+        "  AUTOINCREMENT works as a type (no IDENTITY needed)\n"
+        "  Use SHORT instead of SMALLINT, LONG instead of INT\n"
+        "  Prefer access_create_table over CREATE TABLE SQL for full type+default+description support\n\n"
+        "ODBC pass-through:\n"
+        "  QueryDef.Connect limit 255 chars — hardcode minimal connect string:\n"
+        "  \"ODBC;DRIVER={ODBC Driver 17 for SQL Server};SERVER=myserver\\sqlexpress;"
+        "DATABASE=mydb;UID=myuser;PWD=mypassword\""
+    ),
+    "vbe": (
+        "VBE line numbers are 1-based.\n"
+        "ProcCountLines can inflate the last proc's count past end of module — always clamp.\n"
+        "Access must be Visible=True for VBE COM access to work.\n"
+        "'Trust access to the VBA project object model' must be enabled in Trust Center.\n"
+        "After design operations (set_control_props, create_control, delete_control),\n"
+        "  close the form in Design view before accessing VBE CodeModule.\n"
+        "access_vbe_append: was encoding & as &amp; (fixed in v0.7.3 with html.unescape)."
+    ),
+    "compile": (
+        "access_compile_vba tips:\n"
+        "  Use timeout param — RunCommand(126) shows MsgBox on error, blocks without it.\n"
+        "  With timeout: auto-dismisses MsgBox + reports module/line/code via VBE.ActiveCodePane.\n"
+        "  Also captures screenshot of the error MsgBox (dialog_screenshot in response).\n"
+        "  Before compiling, check: Eval('Application.BrokenReference') — broken refs cause mysterious failures.\n"
+        "  After compile error: use access_vbe_get_lines to read the problematic code, fix with access_vbe_replace_lines."
+    ),
+    "design": (
+        "Design view + VBE conflict:\n"
+        "  After design operations, the form may remain open in Design view.\n"
+        "  access_vbe_replace_proc closes the form (acSaveYes) before accessing VBE.\n"
+        "  All design operations invalidate all 3 caches (_vbe_code_cache, _parsed_controls_cache, _cm_cache).\n\n"
+        "SaveAsText encoding:\n"
+        "  Modules (.bas) — cp1252 (ANSI, no BOM)\n"
+        "  Forms/reports/queries/macros — utf-16 (UTF-16LE with BOM)\n"
+        "  access_set_code handles this automatically."
+    ),
+}
+
+
+def ac_tips(topic: str = "") -> dict:
+    """Return tips and gotchas for working with Access via MCP."""
+    if not topic:
+        return {
+            "available_topics": list(_TIPS.keys()),
+            "usage": "Call access_tips with a topic to get relevant tips.",
+        }
+    key = topic.lower().strip()
+    if key in _TIPS:
+        return {"topic": key, "tips": _TIPS[key]}
+    # Fuzzy match — return any topic containing the search term
+    matches = {k: v for k, v in _TIPS.items() if key in k or key in v.lower()}
+    if matches:
+        return {"matched_topics": {k: v for k, v in matches.items()}}
+    return {
+        "error": f"Topic '{topic}' not found.",
+        "available_topics": list(_TIPS.keys()),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Compile VBA
 # ---------------------------------------------------------------------------
 
-def ac_compile_vba(db_path: str) -> dict:
-    """Compila y guarda todos los modulos VBA."""
+def _get_vbe_error_location(app) -> Optional[dict]:
+    """After a compile error, VBE positions the cursor on the offending line.
+    Try to read ActiveCodePane to extract module name, line number, and code.
+    Returns dict with error location or None if unavailable.
+    """
+    try:
+        pane = app.VBE.ActiveCodePane
+        if pane is None:
+            return None
+        cm = pane.CodeModule
+        module_name = cm.Parent.Name
+        # GetSelection returns (StartLine, StartCol, EndLine, EndCol)
+        start_line, start_col, end_line, end_col = pane.GetSelection()
+        # Read a few lines around the error
+        first = max(1, start_line - 2)
+        last = min(cm.CountOfLines, start_line + 2)
+        lines = []
+        for i in range(first, last + 1):
+            prefix = ">>> " if i == start_line else "    "
+            lines.append(f"{prefix}{i}: {cm.Lines(i, 1)}")
+        return {
+            "module": module_name,
+            "line": start_line,
+            "code_context": "\n".join(lines),
+        }
+    except Exception:
+        return None
+
+
+def ac_compile_vba(db_path: str, timeout: Optional[int] = None) -> dict:
+    """Compila y guarda todos los modulos VBA.
+    RunCommand(126) puede mostrar MsgBox si hay errores de compilacion.
+    Con timeout, el watchdog cierra el MsgBox automaticamente y devuelve
+    la ubicacion del error (modulo, linea, codigo) via VBE.ActiveCodePane,
+    y una screenshot del MsgBox de error como imagen base64.
+    Returns dict with status + optional error_detail, error_location, dialog_screenshot.
+    """
     app = _Session.connect(db_path)
+    watchdog = None
+    dialog_screenshots: list = []
+    if timeout:
+        _h = app.hWndAccessApp
+        hwnd = int(_h() if callable(_h) else _h)
+        watchdog = threading.Timer(
+            timeout, _dismiss_access_dialogs,
+            args=[hwnd], kwargs={"screenshot_holder": dialog_screenshots},
+        )
+        watchdog.daemon = True
+        watchdog.start()
     try:
         app.RunCommand(_AC_CMD_COMPILE)
     except Exception as exc:
-        raise RuntimeError(f"Error de compilacion VBA: {exc}")
+        err_loc = _get_vbe_error_location(app)
+        if watchdog and not watchdog.is_alive():
+            result = {
+                "status": "error",
+                "error_detail": f"Compilacion VBA timed out after {timeout}s — MsgBox de error auto-cerrado.",
+            }
+        else:
+            result = {
+                "status": "error",
+                "error_detail": f"Error de compilacion VBA: {exc}",
+            }
+        if err_loc:
+            result["error_location"] = err_loc
+        if dialog_screenshots:
+            result["dialog_screenshot"] = dialog_screenshots[0]
+        return result
+    finally:
+        if watchdog:
+            watchdog.cancel()
     # Invalidate caches — compilation may change module state
     _vbe_code_cache.clear()
     _Session._cm_cache.clear()
@@ -2921,25 +3181,109 @@ def _invoke_app_run(app, procedure: str, call_args: list):
     )
 
 
+def _dismiss_access_dialogs(hwnd_access: int, screenshot_holder: Optional[list] = None):
+    """Send WM_CLOSE to any modal dialog owned by Access.
+
+    Receives hwnd_access as int (NOT COM object) — safe to call from any thread.
+    COM objects are apartment-threaded and can't be accessed from the Timer thread.
+    If screenshot_holder is provided (a list), captures a screenshot of the first
+    dialog found before dismissing, and appends the file path to the list.
+    """
+    import win32gui
+    def _cb(hwnd, found):
+        try:
+            if win32gui.GetClassName(hwnd) == '#32770':
+                if win32gui.GetWindow(hwnd, 4) == hwnd_access:  # GW_OWNER
+                    found.append(hwnd)
+        except Exception:
+            pass
+        return True
+    found = []
+    try:
+        win32gui.EnumWindows(_cb, found)
+    except Exception:
+        return
+    # Capture screenshot of first dialog before dismissing
+    if found and screenshot_holder is not None:
+        try:
+            img, _, _ = _capture_window(found[0], max_width=800)
+            path = os.path.join(tempfile.gettempdir(),
+                                f"access_dialog_{int(time.time())}.png")
+            img.save(path)
+            screenshot_holder.append(path)
+        except Exception:
+            pass  # screenshot is best-effort
+    for dlg in found:
+        win32gui.PostMessage(dlg, 0x0010, 0, 0)  # WM_CLOSE
+
+
 def ac_run_vba(
     db_path: str, procedure: str, args: Optional[list] = None,
+    timeout: Optional[int] = None,
 ) -> dict:
-    """Ejecuta un Sub/Function VBA via Application.Run.
+    """Ejecuta un Sub/Function VBA via Application.Run (o COM Forms() para form modules).
 
-    IMPORTANTE:
-    - Solo puede ejecutar Subs/Functions en modulos estandar (no en form/report modules).
-      Para form modules, crear un wrapper publico en un modulo estandar.
-    - Si el procedimiento muestra MsgBox/InputBox, la llamada se BLOQUEARA indefinidamente.
-      Usar access_ui_click/access_ui_type para cerrar dialogos modales si esto ocurre.
+    Soporta 3 sintaxis:
+    - 'MiModulo.MiSub' o 'MiSub' → Application.Run (modulos estandar)
+    - 'Forms.FormName.Method' → COM Forms() access (form modules, form debe estar abierto)
+
+    Si el procedimiento muestra MsgBox/InputBox y se pasa timeout, el dialogo se cierra
+    automaticamente tras timeout segundos y se devuelve un error de timeout.
     """
     app = _Session.connect(db_path)
     call_args = args or []
     if len(call_args) > 30:
         raise ValueError("Application.Run soporta max 30 argumentos.")
+
+    # Forms.FormName.Method → direct COM access (form modules)
+    if "." in procedure:
+        parts = procedure.split(".", 2)
+        if parts[0] == "Forms" and len(parts) == 3:
+            form_name, method_name = parts[1], parts[2]
+            try:
+                form = app.Forms(form_name)
+                if call_args:
+                    result = getattr(form, method_name)(*call_args)
+                else:
+                    # Try method call first, fall back to property read
+                    attr = getattr(form, method_name)
+                    try:
+                        result = attr() if callable(attr) else attr
+                    except (TypeError, AttributeError):
+                        result = attr
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Error al llamar Forms('{form_name}').{method_name}: {exc}. "
+                    f"Asegurate de que el form esta abierto."
+                )
+            if result is not None:
+                try:
+                    json.dumps(result)
+                except (TypeError, ValueError):
+                    result = str(result)
+            return {"procedure": procedure, "result": result, "status": "executed"}
+
+    # Standard Application.Run with optional watchdog timeout
+    watchdog = None
+    if timeout:
+        # Capture hwnd on main thread (COM is apartment-threaded)
+        _h = app.hWndAccessApp
+        hwnd = int(_h() if callable(_h) else _h)
+        watchdog = threading.Timer(timeout, _dismiss_access_dialogs, args=[hwnd])
+        watchdog.daemon = True
+        watchdog.start()
     try:
         result = _invoke_app_run(app, procedure, call_args)
     except Exception as exc:
+        if watchdog and not watchdog.is_alive():
+            raise RuntimeError(
+                f"'{procedure}' timed out after {timeout}s — likely MsgBox/InputBox. "
+                "Use access_screenshot + access_ui_click to dismiss."
+            )
         raise RuntimeError(f"Error al ejecutar '{procedure}': {exc}")
+    finally:
+        if watchdog:
+            watchdog.cancel()
     # COM puede devolver tipos no serializables; convertir a str si es necesario
     if result is not None:
         try:
@@ -2947,6 +3291,46 @@ def ac_run_vba(
         except (TypeError, ValueError):
             result = str(result)
     return {"procedure": procedure, "result": result, "status": "executed"}
+
+
+# ---------------------------------------------------------------------------
+# Eval VBA expression
+# ---------------------------------------------------------------------------
+
+def _invoke_app_eval(app, expression: str):
+    """Call Application.Eval via InvokeTypes — same pattern as _invoke_app_run."""
+    import pythoncom
+    dispid = app._oleobj_.GetIDsOfNames(0, "Eval")
+    # Eval(StringExpr As String) As Variant — 1 required param
+    return app._oleobj_.InvokeTypes(
+        dispid, 0, pythoncom.DISPATCH_METHOD,
+        (12, 0),       # return: VT_VARIANT
+        ((8, 1),),     # 1 param: VT_BSTR, PARAMFLAG_FIN
+        expression,
+    )
+
+
+def ac_eval_vba(db_path: str, expression: str) -> dict:
+    """Evalua una expresion VBA/Access via Application.Eval.
+
+    Permite:
+    - Llamar funciones de form modules: Eval("Forms!frmX.MiFuncion()")
+    - Leer propiedades de forms abiertos: Eval("Forms!frmX.MARGEN_SEG")
+    - Funciones de dominio: Eval("DLookup(""Empresa"",""Ventas"",""numc=1"")")
+    - Funciones VBA built-in: Eval("Date()")
+    - Solo funciones (no Subs). El form debe estar abierto.
+    """
+    app = _Session.connect(db_path)
+    try:
+        result = _invoke_app_eval(app, expression)
+    except Exception as exc:
+        raise RuntimeError(f"Error al evaluar '{expression}': {exc}")
+    if result is not None:
+        try:
+            json.dumps(result)
+        except (TypeError, ValueError):
+            result = str(result)
+    return {"expression": expression, "result": result, "status": "evaluated"}
 
 
 # ---------------------------------------------------------------------------
@@ -3230,7 +3614,11 @@ def ac_screenshot(
         object_opened = True
 
     if wait_ms > 0:
-        time.sleep(wait_ms / 1000.0)
+        import pythoncom
+        _deadline = time.time() + wait_ms / 1000.0
+        while time.time() < _deadline:
+            pythoncom.PumpWaitingMessages()
+            time.sleep(0.015)  # ~60 Hz, prevent busy-wait
 
     _h = app.hWndAccessApp
     hwnd = int(_h() if callable(_h) else _h)
@@ -3728,10 +4116,11 @@ TOOLS = [
         name="access_create_control",
         description=(
             "Crea un control en un form/report via COM. "
-            "control_type: nombre o numero. "
+            "control_type: nombre o numero (ej: 119=acCustomControl para ActiveX, 128=acWebBrowser nativo). "
             "props especiales: section (0=Detail,1=Header,2=Footer,3=PageHeader,4=PageFooter "
             "o nombre: 'detail','header','footer','reportheader','pageheader'...), "
-            "parent, column_name, left, top, width, height."
+            "parent, column_name, left, top, width, height. "
+            "Para ActiveX (type 119), usar class_name con el ProgID (ej: 'Shell.Explorer.2')."
         ),
         inputSchema={
             "type": "object",
@@ -3739,11 +4128,15 @@ TOOLS = [
                 "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
                 "object_type": {"type": "string", "enum": ["form", "report"]},
                 "object_name": {"type": "string", "description": "Nombre del form/report"},
-                "control_type": {"type": "string", "description": "'CommandButton', 'TextBox', 'Label'... o numero (104, 109, 100...)"},
+                "control_type": {"type": "string", "description": "'CommandButton', 'TextBox', 'Label', 'CustomControl'(119), 'WebBrowser'(128)... o numero"},
                 "props": {
                     "type": "object",
                     "description": "Propiedades: section, parent, column_name, left, top, width, height, Name, Caption, etc.",
                     "additionalProperties": True,
+                },
+                "class_name": {
+                    "type": "string",
+                    "description": "ProgID para ActiveX (type 119). Ej: 'Shell.Explorer.2', 'MSCAL.Calendar.7'. Inicializa el control OLE.",
                 },
             },
             "required": ["db_path", "object_type", "object_name", "control_type", "props"],
@@ -3990,11 +4383,12 @@ TOOLS = [
     # ── Compile VBA ─────────────────────────────────────────────────────────
     types.Tool(
         name="access_compile_vba",
-        description="Compila y guarda todos los modulos VBA. Devuelve status o error de compilacion.",
+        description="Compila y guarda todos los modulos VBA. Devuelve status o error de compilacion. Con timeout, cierra automaticamente MsgBox de error de compilacion.",
         inputSchema={
             "type": "object",
             "properties": {
                 "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "timeout": {"type": "integer", "description": "Timeout en segundos. Si se excede, cierra MsgBox de error de compilacion automaticamente"},
             },
             "required": ["db_path"],
         },
@@ -4166,6 +4560,24 @@ TOOLS = [
             "required": ["db_path", "table_name", "action", "field_name"],
         },
     ),
+    # ── Create form ───────────────────────────────────────────────────────
+    types.Tool(
+        name="access_create_form",
+        description=(
+            "Crea un form nuevo en la BD. Evita el MsgBox 'Save As' que bloquea COM "
+            "al usar CreateForm() directamente. Opcion has_header para crear con "
+            "header/footer section."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "form_name": {"type": "string", "description": "Nombre del form a crear"},
+                "has_header": {"type": "boolean", "default": False, "description": "Crear con seccion header/footer"},
+            },
+            "required": ["db_path", "form_name"],
+        },
+    ),
     # ── Delete object ──────────────────────────────────────────────────────
     types.Tool(
         name="access_delete_object",
@@ -4184,19 +4596,39 @@ TOOLS = [
     # ── Run VBA ────────────────────────────────────────────────────────────
     types.Tool(
         name="access_run_vba",
-        description="Ejecuta un Sub/Function VBA via Application.Run. procedure puede ser 'Modulo.NombreSub' o solo 'NombreSub'. Devuelve result si es Function. ADVERTENCIA: Si el procedimiento muestra MsgBox/InputBox, la llamada se bloqueara indefinidamente. Usar access_ui_click/access_ui_type para interactuar con dialogos modales.",
+        description="Ejecuta un Sub/Function VBA. Soporta 3 sintaxis: 'Modulo.MiSub' (modulo estandar via Application.Run), 'MiSub' (idem), 'Forms.FormName.Method' (form module via COM — form debe estar abierto). Devuelve result si es Function. Con timeout, cierra MsgBox/InputBox automaticamente si se excede.",
         inputSchema={
             "type": "object",
             "properties": {
                 "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
-                "procedure": {"type": "string", "description": "Nombre del procedimiento VBA (ej: MiModulo.MiSub)"},
+                "procedure": {"type": "string", "description": "Nombre del procedimiento: 'MiModulo.MiSub', 'MiSub', o 'Forms.FormName.Method'"},
                 "args": {
                     "type": "array",
                     "description": "Argumentos opcionales (max 30)",
                     "items": {},
                 },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Timeout en segundos. Si se excede, cierra dialogos MsgBox/InputBox automaticamente y devuelve error",
+                },
             },
             "required": ["db_path", "procedure"],
+        },
+    ),
+    # ── Eval VBA ──────────────────────────────────────────────────────────
+    types.Tool(
+        name="access_eval_vba",
+        description="Evalua una expresion VBA/Access via Application.Eval. Permite llamar funciones de form modules (form debe estar abierto), leer propiedades de forms, funciones de dominio (DLookup, DCount...) y funciones VBA built-in. Solo Functions, no Subs.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "expression": {
+                    "type": "string",
+                    "description": "Expresion a evaluar (ej: 'Forms!frmX.MARGEN_SEG', 'Date()', 'DLookup(\"Empresa\",\"Ventas\",\"numc=1\")')",
+                },
+            },
+            "required": ["db_path", "expression"],
         },
     ),
     # ── Delete relationship ────────────────────────────────────────────────
@@ -4328,10 +4760,21 @@ TOOLS = [
             "required": ["db_path", "object_type", "object_name", "controls"],
         },
     ),
+    # ── Tips / knowledge base ─────────────────────────────────────────────────
+    types.Tool(
+        name="access_tips",
+        description="Tips y gotchas para trabajar con Access via MCP. Topics: eval, controls, gotchas, sql, vbe, compile, design. Sin topic devuelve la lista.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "topic": {"type": "string", "description": "Topic: eval, controls, gotchas, sql, vbe, compile, design (vacio = lista de topics)"},
+            },
+        },
+    ),
     # ── Screenshot + UI Automation ────────────────────────────────────────────
     types.Tool(
         name="access_screenshot",
-        description="Captura la ventana de Access como PNG. Opcionalmente abre un form/report antes de capturar. Devuelve path, dimensiones y metadatos.",
+        description="Captura la ventana de Access como PNG. Opcionalmente abre un form/report antes de capturar. Devuelve path, dimensiones y metadatos. wait_ms bombea mensajes Windows (Timer events, ActiveX init).",
         inputSchema={
             "type": "object",
             "properties": {
@@ -4656,6 +5099,7 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 arguments["object_name"],
                 arguments["control_type"],
                 dict(arguments.get("props", {})),
+                class_name=arguments.get("class_name"),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -4783,7 +5227,7 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
 
         # ── Compile VBA ──────────────────────────────────────────────────
         elif name == "access_compile_vba":
-            result = ac_compile_vba(arguments["db_path"])
+            result = ac_compile_vba(arguments["db_path"], timeout=arguments.get("timeout"))
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
         # ── Run macro ────────────────────────────────────────────────────
@@ -4870,6 +5314,15 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
+        # ── Create form ──────────────────────────────────────────────────
+        elif name == "access_create_form":
+            result = ac_create_form(
+                arguments["db_path"],
+                arguments["form_name"],
+                has_header=bool(arguments.get("has_header", False)),
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
         # ── Delete object ────────────────────────────────────────────────
         elif name == "access_delete_object":
             result = ac_delete_object(
@@ -4886,6 +5339,15 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 arguments["db_path"],
                 arguments["procedure"],
                 args=arguments.get("args"),
+                timeout=arguments.get("timeout"),
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        # ── Eval VBA ────────────────────────────────────────────────────
+        elif name == "access_eval_vba":
+            result = ac_eval_vba(
+                arguments["db_path"],
+                arguments["expression"],
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -4936,6 +5398,11 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 arguments["object_name"],
                 arguments["controls"],
             )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        # ── Tips ────────────────────────────────────────────────────────
+        elif name == "access_tips":
+            result = ac_tips(arguments.get("topic", ""))
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
         # ── Screenshot + UI Automation ─────────────────────────────────
