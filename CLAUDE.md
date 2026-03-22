@@ -1,0 +1,244 @@
+# CLAUDE.md — mcp-access MCP Server
+
+## Overview
+
+MCP server (`access_mcp_server.py`, ~5500 lines) for reading and editing Microsoft Access databases (`.accdb`/`.mdb`) via COM automation (pywin32). Runs as stdio MCP server.
+
+## Architecture
+
+- **Singleton COM session** (`_Session`): one `Access.Application` instance shared across all tool calls. Opening a different `.accdb` closes the previous one.
+- **Dedicated COM thread** (`_com_executor`): All tool calls run in a single-threaded `ThreadPoolExecutor` with `CoInitialize()`. This keeps COM in one STA thread while the asyncio event loop stays free to read/write stdio. Without this, blocking COM calls would stall the event loop and cause the MCP SDK to produce `-32602 Invalid request parameters` errors from message corruption.
+- **Caches**: `_vbe_code_cache` (VBE text), `_parsed_controls_cache` (control parsing), `_Session._cm_cache` (CodeModule COM objects). All invalidated on DB switch, object modification, and design operations.
+- **Binary section handling**: `ac_get_code` strips PrtMip/PrtDevMode from form/report exports; `ac_set_code` restores them automatically before import.
+
+## Tools (58 total)
+
+| Category | Tools |
+|----------|-------|
+| **Database** | `access_create_database`, `access_close` |
+| **Objects** | `access_list_objects`, `access_get_code`, `access_set_code`, `access_export_structure`, `access_delete_object`, `access_create_form` |
+| **SQL/Tables** | `access_execute_sql`, `access_execute_batch`, `access_table_info`, `access_search_queries`, `access_create_table`, `access_alter_table` |
+| **VBE line-level** | `access_vbe_get_lines`, `access_vbe_get_proc`, `access_vbe_module_info`, `access_vbe_replace_lines`, `access_vbe_find`, `access_vbe_search_all`, `access_vbe_replace_proc`, `access_vbe_append` |
+| **Controls** | `access_list_controls`, `access_get_control`, `access_create_control`, `access_delete_control`, `access_set_control_props`, `access_set_multiple_controls` |
+| **DB Properties** | `access_get_db_property`, `access_set_db_property`, `access_get_form_property` |
+| **Linked Tables** | `access_list_linked_tables`, `access_relink_table` |
+| **Relationships** | `access_list_relationships`, `access_create_relationship`, `access_delete_relationship` |
+| **VBA References** | `access_list_references`, `access_manage_reference` |
+| **Maintenance** | `access_compact_repair` |
+| **Queries** | `access_manage_query` |
+| **Indexes** | `access_list_indexes`, `access_manage_index` |
+| **VBA Compilation** | `access_compile_vba` |
+| **VBA Execution** | `access_run_macro`, `access_run_vba`, `access_eval_vba` |
+| **Export** | `access_output_report` |
+| **Data Transfer** | `access_transfer_data` |
+| **Field Properties** | `access_get_field_properties`, `access_set_field_property` |
+| **Startup Options** | `access_list_startup_options` |
+| **Cross-reference** | `access_find_usages` |
+| **Knowledge base** | `access_tips` |
+
+## Key Implementation Details
+
+### Encoding in ac_set_code
+- **Modules** (`.bas`): written as `cp1252` (ANSI) — Access expects no BOM for VBA modules
+- **Forms, reports, queries, macros**: written as `utf-16` (UTF-16LE with BOM) — Access LoadFromText expects this
+
+### Control parsing (_parse_controls)
+The Access export format nests controls inside sections:
+```
+Begin Form
+    Begin                    ← defaults block (NOT controls)
+    End
+    Begin Section            ← section (Detail, FormHeader, FormFooter)
+        Begin                ← container
+            Begin Label      ← REAL CONTROL
+            End
+        End
+    End
+    Begin ClassModule        ← VBA code
+    End
+End Form
+```
+The parser scans for `Begin <TypeName>` where TypeName matches known control types (`_CTRL_TYPE` dict) at any depth, ignoring the defaults block.
+
+### VBE + Design view conflict
+After design operations (`ac_set_control_props`, `ac_create_control`, `ac_delete_control`), the form may remain open in Design view. `ac_vbe_replace_proc` now:
+1. Closes the form in Design view (DoCmd.Close with acSaveYes)
+2. Invalidates `_cm_cache` for the object
+3. Then accesses the VBE CodeModule
+
+All design operations invalidate all three caches in their `finally` block.
+
+### ac_execute_sql safety
+- SELECT results are limited by `limit` parameter (default 500, max 10000). If truncated, response includes `truncated: true`.
+- DELETE/DROP/TRUNCATE/ALTER require `confirm_destructive=true` — without it the server returns an error.
+- `_DESTRUCTIVE_PREFIXES` tuple defines the guarded prefixes.
+
+### ac_execute_batch (batch SQL)
+Executes multiple SQL statements in one call. Accepts `statements: [{sql, label?}, ...]`.
+- `stop_on_error` (default true): stops at first error, returns partial results with `stopped_at` index.
+- `confirm_destructive`: applies to entire batch — pre-scans all statements for destructive prefixes.
+- SELECT statements return `{rows, count}` (limit 100 per SELECT). Others return `{affected_rows}`.
+- Response: `{total, succeeded, failed, results: [{index, label?, status, ...}]}`.
+
+### ac_get_form_property
+Reads properties of a form/report (RecordSource, Caption, DefaultView, HasModule, etc.).
+- If `property_names` is provided, reads only those. Otherwise reads all readable properties.
+- Opens in Design view, reads, closes. Uses `_serialize_value` for COM value conversion.
+
+### ac_set_multiple_controls
+Modifies properties on multiple controls in a single design-view session.
+- Opens form/report once, iterates controls, applies props, saves and closes once.
+- Each control reports `{name, applied, errors?}`. Invalidates all 3 caches on completion.
+
+### Search tools — regex and limits
+- All search tools (`ac_vbe_find`, `ac_vbe_search_all`, `ac_search_queries`, `ac_find_usages`) support `use_regex=true` for regex patterns via `_text_matches()` helper.
+- `ac_vbe_search_all` and `ac_search_queries` accept `max_results` (default 100). When exceeded, response includes `truncated: true`.
+- `ac_find_usages` delegates to `ac_vbe_search_all` and `ac_search_queries` internally (DRY). Only control property scanning is inline.
+
+### Compact & Repair (ac_compact_repair)
+Closes the DB, compacts to temp file in same directory, does atomic swap (original→.bak, tmp→original), then reopens. Clears all 3 caches. Rollback on failure.
+
+### Relationship attributes (_REL_ATTR)
+`_REL_ATTR` maps DAO Relation.Attributes bitmask: 1=Unique, 2=DontEnforce, 256=UpdateCascade, 4096=DeleteCascade.
+
+### VBA References (ac_manage_reference)
+After add/remove, invalidates `_vbe_code_cache` and `_Session._cm_cache` since references affect VBA compilation. Guards against removing built-in references (VBA, Access, DAO).
+
+### Query management (ac_manage_query)
+CRUD for QueryDefs via DAO. `delete` requires `confirm=true`. `_QUERYDEF_TYPE` maps DAO QueryDef.Type to readable names (0=Select, 32=Delete, 48=Update, etc.).
+
+### Compile VBA (ac_compile_vba)
+Uses `app.RunCommand(126)` (`acCmdCompileAndSaveAllModules`). Invalidates VBE caches after compilation. Optional `timeout` parameter — if compilation shows a MsgBox (error dialog), the watchdog dismisses it automatically (same pattern as `ac_run_vba`). After the error, `_get_vbe_error_location()` reads `VBE.ActiveCodePane.GetSelection()` to report the exact module, line number, and surrounding code where the error occurred.
+
+### Output report (ac_output_report)
+Uses `DoCmd.OutputTo(acOutputReport=3, ...)`. `_OUTPUT_FORMATS` maps format names to Access format strings. Auto-generates output_path if omitted.
+
+### Transfer data (ac_transfer_data)
+Consolidated import/export for Excel and CSV. Excel uses `DoCmd.TransferSpreadsheet` with `acSpreadsheetTypeExcel12Xml=10`. CSV uses `DoCmd.TransferText`.
+
+### Field properties (ac_get_field_properties / ac_set_field_property)
+Reads all `Field.Properties` (skips COM errors on unreadable ones). Set uses `_coerce_prop()` with fallback to `CreateProperty`.
+
+### Startup options (ac_list_startup_options)
+`_STARTUP_PROPS` lists 14 common startup properties. Reads each via DB Properties fallback to GetOption.
+
+### DAO field types (ac_table_info)
+`_DAO_FIELD_TYPE` maps DAO Type integers to readable names. AutoNumber is detected as Long (type 4) with `dbAutoIncrField` attribute (bit 16).
+
+### Create form (ac_create_form)
+Creates a new form without triggering the "Save As" MsgBox that blocks COM. Uses `CreateForm()` → `DoCmd.Save(acForm, autoName)` → `DoCmd.Close(acForm, autoName, acSaveNo)` → `DoCmd.Rename(desired, acForm, autoName)`. Optional `has_header=true` toggles header/footer section via `RunCommand(36)` before saving. Invalidates all 3 caches.
+
+### Create database (ac_create_database)
+Uses `app.NewCurrentDatabase()` then closes and reopens with `OpenCurrentDatabase()` to ensure `CurrentDb()` works reliably. Refuses to overwrite existing files. Bypasses `_Session._switch()` (which requires file to exist) and manages Access lifecycle directly.
+
+### Create table via DAO (ac_create_table)
+Creates tables using DAO `CreateTableDef` + `CreateField` instead of DDL SQL. Supports all field types via `_FIELD_TYPE_MAP`, defaults, descriptions, and primary keys in a single call. More robust than `CREATE TABLE` via `access_execute_sql` which has Jet SQL limitations (no DEFAULT, no YESNO type). Uses `_set_field_prop()` helper for post-creation property assignment.
+
+### Alter table via DAO (ac_alter_table)
+Modifies table structure: `add_field` (with type, size, default, description), `delete_field` (requires `confirm=true`), `rename_field`. Uses DAO `TableDef.CreateField/Fields.Delete/Fields.Name` directly.
+
+### List objects with tables (ac_list_objects)
+`access_list_objects` now supports `object_type="table"` via `app.CurrentData.AllTables`. System tables (`MSys*`) and temp tables (`~*`) are filtered out.
+
+### Delete object (ac_delete_object)
+Uses `DoCmd.DeleteObject(AC_TYPE[object_type], object_name)`. Requires `confirm=true` (destructive). Invalidates all 3 caches in `finally`.
+
+### Run VBA (ac_run_vba)
+Uses `Application.Run` via direct `InvokeTypes` call (bypasses pywin32's late-bound `__getattr__`). Max 30 arguments (Access limit). Result from Functions is captured; non-serializable COM types converted to `str`.
+
+The helper `_invoke_app_run()` builds the full 31-param call with `pythoncom.Missing` for unused optional args, converted to `VT_ERROR/DISP_E_PARAMNOTFOUND` by `InvokeTypes`. This is necessary because Access COM rejects `Invoke()` calls missing the 30 optional params with `DISP_E_BADPARAMCOUNT`.
+
+**Form module support** (`Forms.FormName.Method` syntax): When `procedure` starts with `Forms.`, uses direct COM `app.Forms(name).Method()` instead of `Application.Run`. The form must be open.
+
+**Timeout parameter**: Optional `timeout` (seconds). If exceeded, `_dismiss_access_dialogs(hwnd)` finds Access modal dialogs (class `#32770`) via `win32gui.EnumWindows` and sends `WM_CLOSE` to dismiss them. The hwnd is captured on the main thread before starting the Timer (COM is apartment-threaded — accessing `app.hWndAccessApp` from the Timer thread fails silently). Without `timeout`, blocks indefinitely on MsgBox (backward compatible).
+
+### Eval VBA (ac_eval_vba)
+Uses `Application.Eval` via `InvokeTypes` (same pattern as `_invoke_app_run`). Evaluates a string expression in Access context. Can call form module functions (`Eval("Forms!frmX.MiFuncion()")`), read form properties, use domain functions (DLookup, DCount), and built-in VBA functions. Only Functions (not Subs). Form must be open.
+
+### Screenshot (ac_screenshot) — message pump + OpenForm timeout
+`wait_ms` uses `pythoncom.PumpWaitingMessages()` loop (~60 Hz) instead of `time.sleep()`. This pumps Windows messages so `Form_Timer` events fire, ActiveX controls initialize, and WebBrowser navigates during the wait.
+
+`open_timeout_sec` (default 30): before calling `DoCmd.OpenForm`, a daemon thread is started. If `OpenForm` does not return within the timeout, the thread sends `PostMessage(WM_KEYDOWN, VK_ESCAPE)` to the Access hwnd to cancel any pending `OpenRecordset` in the form's Load event, then `TimeoutError` is raised. Without this, a slow ODBC query in `Form_Load` can block `DoCmd.OpenForm` indefinitely (observed: 40+ minutes). The hwnd is captured **before** `OpenForm` blocks (COM is STA — the cancel thread cannot access `app.hWndAccessApp` directly).
+
+### Delete relationship (ac_delete_relationship)
+Uses `db.Relations.Delete(name)` via DAO.
+
+### Find usages (ac_find_usages)
+Cross-reference search in 3 locations: VBA code (all modules/forms/reports), SQL of all queries, and control properties (ControlSource, RecordSource, RowSource, DefaultValue, ValidationRule) via SaveAsText exports. `max_results` default 200.
+
+## Adding a new tool
+
+1. Write the implementation function (e.g. `ac_new_tool()`)
+2. Add a `types.Tool(...)` entry to the `TOOLS` list
+3. Add an `elif name == "access_new_tool":` branch in `call_tool()`
+4. Update the tool count in this CLAUDE.md and README.md
+
+## MCP SDK Patch: -32602 error detail (mcp 1.26.0)
+
+The MCP Python SDK (`mcp/shared/session.py`, line ~380) catches **all** exceptions during request handling and returns a generic `-32602 Invalid request parameters` error with an empty `data` field. This makes debugging impossible — the actual exception (Pydantic validation, COM error, etc.) is swallowed.
+
+**Patch applied** to `c:\program files\python310\lib\site-packages\mcp\shared\session.py`:
+- `logging.warning` now includes full traceback
+- `logging.debug` changed to `logging.warning` so the failing message is always visible
+- `ErrorData.message` now includes the exception string (e.g. `"Invalid request parameters: 'NoneType' object..."`)
+- `ErrorData.data` now includes the full traceback instead of empty string
+
+This patch is local to this machine and will be lost on `pip install --upgrade mcp`. Re-apply if needed. The upstream issue is that the catch-all `except Exception` at line 380 swallows errors from `model_validate`, `_received_request`, and `_handle_incoming` indiscriminately.
+
+## Common Gotchas
+
+- VBE line numbers are **1-based**
+- `ProcCountLines` can inflate the last proc's count past end of module — always clamp with `min(count, total - start + 1)`
+- Access must be `Visible = True` for VBE COM access to work
+- *"Trust access to the VBA project object model"* must be enabled in Access Trust Center
+
+### CreateForm via COM shows "Save As" MsgBox
+- `app.CreateForm()` opens a new form in Design view. `DoCmd.Close(acForm, name, acSaveYes)` triggers a "Save As" dialog that blocks the COM session.
+- **Fix**: `access_create_form` tool uses the sequence: `CreateForm()` → `DoCmd.Save(acForm, autoName)` (saves with auto-name, no dialog) → `DoCmd.Close(acForm, autoName, acSaveNo)` (already saved) → `DoCmd.Rename(desired, acForm, autoName)`. No dialogs at any step.
+- **Do NOT** call `CreateForm()` directly followed by `_save_and_close()` — always use `access_create_form` tool instead.
+- Alternative: export an existing form with `ac_get_code`, modify the text, and reimport with `ac_set_code` (avoids CreateForm entirely).
+
+### "You already have the database open" after MCP reconnect
+- After `/mcp` reconnect, the MCP server process restarts (`_Session._app = None`) but Access.exe keeps running with the DB open. New `Dispatch("Access.Application")` connects to the existing instance, and `OpenCurrentDatabase` fails with "already have the database open".
+- Fix: `_switch()` catches this specific error and syncs internal state (`_db_open = path`) without re-opening.
+
+### dbAttachSavePWD and linked tables
+- `dbAttachSavePWD` = **131072** (0x20000). NOT 65536 (that's `dbAttachExclusive`).
+- Setting `TableDef.Attributes` from Python COM before Append **does not work reliably** (Type Mismatch errors). It works in native VBA but fails via pywin32.
+- `ac_relink_table` uses `DoCmd.TransferDatabase(acLink, ..., StoreLogin:=True)` instead of DAO `CreateTableDef` + `Attributes` for reliable `dbAttachSavePWD` handling.
+- `DoCmd.DeleteObject(acTable, name)` is used to remove the old link before recreating. This works from Python COM, unlike `db.TableDefs.Delete()` which can leave stale references.
+- If `TransferDatabase` fails after deleting the old link, `ac_relink_table` attempts rollback by recreating the original link.
+
+### ac_execute_sql / ac_execute_batch retry pattern
+- Both use try/except retry with `dbSeeChanges` for ODBC linked tables with IDENTITY columns.
+- If the first attempt fails and the retry also fails, the **original** error is raised (not the retry error).
+
+### ac_set_code backup
+- Forms, reports, **and modules** are backed up via `SaveAsText` before `LoadFromText`. If import fails, the backup is restored automatically.
+
+### Application.Run and late-bound COM (DISP_E_BADPARAMCOUNT)
+- `Application.Run` has 31 params (1 required + 30 optional). pywin32's late-bound `Dispatch` uses `IDispatch.Invoke()` which only passes provided args — Access COM rejects this with `DISP_E_BADPARAMCOUNT` because the 30 optional params lack `VT_ERROR/DISP_E_PARAMNOTFOUND` markers.
+- Fix: `_invoke_app_run()` calls `_oleobj_.InvokeTypes()` directly with full arg types + `pythoncom.Missing` padding. Same protocol as `EnsureDispatch`-generated wrappers, but without changing the binding model for all other tools.
+- Do NOT switch `_Session._launch()` to `EnsureDispatch` — it would change binding for all 56 tools and add `gen_py` cache dependency.
+
+### ac_run_vba and modal dialogs
+- Without `timeout`: `Application.Run` blocks indefinitely if VBA shows `MsgBox`/`InputBox`.
+- With `timeout`: `_dismiss_access_dialogs()` fires via `threading.Timer`, finds `#32770` dialogs owned by Access via `win32gui.EnumWindows`, sends `WM_CLOSE`. The blocked `InvokeTypes` then returns and the tool reports a timeout error.
+
+### ac_create_control and ActiveX
+- Type 119 (`acCustomControl`): pass `class_name` with the ProgID (e.g. `Shell.Explorer.2`) to initialize the OLE control via `ctrl.Class = class_name`.
+- Type 128 (`acWebBrowser`): **native** WebBrowser control, no ActiveX/OLE needed.
+- `_CTRL_TYPE` maps SaveAsText type numbers (for parsing). `_AC_CONTROL_TYPE_NAMES` adds AcControlType enum names (128=WebBrowser, 129=NavigationControl, etc.) for `CreateControl`.
+
+### Jet SQL DDL Gotchas (access_execute_sql)
+- `YESNO` is not valid in DDL — use `BIT` for Yes/No fields, or better yet use `access_create_table` which accepts `yesno`/`boolean`
+- `DEFAULT` is not supported in `CREATE TABLE` Jet SQL — use `access_set_field_property` afterwards, or `access_create_table` which handles defaults automatically
+- Multiple JOINs require nested parentheses: `FROM (A INNER JOIN B ON ...) INNER JOIN C ON ...`
+- `AUTOINCREMENT` works as a type in DDL (no need for `IDENTITY` like SQL Server)
+- Use `SHORT` instead of `SMALLINT`, `LONG` instead of `INT` in DDL
+- Prefer `access_create_table` over `CREATE TABLE` via SQL for full type + default + description support in one call
+
+### VBA Language Gotchas
+
+- **`Private Type` sin `End Type`**: Todo el codigo despues del bloque queda "dentro" del tipo → error "Statement invalid inside Type block" en cualquier `Declare`/`Function`/`Sub` siguiente. Si el compilador da ese error en una linea que parece correcta, revisar que todos los `Private Type` tienen su `End Type`.
+- **`SysCmd acSysCmdInitMeter`/`acSysCmdUpdateMeter`**: Causan "Illegal function call" de forma intermitente (especialmente con valor=maxValue, o sin llamar `acSysCmdRemoveMeter` entre secuencias). Usar siempre `SysCmd acSysCmdSetStatus, "..."` en su lugar — nunca falla.

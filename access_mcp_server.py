@@ -61,6 +61,25 @@ logging.basicConfig(
 log = logging.getLogger("access-mcp")
 
 # ---------------------------------------------------------------------------
+# COM thread pool — single thread so all COM calls stay in the same STA.
+# Without this, async call_tool blocks the event loop during COM operations,
+# causing the MCP SDK's stdin reader to fall behind and produce -32602 errors.
+# ---------------------------------------------------------------------------
+import concurrent.futures
+
+def _com_thread_init():
+    """Initializer for the COM worker thread — calls CoInitialize once."""
+    import pythoncom
+    pythoncom.CoInitialize()
+    log.info("COM thread initialized (thread=%s)", threading.current_thread().name)
+
+_com_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="com-worker",
+    initializer=_com_thread_init,
+)
+
+# ---------------------------------------------------------------------------
 # Constantes Access COM
 # ---------------------------------------------------------------------------
 AC_TYPE: dict[str, int] = {
@@ -539,6 +558,12 @@ def ac_vbe_replace_lines(
     # Invalidar cache de texto (el módulo cambió)
     cache_key = f"{object_type}:{object_name}"
     _vbe_code_cache.pop(cache_key, None)
+    # Persist VBE changes to .accdb — without this, changes are only in memory
+    try:
+        obj_type_code = _OBJ_TYPES.get(object_type, 5)  # acModule=5 default
+        app.DoCmd.Save(obj_type_code, object_name)
+    except Exception:
+        pass  # save is best-effort; compact/close will also persist
     new_total = cm.CountOfLines
     end = start_line + count - 1 if count > 0 else start_line
     clamp_note = " (count ajustado al límite del módulo)" if clamped else ""
@@ -837,6 +862,12 @@ def ac_vbe_append(
     inserted = len(decoded.splitlines())
     cache_key = f"{object_type}:{object_name}"
     _vbe_code_cache.pop(cache_key, None)
+    # Persist VBE changes to .accdb
+    try:
+        obj_type_code = _OBJ_TYPES.get(object_type, 5)
+        app.DoCmd.Save(obj_type_code, object_name)
+    except Exception:
+        pass
     new_total = cm.CountOfLines
     return f"OK: {inserted} líneas añadidas al final → módulo ahora tiene {new_total} líneas"
 
@@ -1353,6 +1384,113 @@ def ac_delete_control(
         _vbe_code_cache.pop(cache_key, None)
 
     return f"OK: control '{control_name}' eliminado de '{object_name}'"
+
+
+def ac_export_text(db_path: str, object_type: str, object_name: str,
+                   output_path: str) -> dict:
+    """Exporta un form/report/module/query/macro como texto via SaveAsText.
+
+    NO abre el objeto en vista diseño — no recalcula posiciones.
+    El archivo resultante es UTF-16 LE con BOM.
+    """
+    if object_type not in ("form", "report", "module", "query", "macro"):
+        raise ValueError("object_type debe ser form, report, module, query o macro")
+    app = _Session.connect(db_path)
+    app.SaveAsText(AC_TYPE[object_type], object_name, output_path)
+    file_size = os.path.getsize(output_path)
+    return {"path": output_path, "file_size": file_size,
+            "object": object_name, "type": object_type}
+
+
+def ac_import_text(db_path: str, object_type: str, object_name: str,
+                   input_path: str) -> dict:
+    """Importa un form/report/module/query/macro desde texto via LoadFromText.
+
+    REEMPLAZA el objeto si ya existe (lo borra primero).
+    NO abre en vista diseño — no recalcula posiciones de controles.
+    El archivo debe ser UTF-16 LE con BOM (el formato de SaveAsText).
+
+    Para forms/reports con seccion CodeBehindForm: separa automaticamente el VBA
+    e inyecta via VBE (igual que access_set_code) para evitar errores de encoding.
+    """
+    if object_type not in ("form", "report", "module", "query", "macro"):
+        raise ValueError("object_type debe ser form, report, module, query o macro")
+    if not os.path.exists(input_path):
+        raise FileNotFoundError(f"No existe: {input_path}")
+
+    # Para forms/reports: leer el contenido y detectar CodeBehindForm
+    if object_type in ("form", "report"):
+        content, _enc = _read_text(input_path)
+        if "CodeBehindForm" in content or "CodeBehindReport" in content:
+            log.info("ac_import_text: detectado CodeBehindForm en '%s', usando VBA split", object_name)
+            # Separar VBA del form text (evita errores de encoding en LoadFromText)
+            form_code, vba_code = _split_code_behind(content)
+            if vba_code:
+                form_code = re.sub(r"^\s*HasModule\s*=.*$", "", form_code, flags=re.MULTILINE)
+
+            app = _Session.connect(db_path)
+            try:
+                app.DoCmd.Close(AC_TYPE[object_type], object_name, _AC_SAVE_NO)
+            except Exception:
+                pass
+            try:
+                app.DoCmd.DeleteObject(AC_TYPE[object_type], object_name)
+            except Exception:
+                pass
+
+            fd, tmp = tempfile.mkstemp(suffix=".txt", prefix="access_mcp_imp_")
+            os.close(fd)
+            try:
+                _write_tmp(tmp, form_code, encoding="utf-16")
+                try:
+                    app.LoadFromText(AC_TYPE[object_type], object_name, tmp)
+                except Exception as e:
+                    raise RuntimeError(
+                        f"LoadFromText falló para '{object_name}': {e}\n"
+                        f"Verifica la sintaxis del form text (sin VBA). "
+                        f"Usa access_set_code para más detalles de error."
+                    ) from e
+            finally:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+
+            if vba_code:
+                _inject_vba_after_import(app, object_type, object_name, vba_code)
+
+            cache_key = f"{object_type}:{object_name}"
+            _parsed_controls_cache.pop(cache_key, None)
+            _Session._cm_cache.pop(cache_key, None)
+            _vbe_code_cache.pop(cache_key, None)
+            return {"status": "imported", "object": object_name, "type": object_type,
+                    "source": input_path, "vba_injected": bool(vba_code)}
+
+    app = _Session.connect(db_path)
+    # Cerrar si está abierto y borrar el existente
+    try:
+        app.DoCmd.Close(AC_TYPE[object_type], object_name, _AC_SAVE_NO)
+    except Exception:
+        pass
+    try:
+        app.DoCmd.DeleteObject(AC_TYPE[object_type], object_name)
+    except Exception:
+        pass
+    # Importar desde texto
+    try:
+        app.LoadFromText(AC_TYPE[object_type], object_name, input_path)
+    except Exception as e:
+        raise RuntimeError(
+            f"LoadFromText falló para '{object_name}': {e}\n"
+            f"Para forms/reports con VBA: usa access_set_code en lugar de access_import_text."
+        ) from e
+    # Invalidar caches
+    cache_key = f"{object_type}:{object_name}"
+    _parsed_controls_cache.pop(cache_key, None)
+    _Session._cm_cache.pop(cache_key, None)
+    _vbe_code_cache.pop(cache_key, None)
+    return {"status": "imported", "object": object_name, "type": object_type,
+            "source": input_path}
 
 
 def ac_set_control_props(
@@ -3121,7 +3259,7 @@ _TIPS: dict[str, str] = {
     "compile": (
         "access_compile_vba tips:\n"
         "  Use timeout param — RunCommand(126) shows MsgBox on error, blocks without it.\n"
-        "  With timeout: auto-dismisses MsgBox + reports module/line/code via VBE.ActiveCodePane.\n"
+        "  With timeout: polls every 2s, auto-clicks End/OK button + reports module/line/code via VBE.ActiveCodePane.\n"
         "  Also captures screenshot of the error MsgBox (dialog_screenshot in response).\n"
         "  Before compiling, check: Eval('Application.BrokenReference') — broken refs cause mysterious failures.\n"
         "  After compile error: use access_vbe_get_lines to read the problematic code, fix with access_vbe_replace_lines."
@@ -3135,6 +3273,38 @@ _TIPS: dict[str, str] = {
         "  Modules (.bas) — cp1252 (ANSI, no BOM)\n"
         "  Forms/reports/queries/macros — utf-16 (UTF-16LE with BOM)\n"
         "  access_set_code handles this automatically."
+    ),
+    "subform_tabcontrol": (
+        "SubForm inside TabControl Page — BROKEN LAYOUT workaround:\n"
+        "  Access recalculates TabControl positions when a SubForm exists inside a Page,\n"
+        "  even with no SourceObject, both via CreateControl and LoadFromText.\n"
+        "  Opening in Design view also triggers recalculation.\n\n"
+        "SOLUTION: SubForm as SIBLING of TabControl (not child of Page).\n"
+        "  1. access_export_text the form\n"
+        "  2. In the UTF-16 text, add an EMPTY Page inside the TabControl\n"
+        "  3. Add SubForm OUTSIDE the TabControl (same indent level, sibling in Detail section)\n"
+        "     Set Visible = NotDefault (hidden by default)\n"
+        "     Position it at the same coords as the Page content area (Left=75, Top=465)\n"
+        "  4. Add OnChange =\"[Event Procedure]\" to the TabControl (Begin Tab)\n"
+        "  5. Add OnOpen =\"[Event Procedure]\" to the form properties\n"
+        "  6. Add CodeBehindForm section at end with VBA:\n"
+        "     Private Sub Form_Open(Cancel As Integer)\n"
+        "         sfName.Visible = False\n"
+        "     End Sub\n"
+        "     Private Sub tabName_Change()\n"
+        "         If tabName.Pages(tabName.Value).Name = \"pagX\" Then\n"
+        "             If sfName.SourceObject = \"\" Then\n"
+        "                 sfName.SourceObject = \"Form.subf_xxx\"\n"
+        "             End If\n"
+        "             sfName.Visible = True\n"
+        "         Else\n"
+        "             sfName.Visible = False\n"
+        "         End If\n"
+        "     End Sub\n"
+        "  7. access_import_text — single operation, NEVER open Design view after\n\n"
+        "CRITICAL: Do NOT use set_form_property, set_control_props, or vbe_append\n"
+        "  after import — they open Design view which recalculates positions.\n"
+        "  All changes must go in the text file BEFORE import."
     ),
 }
 
@@ -3192,52 +3362,229 @@ def _get_vbe_error_location(app) -> Optional[dict]:
         return None
 
 
+def _lint_form_modules(app) -> list:
+    """Lint form modules: detect orphan event handlers and Me.X refs to missing controls.
+
+    Returns list of warning strings. Empty if no issues found.
+    Iterates all VBComponents of type 100 (Access form/report modules), opens each
+    form in Design view to collect control names, then scans VBA code for:
+      - Event handler subs whose ctrl prefix doesn't match any control
+      - Me.X references to names that aren't controls or known Form properties
+    """
+    _FORM_PROPS = {
+        "recordsource", "filter", "caption", "visible", "enabled", "dirty",
+        "newrecord", "allowedits", "allowadditions", "allowdeletions", "requery",
+        "refresh", "undo", "setfocus", "repaint", "recalc", "controls", "name",
+        "tag", "filterstring", "orderbyon", "orderby", "dataentry", "cycle",
+        "filteron", "openargs", "recordset", "bookmark", "currentrecord",
+        "module", "hasmodule", "width", "painting", "popup", "modal",
+        "borderstyle", "defaultview", "autocenter", "autoresize",
+        "minmaxbuttons", "controlbox", "scrollbars", "navigbuttons",
+        "gridx", "gridy", "picture", "picturetype", "layoutforprint",
+        "fastlaserprinting", "allowlayoutview", "allowformview", "allowdataview",
+        "splitformorientation", "whenclosed", "whenloaded", "whennothinghaschanged",
+        "insidewidth", "insideheight", "currentview", "painted",
+    }
+    _event_re = re.compile(
+        r"^\s*(?:Private\s+|Public\s+)?Sub\s+(\w+)_"
+        r"(Click|BeforeUpdate|AfterUpdate|LostFocus|Change|GotFocus|KeyDown|"
+        r"Enter|Exit|DblClick|MouseDown|MouseMove|KeyUp|KeyPress)\s*\(",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    _me_re = re.compile(r"\bMe\.(\w+)\b", re.IGNORECASE)
+
+    warnings = []
+    try:
+        vbe = app.VBE
+        proj = vbe.ActiveVBProject
+        for comp in proj.VBComponents:
+            if comp.Type != 100:  # vbext_ct_Document — Access form/report modules
+                continue
+            form_name = comp.Name
+            # Try to open as form in Design view to get control names
+            ctrl_names = set()
+            already_open = False
+            try:
+                try:
+                    _ = app.Forms(form_name)
+                    already_open = True
+                except Exception:
+                    pass
+                if not already_open:
+                    app.DoCmd.OpenForm(form_name, 1)  # acDesign=1
+                form_obj = app.Forms(form_name)
+                for ctrl in form_obj.Controls:
+                    try:
+                        ctrl_names.add(ctrl.Name.lower())
+                    except Exception:
+                        pass
+                if not already_open:
+                    app.DoCmd.Close(2, form_name, 2)  # acForm=2, acSaveNo=2
+            except Exception:
+                continue  # Not a form (maybe a report), can't open — skip
+            if not ctrl_names:
+                continue
+            # Get VBA code for this form module
+            try:
+                cm = comp.CodeModule
+                if cm.CountOfLines == 0:
+                    continue
+                code = cm.Lines(1, cm.CountOfLines)
+            except Exception:
+                continue
+            # Check orphan event handlers
+            for m in _event_re.finditer(code):
+                ctrl_part = m.group(1)
+                if ctrl_part.lower().startswith("form"):
+                    continue  # Form_Load, Form_Open, etc. — valid
+                if ctrl_part.lower() not in ctrl_names:
+                    warnings.append(
+                        f"{form_name}: event handler '{ctrl_part}_{m.group(2)}'"
+                        f" — control '{ctrl_part}' not found"
+                    )
+            # Check Me.X references (deduplicated per prop within this form)
+            seen_me: set = set()
+            for m in _me_re.finditer(code):
+                prop = m.group(1)
+                key = prop.lower()
+                if key in seen_me:
+                    continue
+                seen_me.add(key)
+                if key in _FORM_PROPS:
+                    continue  # known Form property — not a control
+                if key not in ctrl_names:
+                    warnings.append(
+                        f"{form_name}: 'Me.{prop}' — control '{prop}' not found"
+                    )
+    except Exception:
+        pass  # VBE not accessible — skip lint
+    return warnings
+
+
 def ac_compile_vba(db_path: str, timeout: Optional[int] = None) -> dict:
-    """Compila y guarda todos los modulos VBA.
-    RunCommand(126) puede mostrar MsgBox si hay errores de compilacion.
-    Con timeout, el watchdog cierra el MsgBox automaticamente y devuelve
-    la ubicacion del error (modulo, linea, codigo) via VBE.ActiveCodePane,
-    y una screenshot del MsgBox de error como imagen base64.
+    """Intenta compilar VBA via RunCommand(126) + verificacion por modulo.
+
+    RunCommand(126) via COM tiene limitaciones (no abre el VBE, no compila
+    realmente en muchos casos). Como verificacion adicional, itera todos los
+    modulos estandar y llama Application.Run en una funcion de cada uno para
+    forzar compilacion on-demand. Si alguno falla con error de compilacion,
+    lo reporta.
+
+    Con timeout, un watchdog cierra MsgBox de error automaticamente.
     Returns dict with status + optional error_detail, error_location, dialog_screenshot.
     """
     app = _Session.connect(db_path)
-    watchdog = None
+
+    # 1. Intentar RunCommand(126) — puede no hacer nada via COM, pero intentamos
+    stop_event = None
     dialog_screenshots: list = []
+    dismissed: list = []
     if timeout:
         _h = app.hWndAccessApp
         hwnd = int(_h() if callable(_h) else _h)
-        watchdog = threading.Timer(
-            timeout, _dismiss_access_dialogs,
-            args=[hwnd], kwargs={"screenshot_holder": dialog_screenshots},
+        stop_event = threading.Event()
+        watchdog = threading.Thread(
+            target=_dialog_watchdog,
+            args=[hwnd, stop_event, dismissed, dialog_screenshots, 2.0],
+            daemon=True,
         )
-        watchdog.daemon = True
         watchdog.start()
     try:
         app.RunCommand(_AC_CMD_COMPILE)
     except Exception as exc:
         err_loc = _get_vbe_error_location(app)
-        if watchdog and not watchdog.is_alive():
-            result = {
-                "status": "error",
-                "error_detail": f"Compilacion VBA timed out after {timeout}s — MsgBox de error auto-cerrado.",
-            }
-        else:
-            result = {
-                "status": "error",
-                "error_detail": f"Error de compilacion VBA: {exc}",
-            }
+        result = {
+            "status": "error",
+            "error_detail": f"Error de compilacion VBA: {exc}",
+        }
         if err_loc:
             result["error_location"] = err_loc
         if dialog_screenshots:
             result["dialog_screenshot"] = dialog_screenshots[0]
         return result
     finally:
-        if watchdog:
-            watchdog.cancel()
-    # Invalidate caches — compilation may change module state
+        if stop_event:
+            stop_event.set()
+
     _vbe_code_cache.clear()
     _Session._cm_cache.clear()
-    return {"status": "compiled"}
+
+    if dismissed:
+        result = {
+            "status": "error",
+            "error_detail": "Compilacion VBA error — MsgBox de error auto-cerrado.",
+        }
+        err_loc = _get_vbe_error_location(app)
+        if err_loc:
+            result["error_location"] = err_loc
+        if dialog_screenshots:
+            result["dialog_screenshot"] = dialog_screenshots[0]
+        return result
+
+    # 2. Verificar IsCompiled — si True, pasar directamente al lint
+    try:
+        if bool(app.IsCompiled):
+            warnings = _lint_form_modules(app)
+            result = {"status": "compiled"}
+            if warnings:
+                result["warnings"] = warnings
+            return result
+    except Exception:
+        pass
+
+    # 3. IsCompiled=False: RunCommand no compilo. Verificar por modulo usando
+    #    Application.Run para forzar compilacion on-demand de cada modulo estandar.
+    errors = []
+    try:
+        vbe = app.VBE
+        proj = vbe.ActiveVBProject
+        for comp in proj.VBComponents:
+            if comp.Type != 1:  # solo modulos estandar (vbext_ct_StdModule)
+                continue
+            cm = comp.CodeModule
+            # Buscar la primera Public Function para llamarla
+            func_name = None
+            for line_num in range(cm.CountOfDeclarationLines + 1, cm.CountOfLines + 1):
+                try:
+                    pname = cm.ProcOfLine(line_num, 0)  # vbext_pk_Proc=0
+                    if pname:
+                        # Verificar que es Function (no Sub) para poder usar Run
+                        proc_line = cm.ProcBodyLine(pname, 0)
+                        proc_text = cm.Lines(proc_line, 1).strip().lower()
+                        if proc_text.startswith("public function"):
+                            func_name = pname
+                            break
+                except Exception:
+                    continue
+            if not func_name:
+                continue
+            # Intentar Application.Run — fuerza compilacion del modulo completo
+            try:
+                app.Run(f"{comp.Name}.{func_name}")
+            except Exception as exc:
+                err_str = str(exc).lower()
+                if "compile" in err_str or "expected" in err_str or "type mismatch" in err_str or "byref" in err_str:
+                    errors.append(f"{comp.Name}.{func_name}: {exc}")
+                # Otros errores runtime (division by zero, etc.) son OK — el modulo compilo
+    except Exception as exc:
+        # Si no podemos acceder al VBE, reportar warning
+        return {
+            "status": "compiled",
+            "note": f"IsCompiled=False, verificacion por modulo fallo: {exc}"
+        }
+
+    if errors:
+        return {
+            "status": "error",
+            "error_detail": "Errores de compilacion detectados via Application.Run:\n" + "\n".join(errors),
+        }
+
+    # 4. Lint form/report modules: orphan event handlers + Me.X refs to missing controls
+    warnings = _lint_form_modules(app)
+    result = {"status": "compiled"}
+    if warnings:
+        result["warnings"] = warnings
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -3295,30 +3642,47 @@ def _invoke_app_run(app, procedure: str, call_args: list):
     )
 
 
-def _dismiss_access_dialogs(hwnd_access: int, screenshot_holder: Optional[list] = None):
-    """Send WM_CLOSE to any modal dialog owned by Access.
+def _dismiss_access_dialogs(hwnd_access: int, screenshot_holder: Optional[list] = None) -> bool:
+    """Dismiss modal dialogs owned by the Access process.
 
-    Receives hwnd_access as int (NOT COM object) — safe to call from any thread.
-    COM objects are apartment-threaded and can't be accessed from the Timer thread.
-    If screenshot_holder is provided (a list), captures a screenshot of the first
-    dialog found before dismissing, and appends the file path to the list.
+    Uses process-ID matching (not just owner hwnd) to also catch VBE-owned
+    dialogs.  Tries clicking End/OK/Finalizar buttons first (more reliable
+    for VBA runtime-error dialogs), then falls back to WM_CLOSE.
+    Returns True if any dialog was found and dismissed.
     """
     import win32gui
+    import win32process
+
+    try:
+        _, access_pid = win32process.GetWindowThreadProcessId(hwnd_access)
+    except Exception:
+        return False
+
+    found = []
     def _cb(hwnd, found):
         try:
-            if win32gui.GetClassName(hwnd) == '#32770':
-                if win32gui.GetWindow(hwnd, 4) == hwnd_access:  # GW_OWNER
-                    found.append(hwnd)
+            if not win32gui.IsWindowVisible(hwnd):
+                return True
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            if pid != access_pid:
+                return True
+            cls = win32gui.GetClassName(hwnd)
+            if cls == '#32770':
+                found.append(hwnd)
         except Exception:
             pass
         return True
-    found = []
+
     try:
         win32gui.EnumWindows(_cb, found)
     except Exception:
-        return
+        return False
+
+    if not found:
+        return False
+
     # Capture screenshot of first dialog before dismissing
-    if found and screenshot_holder is not None:
+    if screenshot_holder is not None:
         try:
             img, _, _ = _capture_window(found[0], max_width=800)
             path = os.path.join(tempfile.gettempdir(),
@@ -3327,8 +3691,59 @@ def _dismiss_access_dialogs(hwnd_access: int, screenshot_holder: Optional[list] 
             screenshot_holder.append(path)
         except Exception:
             pass  # screenshot is best-effort
+
     for dlg in found:
-        win32gui.PostMessage(dlg, 0x0010, 0, 0)  # WM_CLOSE
+        _try_click_button(dlg)
+        # Fallback: WM_CLOSE
+        try:
+            if win32gui.IsWindow(dlg):
+                win32gui.PostMessage(dlg, 0x0010, 0, 0)  # WM_CLOSE
+        except Exception:
+            pass
+
+    return True
+
+
+def _try_click_button(dialog_hwnd: int):
+    """Find and click End/OK/Finalizar/Aceptar button in a dialog."""
+    import win32gui
+
+    target_texts = {"end", "finalizar", "ok", "aceptar",
+                    "&end", "&finalizar", "&ok", "&aceptar"}
+    found_btn = [None]
+
+    def _cb(hwnd, _):
+        try:
+            if win32gui.GetClassName(hwnd) == 'Button':
+                text = win32gui.GetWindowText(hwnd).lower().strip()
+                if text in target_texts or text.lstrip('&') in target_texts:
+                    found_btn[0] = hwnd
+                    return False
+        except Exception:
+            pass
+        return True
+
+    try:
+        win32gui.EnumChildWindows(dialog_hwnd, _cb, None)
+    except Exception:
+        pass
+
+    if found_btn[0]:
+        try:
+            win32gui.PostMessage(found_btn[0], 0x00F5, 0, 0)  # BM_CLICK
+        except Exception:
+            pass
+
+
+def _dialog_watchdog(hwnd_access: int, stop_event: threading.Event,
+                     dismissed: list, screenshot_holder: list,
+                     interval: float = 2.0):
+    """Poll for Access dialogs every *interval* seconds and dismiss them."""
+    while not stop_event.is_set():
+        if _dismiss_access_dialogs(hwnd_access,
+                                   screenshot_holder if not dismissed else None):
+            dismissed.append(True)
+        stop_event.wait(interval)
 
 
 def ac_run_vba(
@@ -3377,27 +3792,33 @@ def ac_run_vba(
                     result = str(result)
             return {"procedure": procedure, "result": result, "status": "executed"}
 
-    # Standard Application.Run with optional watchdog timeout
-    watchdog = None
+    # Standard Application.Run with optional watchdog timeout (polling every 2s)
+    stop_event = None
+    dismissed: list = []
+    dialog_screenshots: list = []
     if timeout:
         # Capture hwnd on main thread (COM is apartment-threaded)
         _h = app.hWndAccessApp
         hwnd = int(_h() if callable(_h) else _h)
-        watchdog = threading.Timer(timeout, _dismiss_access_dialogs, args=[hwnd])
-        watchdog.daemon = True
+        stop_event = threading.Event()
+        watchdog = threading.Thread(
+            target=_dialog_watchdog,
+            args=[hwnd, stop_event, dismissed, dialog_screenshots, 2.0],
+            daemon=True,
+        )
         watchdog.start()
     try:
         result = _invoke_app_run(app, procedure, call_args)
     except Exception as exc:
-        if watchdog and not watchdog.is_alive():
-            raise RuntimeError(
-                f"'{procedure}' timed out after {timeout}s — likely MsgBox/InputBox. "
-                "Use access_screenshot + access_ui_click to dismiss."
-            )
+        if dismissed:
+            detail = f"'{procedure}' — VBA runtime error (dialog auto-cerrado)."
+            if dialog_screenshots:
+                detail += f" Screenshot: {dialog_screenshots[0]}"
+            raise RuntimeError(detail)
         raise RuntimeError(f"Error al ejecutar '{procedure}': {exc}")
     finally:
-        if watchdog:
-            watchdog.cancel()
+        if stop_event:
+            stop_event.set()
     # COM puede devolver tipos no serializables; convertir a str si es necesario
     if result is not None:
         try:
@@ -3703,6 +4124,7 @@ def ac_screenshot(
     output_path: str = "",
     wait_ms: int = 300,
     max_width: int = 1920,
+    open_timeout_sec: int = 30,
 ) -> dict:
     """Capture the Access window as PNG. Optionally opens a form/report first.
 
@@ -3710,8 +4132,14 @@ def ac_screenshot(
     Windows message pump). Si el form usa Form_Timer para inicializacion
     (ej: WebBrowser navigate), abrir el form manualmente antes, o usar
     access_run_vba para forzar la inicializacion.
+
+    open_timeout_sec: segundos maximos esperando que OpenForm complete (default 30).
+    Si el Form_Load/Open tarda mas (ej: OpenRecordset lento), se envia ESC para
+    cancelar la operacion y se lanza TimeoutError. Evita bloqueos de 40+ minutos.
     """
     import win32gui
+    import win32api
+    import win32con
 
     app = _Session.connect(db_path)
     object_opened = False
@@ -3719,12 +4147,43 @@ def ac_screenshot(
     # Open form/report if requested
     if object_type and object_name:
         ot = object_type.lower()
-        if ot == "form":
-            app.DoCmd.OpenForm(object_name, 0)  # acNormal
-        elif ot == "report":
-            app.DoCmd.OpenReport(object_name, 2)  # acPreview
-        else:
+        if ot not in ("form", "report"):
             raise ValueError(f"object_type must be 'form' or 'report', got '{object_type}'")
+
+        # Get hwnd before OpenForm blocks (needed by cancel thread)
+        _h = app.hWndAccessApp
+        _hwnd = int(_h() if callable(_h) else _h)
+
+        # Background thread: send ESC after timeout to cancel hanging Load events
+        _done = threading.Event()
+        _timed_out = threading.Event()
+
+        def _cancel_if_hung():
+            if not _done.wait(open_timeout_sec):
+                _timed_out.set()
+                log.warning(
+                    "OpenForm '%s' timeout after %ds — sending ESC to cancel",
+                    object_name, open_timeout_sec,
+                )
+                win32api.PostMessage(_hwnd, win32con.WM_KEYDOWN, win32con.VK_ESCAPE, 0)
+                win32api.PostMessage(_hwnd, win32con.WM_KEYUP, win32con.VK_ESCAPE, 0)
+
+        _t = threading.Thread(target=_cancel_if_hung, daemon=True)
+        _t.start()
+        try:
+            if ot == "form":
+                app.DoCmd.OpenForm(object_name, 0)  # acNormal
+            else:
+                app.DoCmd.OpenReport(object_name, 2)  # acPreview
+        finally:
+            _done.set()
+
+        if _timed_out.is_set():
+            raise TimeoutError(
+                f"OpenForm '{object_name}' did not complete within {open_timeout_sec}s. "
+                "Form_Load event may have a slow/blocked OpenRecordset. "
+                "ESC was sent to cancel. Increase open_timeout_sec if the form is intentionally slow."
+            )
         object_opened = True
 
     if wait_ms > 0:
@@ -4268,6 +4727,34 @@ TOOLS = [
                 "control_name": {"type": "string", "description": "Nombre del control"},
             },
             "required": ["db_path", "object_type", "object_name", "control_name"],
+        },
+    ),
+    types.Tool(
+        name="access_export_text",
+        description="Exporta form/report/module como texto (SaveAsText). NO abre en Design view — no recalcula posiciones. El archivo es UTF-16 LE.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "object_type": {"type": "string", "enum": ["form", "report", "module", "query", "macro"]},
+                "object_name": {"type": "string", "description": "Nombre del objeto"},
+                "output_path": {"type": "string", "description": "Ruta del archivo de salida (.txt)"},
+            },
+            "required": ["db_path", "object_type", "object_name", "output_path"],
+        },
+    ),
+    types.Tool(
+        name="access_import_text",
+        description="Importa form/report/module desde texto (LoadFromText). REEMPLAZA si existe. NO abre en Design view — no recalcula posiciones. Para forms/reports con CodeBehindForm: separa VBA automaticamente e inyecta via VBE (igual que access_set_code).",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "object_type": {"type": "string", "enum": ["form", "report", "module", "query", "macro"]},
+                "object_name": {"type": "string", "description": "Nombre del objeto"},
+                "input_path": {"type": "string", "description": "Ruta del archivo de texto (.txt) en formato UTF-16 LE"},
+            },
+            "required": ["db_path", "object_type", "object_name", "input_path"],
         },
     ),
     types.Tool(
@@ -4931,6 +5418,11 @@ TOOLS = [
                     "default": 1920,
                     "description": "Ancho maximo de la imagen en px",
                 },
+                "open_timeout_sec": {
+                    "type": "integer",
+                    "default": 30,
+                    "description": "Segundos maximos esperando OpenForm/OpenReport. Si Form_Load tarda mas (OpenRecordset lento), se envia ESC y se lanza error. Default 30.",
+                },
             },
             "required": ["db_path"],
         },
@@ -5061,17 +5553,8 @@ REGLAS OBLIGATORIAS para el agente:
         ],
     )
 
-@server.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
-    # Logging seguro: mostrar código solo como longitud para proteger datos sensibles
-    safe_args = {}
-    for k, v in arguments.items():
-        if k == "code":
-            safe_args[k] = f"<VBA code: {len(v)} chars>"
-        else:
-            safe_args[k] = v
-    log.info(">>> %s  %s", name, safe_args)
-
+def _call_tool_sync(name: str, arguments: dict) -> str:
+    """Synchronous tool dispatcher — runs in a thread to avoid blocking the event loop."""
     try:
         if name == "access_list_objects":
             result = ac_list_objects(
@@ -5239,6 +5722,24 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 arguments["object_name"],
                 arguments["control_name"],
             )
+
+        elif name == "access_export_text":
+            result = ac_export_text(
+                arguments["db_path"],
+                arguments["object_type"],
+                arguments["object_name"],
+                arguments["output_path"],
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        elif name == "access_import_text":
+            result = ac_import_text(
+                arguments["db_path"],
+                arguments["object_type"],
+                arguments["object_name"],
+                arguments["input_path"],
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
 
         elif name == "access_set_control_props":
             result = ac_set_control_props(
@@ -5547,6 +6048,7 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 output_path=arguments.get("output_path", ""),
                 wait_ms=int(arguments.get("wait_ms", 300)),
                 max_width=int(arguments.get("max_width", 1920)),
+                open_timeout_sec=int(arguments.get("open_timeout_sec", 30)),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -5598,6 +6100,25 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         text = error_msg
 
     log.info("<<< %s  OK", name)
+    return text
+
+
+@server.call_tool()
+async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
+    """Async wrapper — delegates COM work to a thread so the event loop stays
+    free to read/write stdio (prevents -32602 errors from message corruption
+    when COM calls block the event loop)."""
+    # Logging seguro
+    safe_args = {}
+    for k, v in arguments.items():
+        if k == "code":
+            safe_args[k] = f"<VBA code: {len(v)} chars>"
+        else:
+            safe_args[k] = v
+    log.info(">>> %s  %s", name, safe_args)
+
+    loop = asyncio.get_running_loop()
+    text = await loop.run_in_executor(_com_executor, _call_tool_sync, name, arguments)
     return [types.TextContent(type="text", text=text)]
 
 

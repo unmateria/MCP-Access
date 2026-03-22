@@ -202,7 +202,7 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 
 | Tool | Description |
 |------|-------------|
-| `access_screenshot` | Capture the Access window as PNG. Optionally opens a form/report first. Returns path, dimensions (original + image), and metadata. Configurable `max_width` (default 1920) and `wait_ms` (pumps Windows messages — Timer events fire, ActiveX initializes) |
+| `access_screenshot` | Capture the Access window as PNG. Optionally opens a form/report first. Returns path, dimensions (original + image), and metadata. Configurable `max_width` (default 1920), `wait_ms` (pumps Windows messages — Timer events fire, ActiveX initializes), and `open_timeout_sec` (default 30 — sends ESC to cancel if `Form_Load` hangs on a slow query) |
 | `access_ui_click` | Click at image coordinates on the Access window. Coordinates are relative to a previous screenshot (`image_width` required for scaling). Supports `left`, `double`, and `right` click |
 | `access_ui_type` | Type text or send keyboard shortcuts. `text` for normal characters (WM_CHAR), `key` for special keys (enter, tab, escape, f1-f12, arrows, etc.), `modifiers` for combos (ctrl, shift, alt) |
 
@@ -262,6 +262,7 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 
 - Access runs visible (`Visible = True`) so VBE COM access works correctly.
 - One Access instance is shared across all tool calls (singleton session). Opening a different `.accdb` closes the previous one.
+- **COM thread isolation**: All COM calls run in a dedicated single-thread executor (`_com_executor`) with `CoInitialize()`. This keeps COM in one STA thread while the asyncio event loop stays free for stdio I/O, preventing `-32602` errors from message corruption.
 - **Auto-reconnect**: if the COM session becomes stale (Access crashed, closed manually, or COM corruption), the server detects it via a health check and reconnects automatically on the next tool call.
 - `access_get_code` strips binary sections (`PrtMip`, `PrtDevMode`, etc.) from form/report exports — `access_set_code` restores them automatically before importing.
 - All VBE line numbers are 1-based.
@@ -273,7 +274,23 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 - **Timer events** (`Form_Timer`): Now fire during `access_screenshot` when `wait_ms > 0` — the wait loop pumps Windows messages via `pythoncom.PumpWaitingMessages()`. Other tools still block the message pump.
 - **`access_vbe_append`** previously HTML-encoded `&` as `&amp;` due to MCP transport escaping. Fixed in v0.7.3 with explicit `html.unescape()` decoding.
 
+## Troubleshooting
+
+### Intermittent `-32602 Invalid request parameters` errors
+
+The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/session.py` that swallows real errors and returns a generic `-32602` code with no detail. A local patch is applied to this machine that includes the actual exception and traceback in the error response. If you upgrade the `mcp` package, re-apply the patch — see `CLAUDE.md` for details.
+
 ## Changelog
+
+### v0.7.9 — 2026-03-22
+
+**Bug fix:**
+- **Intermittent `-32602 Invalid request parameters` errors**: Root cause — the `call_tool` handler was `async` but ran blocking COM calls synchronously, stalling the asyncio event loop. When the event loop couldn't read stdin fast enough, the MCP SDK's message parser received truncated or merged JSON-RPC frames, causing Pydantic `model_validate` to fail with a catch-all `-32602` error. Fix: all COM work now runs in a dedicated single-thread `ThreadPoolExecutor` (`_com_executor`) with `CoInitialize()`, keeping the event loop free for stdio I/O. The `call_tool` async wrapper uses `loop.run_in_executor()` to delegate to the COM thread
+
+### v0.7.8 — 2026-03-20
+
+**Bug fix:**
+- **`access_screenshot` OpenForm hang**: `DoCmd.OpenForm` could block indefinitely when a form's `Form_Load` event ran a slow or blocked `OpenRecordset` (ODBC query to SQL Server). New `open_timeout_sec` parameter (default 30 s) starts a daemon thread before opening the form. If `OpenForm` does not return within the timeout, the thread sends `PostMessage(WM_KEYDOWN/WM_KEYUP, VK_ESCAPE)` to the Access window to cancel the pending DAO operation, then raises `TimeoutError` with a descriptive message. The hwnd is captured before `OpenForm` blocks so the cancel thread does not need COM access (STA restriction). `open_timeout_sec` can be increased for forms that are legitimately slow to load
 
 ### v0.7.7 — 2026-03-17
 
