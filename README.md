@@ -1,6 +1,32 @@
 # mcp-access
 
-MCP server for reading and editing Microsoft Access databases (`.accdb` / `.mdb`) via COM automation.
+**Give any AI assistant full control over Microsoft Access databases.**
+
+Create forms, write VBA, design tables, manage controls, run queries, build relationships, and edit every corner of an `.accdb` — all through natural language. 58 tools that turn Access into something you can *talk to*.
+
+No Access expertise required. Just describe what you want.
+
+```
+"Create a form called Invoices with a ListBox, two date filters, and a search button"
+"Add a VBA click handler that filters the recordsource by date range"
+"Create a table called audit_log with timestamp, user, and action fields"
+"List all controls inside the Payment tab and change the combo's row source"
+```
+
+The AI handles the COM automation, design view, VBA modules, binary sections, cache invalidation, and all the ugly parts. You get the result.
+
+### What it can do
+
+- **Forms & Reports** — create, export, import, screenshot, click, type. Full UI automation loop
+- **VBA** — read, write, replace, compile, and *run* procedures. Line-level or full-proc editing
+- **Controls** — create, delete, modify, list. Finds controls nested inside TabControl pages
+- **Tables & SQL** — create via DAO, alter, query, batch execute. Linked ODBC tables supported
+- **Relationships, indexes, references, queries, macros** — full CRUD
+- **Maintenance** — compact & repair, decompile bloated databases, export structure docs
+
+Works with Claude Code, Cursor, Windsurf, Continue, or any MCP-compatible client.
+
+---
 
 ## Requirements
 
