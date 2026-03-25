@@ -900,6 +900,9 @@ _CTRL_TYPE: dict[int, str] = {
     126: "WebBrowser",
 }
 
+# Tipos de control que son contenedores — el parser debe escanear su interior
+_CONTAINER_TYPES = {"Page", "OptionGroup"}
+
 # AcControlType enum values (used by CreateControl/CreateReportControl)
 # These are DIFFERENT from SaveAsText type numbers above.
 # Source: https://learn.microsoft.com/en-us/office/vba/api/access.accontroltype
@@ -990,7 +993,11 @@ def _parse_controls(form_text: str) -> dict:
     #    donde TypeName coincide con un tipo de control conocido.
     #    Los controles pueden estar a cualquier profundidad dentro de secciones.
     i = form_begin + 1
+    container_stack: list[tuple[str, int]] = []  # [(name, ctrl_end_idx), ...]
     while i < result["form_end_idx"]:
+        # Limpiar contenedores que ya hemos pasado
+        while container_stack and i > container_stack[-1][1]:
+            container_stack.pop()
         raw = lines[i].rstrip("\r\n")
         s = raw.lstrip()
         indent = raw[: len(raw) - len(s)]
@@ -1062,8 +1069,15 @@ def _parse_controls(form_text: str) -> dict:
             }
             if fmt_count > 0:
                 ctrl_entry["format_conditions"] = fmt_count
+            # Anotar parent si estamos dentro de un contenedor
+            if container_stack:
+                ctrl_entry["parent"] = container_stack[-1][0]
             result["controls"].append(ctrl_entry)
-            i = ctrl_end + 1
+            if m_ctrl.group(1) in _CONTAINER_TYPES:
+                container_stack.append((name, ctrl_end))
+                i = ctrl_start + 1  # re-escanear dentro del contenedor
+            else:
+                i = ctrl_end + 1
             continue
 
         i += 1
@@ -1420,7 +1434,7 @@ def ac_import_text(db_path: str, object_type: str, object_name: str,
 
     # Para forms/reports: leer el contenido y detectar CodeBehindForm
     if object_type in ("form", "report"):
-        content, _enc = _read_text(input_path)
+        content, _enc = _read_tmp(input_path)
         if "CodeBehindForm" in content or "CodeBehindReport" in content:
             log.info("ac_import_text: detectado CodeBehindForm en '%s', usando VBA split", object_name)
             # Separar VBA del form text (evita errores de encoding en LoadFromText)

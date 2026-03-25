@@ -102,8 +102,8 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 
 | Tool | Description |
 |------|-------------|
-| `access_list_controls` | List direct controls of a form/report with key properties |
-| `access_get_control` | Get the full definition block of a specific control |
+| `access_list_controls` | List all controls of a form/report with key properties. Controls inside Pages/OptionGroups include a `parent` field |
+| `access_get_control` | Get the full definition block of a specific control (finds controls inside Pages/OptionGroups) |
 | `access_create_control` | Create a new control via COM in design view. Supports `class_name` for ActiveX (type 119) ProgID initialization. Use type 128 (`acWebBrowser`) for native WebBrowser |
 | `access_delete_control` | Delete a control via COM |
 | `access_set_control_props` | Modify control properties via COM in design view |
@@ -281,6 +281,11 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/session.py` that swallows real errors and returns a generic `-32602` code with no detail. A local patch is applied to this machine that includes the actual exception and traceback in the error response. If you upgrade the `mcp` package, re-apply the patch — see `CLAUDE.md` for details.
 
 ## Changelog
+
+### v0.7.10 — 2026-03-25
+
+**Bug fix:**
+- **`access_list_controls` / `access_get_control` didn't find controls inside Pages or OptionGroups**: The text parser (`_parse_controls`) consumed the entire `Begin Page ... End` block as one control and skipped all children inside it. Fix: new `_CONTAINER_TYPES` set (`{"Page", "OptionGroup"}`) and a `container_stack` mechanism — when the parser finds a container type, it records the container and re-scans inside the block instead of jumping past it. Child controls now include a `"parent"` field with the container's name. `delete_control` and `set_control_props` were unaffected (they use COM directly)
 
 ### v0.7.9 — 2026-03-22
 

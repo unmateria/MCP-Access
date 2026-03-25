@@ -52,6 +52,12 @@ Begin Form
         Begin                ← container
             Begin Label      ← REAL CONTROL
             End
+            Begin Page       ← CONTAINER — children re-scanned
+                Begin        ← anonymous wrapper
+                    Begin ComboBox  ← child control (parent = Page)
+                    End
+                End
+            End
         End
     End
     Begin ClassModule        ← VBA code
@@ -59,6 +65,8 @@ Begin Form
 End Form
 ```
 The parser scans for `Begin <TypeName>` where TypeName matches known control types (`_CTRL_TYPE` dict) at any depth, ignoring the defaults block.
+
+**Container types** (`_CONTAINER_TYPES = {"Page", "OptionGroup"}`): When the parser finds a container control, it records the container, then re-scans inside the block instead of skipping it. Child controls get a `"parent"` field with the container's name. A `container_stack` tracks nesting so deeply nested containers (Page inside OptionGroup, etc.) are handled correctly.
 
 ### VBE + Design view conflict
 After design operations (`ac_set_control_props`, `ac_create_control`, `ac_delete_control`), the form may remain open in Design view. `ac_vbe_replace_proc` now:
