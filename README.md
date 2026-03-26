@@ -308,6 +308,12 @@ The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/s
 
 ## Changelog
 
+### v0.7.11 — 2026-03-26
+
+**Bug fixes:**
+- **AutoExec / startup forms block `OpenCurrentDatabase` indefinitely**: Databases with `AutoExec` macros that open modal forms (e.g. Northwind Developer Edition's welcome/login dialog via `acDialog`) block the COM call until the user manually closes the form. Fix: `_switch()` now holds the Shift key via `win32api.keybd_event(VK_SHIFT)` during `OpenCurrentDatabase` — the standard Access bypass for AutoExec and startup forms. After opening, any auto-opened forms are closed as a safety net. `AutomationSecurity = 3` does NOT work (Access ignores it for database-level AutoExec macros). VK_ESCAPE is unreliable (doesn't reach modal forms)
+- **MCP clients sending integer/boolean arguments as strings**: Some MCP clients (e.g. Claude Desktop) serialize ALL tool arguments as strings. The MCP SDK validates against the JSON Schema before `call_tool()` runs, so `start_line: "1"` fails with `'1' is not of type 'integer'`. Fix: `_fixup_schema()` runs at module load and widens all 58 tool schemas to accept `["integer", "string"]` and `["boolean", "string"]`. `_coerce_arguments()` in `call_tool()` converts string args to the expected type before dispatch
+
 ### v0.7.10 — 2026-03-25
 
 **Bug fix:**

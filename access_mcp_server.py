@@ -157,6 +157,18 @@ class _Session:
             except Exception as e:
                 log.warning("Error cerrando BD anterior: %s", e)
         log.info("Abriendo BD: %s", path)
+
+        # Hold Shift during OpenCurrentDatabase to bypass AutoExec/startup
+        # forms.  Without this, databases with modal startup forms (acDialog)
+        # block the COM call indefinitely until the user manually closes them.
+        shift_held = False
+        try:
+            import win32api, win32con
+            win32api.keybd_event(win32con.VK_SHIFT, 0, 0, 0)
+            shift_held = True
+        except Exception:
+            log.warning("No se pudo simular Shift — AutoExec puede ejecutarse")
+
         try:
             cls._app.OpenCurrentDatabase(path)
         except Exception as e:
@@ -166,7 +178,30 @@ class _Session:
                 log.info("BD ya estaba abierta — sincronizando estado")
             else:
                 raise
+        finally:
+            if shift_held:
+                try:
+                    win32api.keybd_event(
+                        win32con.VK_SHIFT, 0, win32con.KEYEVENTF_KEYUP, 0,
+                    )
+                except Exception:
+                    pass
+
         cls._db_open = path
+
+        # Close any auto-opened forms (safety net if Shift bypass didn't work
+        # or if the DB has a startup form that isn't blocked by Shift)
+        try:
+            for i in range(cls._app.Forms.Count - 1, -1, -1):
+                try:
+                    name = cls._app.Forms(i).Name
+                    cls._app.DoCmd.Close(2, name)  # acForm
+                    log.info("Cerrado form auto-abierto: %s", name)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         # Limpiar caches al cambiar de BD
         cls._cm_cache.clear()
         _vbe_code_cache.clear()
@@ -521,21 +556,9 @@ def ac_vbe_module_info(
     return {"total_lines": total, "procs": procs}
 
 
-def ac_vbe_replace_lines(
-    db_path: str, object_type: str, object_name: str,
-    start_line: int, count: int, new_code: str
-) -> str:
-    """
-    Reemplaza 'count' líneas a partir de 'start_line' con 'new_code'.
-    - count=0 → inserción pura (no borra nada).
-    - new_code='' → borrado puro (no inserta nada).
-    new_code puede ser multilínea (\\n o \\r\\n).
-    Devuelve el estado + preview del código insertado para evitar un get_proc adicional.
-    """
-    app = _Session.connect(db_path)
-    cm = _get_code_module(app, object_type, object_name)
+def _exec_single_replace(cm, app, object_type, object_name, start_line, count, new_code):
+    """Ejecuta una operación individual de replace_lines. Devuelve dict con resultado."""
     total = cm.CountOfLines
-    # Validar límites
     if start_line < 1 or start_line > total + 1:
         raise ValueError(
             f"start_line {start_line} fuera de rango (1–{total})"
@@ -549,12 +572,70 @@ def ac_vbe_replace_lines(
         cm.DeleteLines(start_line, count)
     inserted = 0
     if new_code:
-        # Decode HTML entities that MCP transport may have encoded (& → &amp; etc.)
         decoded = html_mod.unescape(new_code)
-        # Access VBA espera \r\n como separador de líneas
         normalized = decoded.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
         cm.InsertLines(start_line, normalized)
         inserted = len(new_code.splitlines())
+    end = start_line + count - 1 if count > 0 else start_line
+    clamp_note = " (count ajustado)" if clamped else ""
+    return {
+        "start_line": start_line, "deleted": count, "inserted": inserted,
+        "clamp_note": clamp_note, "end": end,
+    }
+
+
+def ac_vbe_replace_lines(
+    db_path: str, object_type: str, object_name: str,
+    start_line: int = 0, count: int = 0, new_code: str = "",
+    operations: list = None,
+) -> str:
+    """
+    Reemplaza 'count' líneas a partir de 'start_line' con 'new_code'.
+    - count=0 → inserción pura (no borra nada).
+    - new_code='' → borrado puro (no inserta nada).
+    new_code puede ser multilínea (\\n o \\r\\n).
+
+    Modo batch: si se pasa 'operations' (lista de {start_line, count, new_code}),
+    se ejecutan todas en 1 llamada, ordenadas automáticamente bottom-to-top.
+    En modo batch, start_line/count/new_code individuales se ignoran.
+
+    Devuelve el estado + preview del código insertado para evitar un get_proc adicional.
+    """
+    app = _Session.connect(db_path)
+    cm = _get_code_module(app, object_type, object_name)
+
+    if operations:
+        # ── Modo batch: ordenar bottom-to-top y ejecutar secuencialmente ──
+        sorted_ops = sorted(operations, key=lambda op: op["start_line"], reverse=True)
+        results = []
+        for op in sorted_ops:
+            r = _exec_single_replace(
+                cm, app, object_type, object_name,
+                int(op["start_line"]), int(op["count"]), op.get("new_code", ""),
+            )
+            results.append(r)
+        # Invalidar cache + persist
+        cache_key = f"{object_type}:{object_name}"
+        _vbe_code_cache.pop(cache_key, None)
+        try:
+            obj_type_code = _OBJ_TYPES.get(object_type, 5)
+            app.DoCmd.Save(obj_type_code, object_name)
+        except Exception:
+            pass
+        new_total = cm.CountOfLines
+        total_deleted = sum(r["deleted"] for r in results)
+        total_inserted = sum(r["inserted"] for r in results)
+        lines_summary = ", ".join(
+            f"L{r['start_line']}" for r in results
+        )
+        return (
+            f"OK batch: {len(results)} operaciones ejecutadas (bottom→top: {lines_summary}). "
+            f"Total: {total_deleted} eliminadas, {total_inserted} insertadas "
+            f"→ módulo ahora tiene {new_total} líneas"
+        )
+
+    # ── Modo individual (retrocompatible) ──
+    r = _exec_single_replace(cm, app, object_type, object_name, start_line, count, new_code)
     # Invalidar cache de texto (el módulo cambió)
     cache_key = f"{object_type}:{object_name}"
     _vbe_code_cache.pop(cache_key, None)
@@ -565,11 +646,9 @@ def ac_vbe_replace_lines(
     except Exception:
         pass  # save is best-effort; compact/close will also persist
     new_total = cm.CountOfLines
-    end = start_line + count - 1 if count > 0 else start_line
-    clamp_note = " (count ajustado al límite del módulo)" if clamped else ""
     status = (
-        f"OK: líneas {start_line}–{end} reemplazadas "
-        f"({count} eliminadas, {inserted} insertadas){clamp_note} "
+        f"OK: líneas {r['start_line']}–{r['end']} reemplazadas "
+        f"({r['deleted']} eliminadas, {r['inserted']} insertadas){r['clamp_note']} "
         f"→ módulo ahora tiene {new_total} líneas"
     )
     if new_code:
@@ -585,10 +664,14 @@ def ac_vbe_replace_lines(
 def ac_vbe_find(
     db_path: str, object_type: str, object_name: str,
     search_text: str, match_case: bool = False, use_regex: bool = False,
+    proc_name: str = "",
 ) -> dict:
     """
     Busca texto (o regex) en un módulo y devuelve todas las líneas que coinciden.
     Usa _vbe_code_cache para evitar releer el módulo si ya fue leído.
+
+    Si proc_name se pasa, limita la búsqueda al rango de ese procedimiento.
+    Siempre enriquece cada match con 'proc' (nombre del procedimiento al que pertenece).
     """
     app = _Session.connect(db_path)
     cm = _get_code_module(app, object_type, object_name)
@@ -596,10 +679,35 @@ def ac_vbe_find(
     all_code = _cm_all_code(cm, cache_key)
     if not all_code:
         return {"found": False, "match_count": 0, "matches": []}
+
+    # Determinar rango de búsqueda
+    search_start = 1
+    search_end = len(all_code.splitlines())
+    if proc_name:
+        try:
+            search_start = cm.ProcStartLine(proc_name, 0)
+            proc_count = cm.ProcCountLines(proc_name, 0)
+            search_end = min(search_start + proc_count - 1, search_end)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Procedimiento '{proc_name}' no encontrado en '{object_name}': {exc}"
+            )
+
     matches: list[dict] = []
-    for i, raw_line in enumerate(all_code.splitlines(), start=1):
+    lines = all_code.splitlines()
+    for i, raw_line in enumerate(lines, start=1):
+        if i < search_start or i > search_end:
+            continue
         if _text_matches(search_text, raw_line, match_case, use_regex):
-            matches.append({"line": i, "content": raw_line.rstrip("\r")})
+            # Enriquecer con nombre del procedimiento
+            owning_proc = ""
+            try:
+                owning_proc = cm.ProcOfLine(i, 0)
+            except Exception:
+                pass  # línea fuera de un proc (Declarations, etc.)
+            matches.append({
+                "line": i, "content": raw_line.rstrip("\r"), "proc": owning_proc,
+            })
     return {"found": bool(matches), "match_count": len(matches), "matches": matches}
 
 
@@ -815,14 +923,23 @@ def ac_vbe_replace_proc(
     # Clamp count al total real del módulo (ProcCountLines puede inflar el último proc)
     total = cm.CountOfLines
     count = min(count, total - start + 1)
-    # Borrar procedimiento viejo
-    cm.DeleteLines(start, count)
-    # Insertar nuevo código (si hay)
-    inserted = 0
-    if new_code:
-        normalized = new_code.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
-        cm.InsertLines(start, normalized)
-        inserted = len(new_code.splitlines())
+    # Backup del proc original en RAM para rollback si falla
+    backup_code = cm.Lines(start, count)
+    # Borrar procedimiento viejo e insertar nuevo con rollback automático
+    try:
+        cm.DeleteLines(start, count)
+        inserted = 0
+        if new_code:
+            normalized = new_code.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+            cm.InsertLines(start, normalized)
+            inserted = len(new_code.splitlines())
+    except Exception:
+        # Restaurar código original
+        try:
+            cm.InsertLines(start, backup_code)
+        except Exception:
+            pass  # best-effort restore
+        raise
     # Invalidar cache
     cache_key = f"{object_type}:{object_name}"
     _vbe_code_cache.pop(cache_key, None)
@@ -841,6 +958,88 @@ def ac_vbe_replace_proc(
         )
         return f"{status}\n\n{preview}"
     return status
+
+
+def ac_vbe_patch_proc(
+    db_path: str, object_type: str, object_name: str,
+    proc_name: str, patches: list,
+) -> str:
+    """
+    Aplica find/replace quirúrgicos DENTRO de un procedimiento sin reescribir todo.
+    patches: lista de {find: str, replace: str}.
+    Más eficiente que vbe_replace_proc cuando solo se cambian unas pocas líneas
+    dentro de un proc grande (ej: 174 líneas, solo cambian 15).
+    """
+    app = _Session.connect(db_path)
+
+    # Cerrar form/report en Design view si está abierto
+    if object_type in ("form", "report"):
+        ac_obj_type = _AC_FORM if object_type == "form" else _AC_REPORT
+        try:
+            app.DoCmd.Close(ac_obj_type, object_name, _AC_SAVE_YES)
+        except Exception:
+            pass
+
+    cache_key = f"{object_type}:{object_name}"
+    _Session._cm_cache.pop(cache_key, None)
+
+    cm = _get_code_module(app, object_type, object_name)
+    try:
+        start = cm.ProcStartLine(proc_name, 0)
+        count = cm.ProcCountLines(proc_name, 0)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Procedimiento '{proc_name}' no encontrado en '{object_name}': {exc}"
+        )
+    total = cm.CountOfLines
+    count = min(count, total - start + 1)
+
+    # Obtener código actual del proc
+    proc_code = cm.Lines(start, count)
+    backup_code = proc_code
+
+    # Aplicar patches secuencialmente
+    applied = 0
+    not_found = []
+    for i, patch in enumerate(patches):
+        find_text = patch["find"]
+        replace_text = patch.get("replace", "")
+        # Decode HTML entities
+        find_text = html_mod.unescape(find_text)
+        replace_text = html_mod.unescape(replace_text)
+        if find_text in proc_code:
+            proc_code = proc_code.replace(find_text, replace_text, 1)
+            applied += 1
+        else:
+            not_found.append(f"patch[{i}]: '{find_text[:50]}...' no encontrado")
+
+    if applied == 0:
+        return f"NOOP: ningún patch coincidió en '{proc_name}'. Errores: {'; '.join(not_found)}"
+
+    # Reemplazar el proc completo con el código parcheado
+    try:
+        cm.DeleteLines(start, count)
+        if proc_code.strip():
+            normalized = proc_code.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+            cm.InsertLines(start, normalized)
+    except Exception:
+        try:
+            cm.InsertLines(start, backup_code)
+        except Exception:
+            pass
+        raise
+
+    # Invalidar cache
+    _vbe_code_cache.pop(cache_key, None)
+    new_total = cm.CountOfLines
+    new_count = cm.ProcCountLines(proc_name, 0) if applied > 0 else 0
+    result = (
+        f"OK: {applied}/{len(patches)} patches aplicados en '{proc_name}' "
+        f"({count} → {new_count} líneas) → módulo ahora tiene {new_total} líneas"
+    )
+    if not_found:
+        result += f"\nNo encontrados: {'; '.join(not_found)}"
+    return result
 
 
 def ac_vbe_append(
@@ -4576,7 +4775,9 @@ TOOLS = [
         name="access_vbe_replace_lines",
         description=(
             "Reemplaza lineas en un modulo VBA via VBE. "
-            "count=0: insercion. new_code='': borrado. Valida limites automaticamente."
+            "count=0: insercion. new_code='': borrado. Valida limites automaticamente. "
+            "Modo batch: pasar 'operations' (lista de {start_line, count, new_code}) "
+            "para ejecutar multiples operaciones en 1 llamada (auto-ordena bottom-to-top)."
         ),
         inputSchema={
             "type": "object",
@@ -4584,16 +4785,33 @@ TOOLS = [
                 "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
                 "object_type": {"type": "string", "enum": ["module", "form", "report"]},
                 "object_name": {"type": "string", "description": "Nombre del objeto"},
-                "start_line":  {"type": "integer", "description": "Primera linea (1-based)"},
-                "count":       {"type": "integer", "description": "Lineas a eliminar (0 = insertar)"},
-                "new_code":    {"type": "string",  "description": "Codigo nuevo ('' = borrar)"},
+                "start_line":  {"type": "integer", "description": "Primera linea (1-based). Ignorado si operations presente."},
+                "count":       {"type": "integer", "description": "Lineas a eliminar (0 = insertar). Ignorado si operations presente."},
+                "new_code":    {"type": "string",  "description": "Codigo nuevo ('' = borrar). Ignorado si operations presente."},
+                "operations":  {
+                    "type": "array",
+                    "description": "Modo batch: lista de operaciones. Cada una: {start_line, count, new_code}. Se ordenan bottom-to-top automaticamente.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "start_line": {"type": "integer"},
+                            "count": {"type": "integer"},
+                            "new_code": {"type": "string"},
+                        },
+                        "required": ["start_line", "count"],
+                    },
+                },
             },
-            "required": ["db_path", "object_type", "object_name", "start_line", "count", "new_code"],
+            "required": ["db_path", "object_type", "object_name"],
         },
     ),
     types.Tool(
         name="access_vbe_find",
-        description="Busca texto o regex en un modulo VBA. Devuelve matches [{line, content}].",
+        description=(
+            "Busca texto o regex en un modulo VBA. Devuelve matches [{line, content, proc}]. "
+            "Cada match incluye 'proc' (nombre del procedimiento). "
+            "Opcional: proc_name para limitar busqueda a un solo procedimiento."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
@@ -4604,6 +4822,8 @@ TOOLS = [
                 "match_case":  {"type": "boolean", "default": False},
                 "use_regex": {"type": "boolean", "default": False,
                               "description": "true = interpretar search_text como regex"},
+                "proc_name": {"type": "string",
+                              "description": "Opcional: limitar busqueda a este procedimiento"},
             },
             "required": ["db_path", "object_type", "object_name", "search_text"],
         },
@@ -4655,6 +4875,36 @@ TOOLS = [
                 "new_code":    {"type": "string", "description": "Codigo nuevo ('' = eliminar)"},
             },
             "required": ["db_path", "object_type", "object_name", "proc_name", "new_code"],
+        },
+    ),
+    types.Tool(
+        name="access_vbe_patch_proc",
+        description=(
+            "Find/replace quirurgico DENTRO de un procedimiento VBA. "
+            "Mas eficiente que replace_proc cuando solo cambian unas pocas lineas "
+            "de un proc grande. patches: [{find, replace}]."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Ruta al .accdb/.mdb"},
+                "object_type": {"type": "string", "enum": ["module", "form", "report"]},
+                "object_name": {"type": "string", "description": "Nombre del objeto"},
+                "proc_name": {"type": "string", "description": "Nombre del Sub/Function/Property"},
+                "patches": {
+                    "type": "array",
+                    "description": "Lista de find/replace a aplicar dentro del proc",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "find": {"type": "string", "description": "Texto a buscar (literal, primera ocurrencia)"},
+                            "replace": {"type": "string", "description": "Texto de reemplazo ('' = eliminar)"},
+                        },
+                        "required": ["find"],
+                    },
+                },
+            },
+            "required": ["db_path", "object_type", "object_name", "proc_name", "patches"],
         },
     ),
     types.Tool(
@@ -5500,6 +5750,65 @@ TOOLS = [
 ]
 
 # ---------------------------------------------------------------------------
+# Schema fixup: accept "integer" and "boolean" as strings too
+# ---------------------------------------------------------------------------
+# Some MCP clients (e.g. Claude Desktop) serialize ALL tool arguments as
+# strings.  The MCP SDK validates against the JSON Schema *before* calling
+# call_tool(), so "1" fails for {"type": "integer"}.  Fix: widen schemas to
+# accept strings, and coerce in call_tool.
+
+def _fixup_schema(schema: dict) -> None:
+    """Recursively change {"type":"integer"} → {"type":["integer","string"]}
+    and {"type":"boolean"} → {"type":["boolean","string"]} in a JSON Schema."""
+    if not isinstance(schema, dict):
+        return
+    t = schema.get("type")
+    if t == "integer":
+        schema["type"] = ["integer", "string"]
+    elif t == "boolean":
+        schema["type"] = ["boolean", "string"]
+    # recurse into properties, items, additionalProperties
+    for key in ("properties", "patternProperties"):
+        block = schema.get(key)
+        if isinstance(block, dict):
+            for v in block.values():
+                _fixup_schema(v)
+    for key in ("items", "additionalProperties"):
+        sub = schema.get(key)
+        if isinstance(sub, dict):
+            _fixup_schema(sub)
+
+for _tool in TOOLS:
+    _fixup_schema(_tool.inputSchema)
+
+# Build schema index for argument coercion at call time
+_TOOL_SCHEMA_INDEX: dict[str, dict] = {t.name: t.inputSchema for t in TOOLS}
+
+
+def _coerce_arguments(name: str, arguments: dict) -> dict:
+    """Convert string arguments to the expected type based on the tool schema.
+    Operates in-place and returns the same dict."""
+    schema = _TOOL_SCHEMA_INDEX.get(name)
+    if not schema:
+        return arguments
+    props = schema.get("properties", {})
+    for key, val in list(arguments.items()):
+        if not isinstance(val, str):
+            continue
+        pdef = props.get(key, {})
+        ptypes = pdef.get("type")
+        if isinstance(ptypes, list):
+            if "integer" in ptypes:
+                try:
+                    arguments[key] = int(val)
+                except (ValueError, TypeError):
+                    pass
+            elif "boolean" in ptypes:
+                arguments[key] = val.lower() in ("true", "1", "yes")
+    return arguments
+
+
+# ---------------------------------------------------------------------------
 # MCP Server
 # ---------------------------------------------------------------------------
 server = Server("access-mcp")
@@ -5643,13 +5952,15 @@ def _call_tool_sync(name: str, arguments: dict) -> str:
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
         elif name == "access_vbe_replace_lines":
+            ops = arguments.get("operations")
             text = ac_vbe_replace_lines(
                 arguments["db_path"],
                 arguments["object_type"],
                 arguments["object_name"],
-                int(arguments["start_line"]),
-                int(arguments["count"]),
-                arguments["new_code"],
+                int(arguments.get("start_line", 0)),
+                int(arguments.get("count", 0)),
+                arguments.get("new_code", ""),
+                operations=ops,
             )
 
         elif name == "access_vbe_find":
@@ -5660,6 +5971,7 @@ def _call_tool_sync(name: str, arguments: dict) -> str:
                 arguments["search_text"],
                 bool(arguments.get("match_case", False)),
                 bool(arguments.get("use_regex", False)),
+                proc_name=arguments.get("proc_name", ""),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -5690,6 +6002,15 @@ def _call_tool_sync(name: str, arguments: dict) -> str:
                 arguments["object_name"],
                 arguments["proc_name"],
                 arguments["new_code"],
+            )
+
+        elif name == "access_vbe_patch_proc":
+            text = ac_vbe_patch_proc(
+                arguments["db_path"],
+                arguments["object_type"],
+                arguments["object_name"],
+                arguments["proc_name"],
+                arguments["patches"],
             )
 
         elif name == "access_vbe_append":
@@ -6122,6 +6443,8 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     """Async wrapper — delegates COM work to a thread so the event loop stays
     free to read/write stdio (prevents -32602 errors from message corruption
     when COM calls block the event loop)."""
+    # Coerce string arguments to expected types (some clients send all as strings)
+    _coerce_arguments(name, arguments)
     # Logging seguro
     safe_args = {}
     for k, v in arguments.items():
