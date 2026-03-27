@@ -2,7 +2,7 @@
 
 **Give any AI assistant full control over Microsoft Access databases.**
 
-Create forms, write VBA, design tables, manage controls, run queries, build relationships, and edit every corner of an `.accdb` — all through natural language. 58 tools that turn Access into something you can *talk to*.
+Create forms, write VBA, design tables, manage controls, run queries, build relationships, and edit every corner of an `.accdb` — all through natural language. 61 tools that turn Access into something you can *talk to*.
 
 No Access expertise required. Just describe what you want.
 
@@ -82,7 +82,7 @@ Add to your MCP config file (`.mcp.json`, `mcp.json`, or client-specific setting
 
 Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 
-## Tools (58)
+## Tools (61)
 
 ### Database
 
@@ -110,6 +110,8 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 | `access_execute_batch` | Execute multiple SQL statements in one call. Supports mixed SELECT/INSERT/UPDATE/DELETE with per-statement results, `stop_on_error`, and `confirm_destructive` |
 | `access_table_info` | Show table structure via DAO (fields, types, sizes, required, linked status) |
 | `access_search_queries` | Search text in the SQL of ALL queries at once (find which queries reference a table, field, or keyword) |
+| `access_create_table` | Create a table via DAO with full type, default, description and primary key support in one call. More robust than `CREATE TABLE` SQL |
+| `access_alter_table` | Modify table structure via DAO: add field, delete field (requires `confirm=true`), rename field |
 
 ### VBE line-level editing
 
@@ -122,6 +124,7 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 | `access_vbe_find` | Search text in a module and return matching lines with numbers |
 | `access_vbe_search_all` | Search text across ALL modules/forms/reports in the database at once |
 | `access_vbe_replace_proc` | Replace a full procedure by name (auto-calculates line bounds) |
+| `access_vbe_patch_proc` | Surgical find/replace within a procedure — more efficient than `replace_proc` when only a few lines change |
 | `access_vbe_append` | Append code at the end of a module |
 
 ### Form & report controls
@@ -135,6 +138,13 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 | `access_set_control_props` | Modify control properties via COM in design view |
 | `access_set_multiple_controls` | Modify properties of multiple controls in a single design-view session |
 
+### Text export/import
+
+| Tool | Description |
+|------|-------------|
+| `access_export_text` | Export form/report/module as text via SaveAsText. Does NOT open Design view. UTF-16 LE output |
+| `access_import_text` | Import form/report/module from text via LoadFromText. Replaces if exists. Auto-splits CodeBehindForm VBA |
+
 ### Database properties
 
 | Tool | Description |
@@ -142,6 +152,7 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 | `access_get_db_property` | Read a DB property (`CurrentDb.Properties`) or Access option (`GetOption`) |
 | `access_set_db_property` | Set a DB property or Access option — creates the property if it doesn't exist |
 | `access_get_form_property` | Read form/report properties (RecordSource, Caption, DefaultView, etc.). Omit `property_names` for all |
+| `access_set_form_property` | Set form/report properties (RecordSource, Caption, DefaultView, HasModule, etc.) via COM in Design view |
 
 ### Linked tables
 
@@ -307,6 +318,11 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/session.py` that swallows real errors and returns a generic `-32602` code with no detail. A local patch is applied to this machine that includes the actual exception and traceback in the error response. If you upgrade the `mcp` package, re-apply the patch — see `CLAUDE.md` for details.
 
 ## Changelog
+
+### v0.7.12 — 2026-03-27
+
+**Bug fix:**
+- **Compact/decompile reopen could trigger AutoExec/startup forms/wizards**: `ac_compact_repair` and `ac_decompile_compact` reopened the database after compacting via direct `app.OpenCurrentDatabase()`, bypassing the SHIFT key handling in `_switch()`. If the database had AutoExec macros or startup forms (e.g. Report Wizard), the reopen would block COM indefinitely. Fix: new `_Session.reopen()` method forces `_switch()` (SHIFT held + auto-close forms) for all reopens in maintenance operations
 
 ### v0.7.11 — 2026-03-26
 

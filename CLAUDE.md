@@ -2,7 +2,7 @@
 
 ## Overview
 
-MCP server (`access_mcp_server.py`, ~5500 lines) for reading and editing Microsoft Access databases (`.accdb`/`.mdb`) via COM automation (pywin32). Runs as stdio MCP server.
+MCP server (`access_mcp_server.py`, ~6500 lines) for reading and editing Microsoft Access databases (`.accdb`/`.mdb`) via COM automation (pywin32). Runs as stdio MCP server.
 
 ## Architecture
 
@@ -11,20 +11,22 @@ MCP server (`access_mcp_server.py`, ~5500 lines) for reading and editing Microso
 - **Caches**: `_vbe_code_cache` (VBE text), `_parsed_controls_cache` (control parsing), `_Session._cm_cache` (CodeModule COM objects). All invalidated on DB switch, object modification, and design operations.
 - **Binary section handling**: `ac_get_code` strips PrtMip/PrtDevMode from form/report exports; `ac_set_code` restores them automatically before import.
 
-## Tools (58 total)
+## Tools (61 total)
 
 | Category | Tools |
 |----------|-------|
 | **Database** | `access_create_database`, `access_close` |
 | **Objects** | `access_list_objects`, `access_get_code`, `access_set_code`, `access_export_structure`, `access_delete_object`, `access_create_form` |
 | **SQL/Tables** | `access_execute_sql`, `access_execute_batch`, `access_table_info`, `access_search_queries`, `access_create_table`, `access_alter_table` |
-| **VBE line-level** | `access_vbe_get_lines`, `access_vbe_get_proc`, `access_vbe_module_info`, `access_vbe_replace_lines`, `access_vbe_find`, `access_vbe_search_all`, `access_vbe_replace_proc`, `access_vbe_append` |
+| **VBE line-level** | `access_vbe_get_lines`, `access_vbe_get_proc`, `access_vbe_module_info`, `access_vbe_replace_lines`, `access_vbe_find`, `access_vbe_search_all`, `access_vbe_replace_proc`, `access_vbe_patch_proc`, `access_vbe_append` |
 | **Controls** | `access_list_controls`, `access_get_control`, `access_create_control`, `access_delete_control`, `access_set_control_props`, `access_set_multiple_controls` |
-| **DB Properties** | `access_get_db_property`, `access_set_db_property`, `access_get_form_property` |
+| **DB Properties** | `access_get_db_property`, `access_set_db_property`, `access_get_form_property`, `access_set_form_property` |
+| **Text Export/Import** | `access_export_text`, `access_import_text` |
 | **Linked Tables** | `access_list_linked_tables`, `access_relink_table` |
 | **Relationships** | `access_list_relationships`, `access_create_relationship`, `access_delete_relationship` |
 | **VBA References** | `access_list_references`, `access_manage_reference` |
-| **Maintenance** | `access_compact_repair` |
+| **Maintenance** | `access_compact_repair`, `access_decompile_compact` |
+| **Screenshot & UI** | `access_screenshot`, `access_ui_click`, `access_ui_type` |
 | **Queries** | `access_manage_query` |
 | **Indexes** | `access_list_indexes`, `access_manage_index` |
 | **VBA Compilation** | `access_compile_vba` |
@@ -103,8 +105,10 @@ Modifies properties on multiple controls in a single design-view session.
 - `ac_vbe_search_all` and `ac_search_queries` accept `max_results` (default 100). When exceeded, response includes `truncated: true`.
 - `ac_find_usages` delegates to `ac_vbe_search_all` and `ac_search_queries` internally (DRY). Only control property scanning is inline.
 
-### Compact & Repair (ac_compact_repair)
+### Compact & Repair (ac_compact_repair) / Decompile (ac_decompile_compact)
 Closes the DB, compacts to temp file in same directory, does atomic swap (original→.bak, tmp→original), then reopens. Clears all 3 caches. Rollback on failure.
+
+**Reopen with SHIFT**: Both `ac_compact_repair` and `ac_decompile_compact` reopen the database after compacting via `_Session.reopen()`, which forces `_switch()` (SHIFT held + auto-close forms). Previously they called `app.OpenCurrentDatabase()` directly, which could trigger AutoExec/startup forms/wizards and block COM indefinitely.
 
 ### Relationship attributes (_REL_ATTR)
 `_REL_ATTR` maps DAO Relation.Attributes bitmask: 1=Unique, 2=DontEnforce, 256=UpdateCascade, 4096=DeleteCascade.
@@ -206,6 +210,13 @@ This patch is local to this machine and will be lost on `pip install --upgrade m
 - **Do NOT** call `CreateForm()` directly followed by `_save_and_close()` — always use `access_create_form` tool instead.
 - Alternative: export an existing form with `ac_get_code`, modify the text, and reimport with `ac_set_code` (avoids CreateForm entirely).
 
+### AutoExec / startup forms block OpenCurrentDatabase
+- Databases with `AutoExec` macros or startup forms (especially modal `acDialog` forms like login/welcome screens) block the `OpenCurrentDatabase` COM call indefinitely. The call doesn't return until the user manually closes the form.
+- Fix: `_switch()` holds the Shift key via `win32api.keybd_event(VK_SHIFT)` during `OpenCurrentDatabase`. This is the standard Access trick to bypass AutoExec and startup forms. After opening, any auto-opened forms are closed as a safety net.
+- `_Session.reopen(path)` — convenience method that clears `_db_open` and calls `_switch()`, for use after `CloseCurrentDatabase` + `CompactRepair` sequences. All reopens in `maintenance.py` use this method to ensure SHIFT bypass is always applied.
+- `AutomationSecurity = 3` (msoAutomationSecurityForceDisable) does NOT work — Access ignores it for database-level AutoExec macros.
+- VK_ESCAPE to dismiss modal forms is unreliable (doesn't always reach the right window).
+
 ### "You already have the database open" after MCP reconnect
 - After `/mcp` reconnect, the MCP server process restarts (`_Session._app = None`) but Access.exe keeps running with the DB open. New `Dispatch("Access.Application")` connects to the existing instance, and `OpenCurrentDatabase` fails with "already have the database open".
 - Fix: `_switch()` catches this specific error and syncs internal state (`_db_open = path`) without re-opening.
@@ -223,6 +234,11 @@ This patch is local to this machine and will be lost on `pip install --upgrade m
 
 ### ac_set_code backup
 - Forms, reports, **and modules** are backed up via `SaveAsText` before `LoadFromText`. If import fails, the backup is restored automatically.
+
+### MCP schema type coercion (integer/boolean as strings)
+- Some MCP clients serialize ALL tool arguments as strings. The MCP SDK validates against JSON Schema before `call_tool()` runs, so `"1"` fails for `{"type": "integer"}`.
+- Fix: `_fixup_schema()` runs at module load and widens all schemas to accept `["integer", "string"]` and `["boolean", "string"]`. `_coerce_arguments()` in `call_tool()` converts string args to the expected type before dispatch.
+- Do NOT change schemas back to strict `"type": "integer"` — clients can't be trusted to send correct types.
 
 ### Application.Run and late-bound COM (DISP_E_BADPARAMCOUNT)
 - `Application.Run` has 31 params (1 required + 30 optional). pywin32's late-bound `Dispatch` uses `IDispatch.Invoke()` which only passes provided args — Access COM rejects this with `DISP_E_BADPARAMCOUNT` because the 30 optional params lack `VT_ERROR/DISP_E_PARAMNOTFOUND` markers.
@@ -248,5 +264,5 @@ This patch is local to this machine and will be lost on `pip install --upgrade m
 
 ### VBA Language Gotchas
 
-- **`Private Type` sin `End Type`**: Todo el codigo despues del bloque queda "dentro" del tipo → error "Statement invalid inside Type block" en cualquier `Declare`/`Function`/`Sub` siguiente. Si el compilador da ese error en una linea que parece correcta, revisar que todos los `Private Type` tienen su `End Type`.
-- **`SysCmd acSysCmdInitMeter`/`acSysCmdUpdateMeter`**: Causan "Illegal function call" de forma intermitente (especialmente con valor=maxValue, o sin llamar `acSysCmdRemoveMeter` entre secuencias). Usar siempre `SysCmd acSysCmdSetStatus, "..."` en su lugar — nunca falla.
+- **`Private Type` without `End Type`**: All code after the block remains "inside" the type → error "Statement invalid inside Type block" on any subsequent `Declare`/`Function`/`Sub`. If the compiler gives this error on a line that looks correct, check that all `Private Type` blocks have their `End Type`.
+- **`SysCmd acSysCmdInitMeter`/`acSysCmdUpdateMeter`**: Cause "Illegal function call" intermittently (especially with value=maxValue, or without calling `acSysCmdRemoveMeter` between sequences). Always use `SysCmd acSysCmdSetStatus, "..."` instead — never fails.
