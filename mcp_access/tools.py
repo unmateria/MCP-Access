@@ -885,7 +885,7 @@ TOOLS = [
     # -- Eval VBA ------------------------------------------------------------
     types.Tool(
         name="access_eval_vba",
-        description="Evaluates a VBA/Access expression via Application.Eval. Allows calling form module functions (form must be open), reading form properties, domain functions (DLookup, DCount...) and built-in VBA functions. Functions only, not Subs.",
+        description="Evaluates a VBA/Access expression via Application.Eval. Works with: domain functions (DLookup, DCount...), built-in VBA functions (Date(), Len()...), form properties of OPEN forms (Forms!frmX.Prop), public functions in standard modules. Does NOT work with: class instances (even default/predeclared), variables, Subs. For class instances use access_run_vba with a wrapper function, or this tool will attempt an automatic fallback via a temp VBA module.",
         inputSchema={
             "type": "object",
             "properties": {

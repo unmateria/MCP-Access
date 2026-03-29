@@ -281,21 +281,55 @@ def _invoke_app_eval(app, expression: str):
     )
 
 
-def ac_eval_vba(db_path: str, expression: str) -> dict:
-    """Evaluates a VBA/Access expression via Application.Eval.
+def _eval_via_temp_module(app, expression: str, original_exc: Exception):
+    """Fallback: create temp standard module with wrapper function, run it, clean up."""
+    proj = app.VBE.VBProjects(1)
+    comp = None
+    try:
+        # Create temp standard module (type 1 = vbext_ct_StdModule)
+        comp = proj.VBComponents.Add(1)
+        temp_name = comp.Name
+        cm = comp.CodeModule
 
-    Allows:
-    - Calling form module functions: Eval("Forms!frmX.MyFunction()")
-    - Reading properties of open forms: Eval("Forms!frmX.MARGEN_SEG")
-    - Domain functions: Eval("DLookup(""Company"",""Sales"",""numc=1"")")
-    - VBA built-in functions: Eval("Date()")
-    - Functions only (not Subs). Form must be open.
-    """
+        # Insert wrapper function
+        wrapper = (
+            "Public Function _mcp_eval_wrapper() As Variant\r\n"
+            f"    _mcp_eval_wrapper = {expression}\r\n"
+            "End Function\r\n"
+        )
+        cm.InsertLines(1, wrapper)
+
+        # Call via Application.Run
+        result = _invoke_app_run(app, f"{temp_name}._mcp_eval_wrapper", [])
+        return result
+
+    except Exception as fallback_exc:
+        raise RuntimeError(
+            f"Eval failed: {original_exc}\n"
+            f"Fallback (temp module) also failed: {fallback_exc}\n"
+            f"Alternatives: use access_run_vba to call a public Function "
+            f"in a standard module that wraps this expression."
+        )
+    finally:
+        if comp is not None:
+            try:
+                proj.VBComponents.Remove(comp)
+            except Exception:
+                log.warning("Could not remove temp module '%s'", comp.Name)
+
+
+def ac_eval_vba(db_path: str, expression: str) -> dict:
+    """Evaluates a VBA/Access expression via Application.Eval with auto-fallback."""
     app = _Session.connect(db_path)
+
+    # 1. Try Application.Eval first
     try:
         result = _invoke_app_eval(app, expression)
-    except Exception as exc:
-        raise RuntimeError(f"Error evaluating '{expression}': {exc}")
+    except Exception as eval_exc:
+        # 2. Fallback: wrap in a temp standard module function
+        result = _eval_via_temp_module(app, expression, eval_exc)
+
+    # serialize result
     if result is not None:
         try:
             json.dumps(result)

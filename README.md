@@ -208,7 +208,7 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 |------|-------------|
 | `access_run_macro` | Execute an Access macro by name |
 | `access_run_vba` | Execute a VBA Sub/Function. Standard modules via `Application.Run`, form modules via `Forms.FormName.Method` syntax (COM). Optional `timeout` auto-dismisses MsgBox/InputBox |
-| `access_eval_vba` | Evaluate a VBA expression via `Application.Eval`. Call form module functions, read form properties, domain functions (DLookup, DCount), VBA built-ins |
+| `access_eval_vba` | Evaluate a VBA expression via `Application.Eval`. Domain functions, VBA built-ins, open form properties, standard module functions. Auto-fallback via temp module for class instances and other expressions Eval cannot resolve |
 
 ### Export
 
@@ -334,6 +334,11 @@ The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/s
 **Bug fixes:**
 - **AutoExec / startup forms block `OpenCurrentDatabase` indefinitely**: Databases with `AutoExec` macros that open modal forms (e.g. Northwind Developer Edition's welcome/login dialog via `acDialog`) block the COM call until the user manually closes the form. Fix: `_switch()` now holds the Shift key via `win32api.keybd_event(VK_SHIFT)` during `OpenCurrentDatabase` — the standard Access bypass for AutoExec and startup forms. After opening, any auto-opened forms are closed as a safety net. `AutomationSecurity = 3` does NOT work (Access ignores it for database-level AutoExec macros). VK_ESCAPE is unreliable (doesn't reach modal forms)
 - **MCP clients sending integer/boolean arguments as strings**: Some MCP clients (e.g. Claude Desktop) serialize ALL tool arguments as strings. The MCP SDK validates against the JSON Schema before `call_tool()` runs, so `start_line: "1"` fails with `'1' is not of type 'integer'`. Fix: `_fixup_schema()` runs at module load and widens all 58 tool schemas to accept `["integer", "string"]` and `["boolean", "string"]`. `_coerce_arguments()` in `call_tool()` converts string args to the expected type before dispatch
+
+### v0.7.11 — 2026-03-29
+
+**Improvement:**
+- **`access_eval_vba` auto-fallback**: `Application.Eval` cannot resolve class default instances (`VB_PredeclaredId`), variables, or project-level symbols. Now when Eval fails, the tool automatically creates a temp standard module with a wrapper function, calls it via `Application.Run`, and cleans up. If both fail, the error includes both messages and suggests `access_run_vba`. Tool description updated to clarify supported/unsupported patterns
 
 ### v0.7.10 — 2026-03-25
 

@@ -172,6 +172,8 @@ The helper `_invoke_app_run()` builds the full 31-param call with `pythoncom.Mis
 ### Eval VBA (ac_eval_vba)
 Uses `Application.Eval` via `InvokeTypes` (same pattern as `_invoke_app_run`). Evaluates a string expression in Access context. Can call form module functions (`Eval("Forms!frmX.MiFuncion()")`), read form properties, use domain functions (DLookup, DCount), and built-in VBA functions. Only Functions (not Subs). Form must be open.
 
+**Auto-fallback for unsupported expressions**: `Application.Eval` cannot resolve class default instances (`VB_PredeclaredId = True`), variables, or other VBA project-level symbols. When Eval fails, `ac_eval_vba` automatically creates a temp standard module with a wrapper function (`_mcp_eval_wrapper`) that evaluates the expression in the full VBA project namespace, calls it via `Application.Run`, and cleans up the module in `finally`. If both Eval and fallback fail, the error message includes both errors and suggests using `access_run_vba` directly.
+
 ### Screenshot (ac_screenshot) — message pump + OpenForm timeout
 `wait_ms` uses `pythoncom.PumpWaitingMessages()` loop (~60 Hz) instead of `time.sleep()`. This pumps Windows messages so `Form_Timer` events fire, ActiveX controls initialize, and WebBrowser navigates during the wait.
 
