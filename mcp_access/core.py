@@ -9,6 +9,7 @@ import concurrent.futures
 import ctypes
 import logging
 import os
+import time
 import sys
 import threading
 from pathlib import Path
@@ -110,7 +111,10 @@ class _Session:
             )
         log.info("Launching Access.Application...")
         cls._app = win32com.client.Dispatch("Access.Application")
-        cls._app.Visible = True   # required for VBE to be accessible via COM
+        try:
+            cls._app.Visible = True   # required for VBE to be accessible via COM
+        except Exception as e:
+            log.warning("Could not set Visible=True: %s (continuing anyway)", e)
         log.info("Access launched OK")
 
     @classmethod
@@ -133,11 +137,16 @@ class _Session:
         log.info("Opening DB: %s", path)
 
         # Hold Shift during OpenCurrentDatabase to bypass AutoExec/startup forms
+        # Uses ctypes directly (no win32api dependency) + sleep for reliability
+        VK_SHIFT = 0x10
+        KEYEVENTF_KEYUP = 0x0002
+        _kbd = ctypes.windll.user32.keybd_event
         shift_held = False
         try:
-            import win32api, win32con
-            win32api.keybd_event(win32con.VK_SHIFT, 0, 0, 0)
+            _kbd(VK_SHIFT, 0, 0, 0)  # Press SHIFT
+            time.sleep(0.3)  # Let the key state register before COM call
             shift_held = True
+            log.info("SHIFT held for bypass")
         except Exception:
             log.warning("Could not simulate Shift — AutoExec may run")
 
@@ -151,9 +160,8 @@ class _Session:
         finally:
             if shift_held:
                 try:
-                    win32api.keybd_event(
-                        win32con.VK_SHIFT, 0, win32con.KEYEVENTF_KEYUP, 0,
-                    )
+                    _kbd(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0)  # Release SHIFT
+                    log.info("SHIFT released")
                 except Exception:
                     pass
 

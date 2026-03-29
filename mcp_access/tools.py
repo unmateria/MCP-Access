@@ -117,7 +117,7 @@ TOOLS = [
     # -- VBE line-level tools ------------------------------------------------
     types.Tool(
         name="access_vbe_get_lines",
-        description="Reads a range of lines from a VBA module via VBE COM.",
+        description="Reads a range of lines from a VBA module via VBE COM. Provide either count or end_line (not both).",
         inputSchema={
             "type": "object",
             "properties": {
@@ -126,8 +126,9 @@ TOOLS = [
                 "object_name": {"type": "string", "description": "Object name"},
                 "start_line":  {"type": "integer", "description": "First line (1-based)"},
                 "count":       {"type": "integer", "description": "Number of lines to read"},
+                "end_line":    {"type": "integer", "description": "Last line (1-based, alternative to count)"},
             },
-            "required": ["db_path", "object_type", "object_name", "start_line", "count"],
+            "required": ["db_path", "object_type", "object_name", "start_line"],
         },
     ),
     types.Tool(

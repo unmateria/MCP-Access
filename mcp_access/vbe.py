@@ -75,9 +75,15 @@ def _cm_all_code(cm: Any, cache_key: str) -> str:
 
 def ac_vbe_get_lines(
     db_path: str, object_type: str, object_name: str,
-    start_line: int, count: int
+    start_line: int, count: int = None, end_line: int = None
 ) -> str:
     """Reads a range of lines without exporting the entire module."""
+    if end_line is not None and count is None:
+        count = end_line - start_line + 1
+    if count is None:
+        raise ValueError("Either count or end_line must be provided")
+    if count < 1:
+        raise ValueError(f"count must be >= 1 (got {count})")
     app = _Session.connect(db_path)
     cm = _get_code_module(app, object_type, object_name)
     cache_key = f"{object_type}:{object_name}"

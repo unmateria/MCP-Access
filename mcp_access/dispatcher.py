@@ -101,7 +101,8 @@ def call_tool_sync(name: str, arguments: dict) -> str:
                 arguments["object_type"],
                 arguments["object_name"],
                 int(arguments["start_line"]),
-                int(arguments["count"]),
+                count=int(arguments["count"]) if "count" in arguments else None,
+                end_line=int(arguments["end_line"]) if "end_line" in arguments else None,
             )
 
         elif name == "access_vbe_get_proc":
