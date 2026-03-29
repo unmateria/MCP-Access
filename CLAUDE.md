@@ -2,7 +2,7 @@
 
 ## Overview
 
-MCP server (`access_mcp_server.py`, ~6500 lines) for reading and editing Microsoft Access databases (`.accdb`/`.mdb`) via COM automation (pywin32). Runs as stdio MCP server.
+MCP server for reading and editing Microsoft Access databases (`.accdb`/`.mdb`) via COM automation (pywin32). Runs as stdio MCP server. Entry point: `access_mcp_server.py`. Implementation: `mcp_access/` package (~7000 lines across 20 modules).
 
 ## Architecture
 
