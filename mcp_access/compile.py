@@ -150,13 +150,114 @@ def _lint_form_modules(app) -> list:
 # Compile VBA
 # ---------------------------------------------------------------------------
 
-def ac_compile_vba(db_path: str, timeout: Optional[int] = None) -> dict:
-    """Attempts to compile VBA via RunCommand(126) + per-module verification.
+def _verify_module_structure(app) -> list:
+    """Verify structural integrity of ALL VBA modules (standard + form/report).
 
-    RunCommand(126) via COM has limitations (doesn't open the VBE, doesn't
-    actually compile in many cases). As additional verification, iterates all
-    standard modules and calls Application.Run on a function in each to force
-    on-demand compilation. Reports any compilation failures.
+    RunCommand(acCmdCompileAndSaveAllModules) via COM may not detect errors in
+    form/report modules even with VBE open.  This function checks that no
+    executable code exists outside Sub/Function/Property/Type/Enum blocks.
+
+    Catches the specific bug pattern: Sub/Function header accidentally deleted,
+    leaving orphan code after End Sub that VBA silently absorbs into the
+    previous procedure.
+
+    Returns list of error strings. Empty if all OK.
+    """
+    # Regex for valid module-level statements (outside any proc)
+    _MODULE_LEVEL = re.compile(
+        r"(?:Option\s|Dim\s|Private\s|Public\s|Global\s|Const\s|Declare\s|"
+        r"#If|#ElseIf|#Else|#End\s|#Const\s|Attribute\s|Implements\s|Event\s|"
+        r"Friend\s|Static\s|Sub\s|Function\s|Property\s|Type\s|Enum\s|DefInt\s|"
+        r"DefLng\s|DefSng\s|DefDbl\s|DefCur\s|DefStr\s|DefBool\s|DefDate\s|"
+        r"DefVar\s|DefObj\s|DefByte\s)",
+        re.IGNORECASE,
+    )
+    _PROC_START = re.compile(
+        r"(?:Private\s+|Public\s+|Friend\s+)?(?:Static\s+)?"
+        r"(?:Sub|Function|Property\s+(?:Get|Let|Set))\s",
+        re.IGNORECASE,
+    )
+    _BLOCK_START = re.compile(
+        r"(?:Private\s+|Public\s+)?(?:Type|Enum)\s", re.IGNORECASE
+    )
+    _BLOCK_END = re.compile(r"End\s+(?:Type|Enum)", re.IGNORECASE)
+    _PROC_END = re.compile(
+        r"End\s+(?:Sub|Function|Property)", re.IGNORECASE
+    )
+
+    errors = []
+    try:
+        vbe = app.VBE
+        proj = vbe.ActiveVBProject
+        for comp in proj.VBComponents:
+            if comp.Type not in (1, 100):  # standard modules + form/report
+                continue
+            cm = comp.CodeModule
+            total = cm.CountOfLines
+            if total == 0:
+                continue
+            code = cm.Lines(1, total)
+
+            in_proc = False
+            in_block = False  # Type / Enum
+            continuation = False
+
+            for i, line in enumerate(code.split("\n"), 1):
+                stripped = line.strip()
+
+                # Line continuation from previous line
+                if continuation:
+                    continuation = stripped.endswith(" _")
+                    continue
+                if stripped.endswith(" _"):
+                    continuation = True
+                    # Still process the first line of the continuation
+
+                # Skip blank / comment
+                if not stripped or stripped.startswith("'"):
+                    continue
+
+                # Type/Enum blocks
+                if not in_proc and _BLOCK_START.match(stripped):
+                    in_block = True
+                    continue
+                if in_block:
+                    if _BLOCK_END.match(stripped):
+                        in_block = False
+                    continue
+
+                # Proc start/end
+                if _PROC_START.match(stripped):
+                    in_proc = True
+                    continue
+                if _PROC_END.match(stripped):
+                    in_proc = False
+                    continue
+
+                # Inside a proc: anything goes
+                if in_proc:
+                    continue
+
+                # Module level: only declarations/directives are valid
+                if not _MODULE_LEVEL.match(stripped):
+                    errors.append(
+                        f"{comp.Name} line {i}: code outside Sub/Function: "
+                        f"{stripped[:80]}"
+                    )
+                    break  # one error per module is enough
+
+    except Exception:
+        pass  # VBE not accessible -- skip
+    return errors
+
+
+def ac_compile_vba(db_path: str, timeout: Optional[int] = None) -> dict:
+    """Compile VBA with VBE open + structural verification.
+
+    Opens the VBE MainWindow so RunCommand(126) behaves like clicking
+    Debug > Compile.  Additionally runs _verify_module_structure() to
+    catch orphan code outside Sub/Function blocks (a pattern that
+    RunCommand sometimes misses for form/report modules).
 
     With timeout, a watchdog auto-dismisses error MsgBox.
     Returns dict with status + optional error_detail, error_location, dialog_screenshot.
@@ -166,7 +267,33 @@ def ac_compile_vba(db_path: str, timeout: Optional[int] = None) -> dict:
 
     app = _Session.connect(db_path)
 
-    # 1. Intentar RunCommand(126) -- puede no hacer nada via COM, pero intentamos
+    # 0. Force project to "not compiled" state.
+    #    VBE edits via COM don't always invalidate IsCompiled, so RunCommand on
+    #    an already-compiled project can be a no-op.
+    vbe_was_visible = False
+    try:
+        vbe_was_visible = bool(app.VBE.MainWindow.Visible)
+    except Exception:
+        pass
+    try:
+        _proj = app.VBE.ActiveVBProject
+        for _comp in _proj.VBComponents:
+            if _comp.Type == 1 and _comp.CodeModule.CountOfLines > 0:
+                _cm = _comp.CodeModule
+                _cm.InsertLines(_cm.CountOfLines + 1, "' _compile_dirty_check")
+                _cm.DeleteLines(_cm.CountOfLines, 1)
+                break
+    except Exception:
+        pass
+
+    # 1. Open VBE so RunCommand(126) compiles ALL modules (including form/report).
+    #    Without VBE visible, RunCommand often silently skips form/report modules.
+    try:
+        app.VBE.MainWindow.Visible = True
+    except Exception:
+        pass
+
+    # 2. RunCommand(126) = acCmdCompileAndSaveAllModules
     stop_event = None
     dialog_screenshots: list = []
     dismissed: list = []
@@ -196,6 +323,12 @@ def ac_compile_vba(db_path: str, timeout: Optional[int] = None) -> dict:
     finally:
         if stop_event:
             stop_event.set()
+        # Restore VBE visibility
+        if not vbe_was_visible:
+            try:
+                app.VBE.MainWindow.Visible = False
+            except Exception:
+                pass
 
     _vbe_code_cache.clear()
     _Session._cm_cache.clear()
@@ -212,65 +345,16 @@ def ac_compile_vba(db_path: str, timeout: Optional[int] = None) -> dict:
             result["dialog_screenshot"] = dialog_screenshots[0]
         return result
 
-    # 2. Verificar IsCompiled -- si True, pasar directamente al lint
-    try:
-        if bool(app.IsCompiled):
-            warnings = _lint_form_modules(app)
-            result = {"status": "compiled"}
-            if warnings:
-                result["warnings"] = warnings
-            return result
-    except Exception:
-        pass
-
-    # 3. IsCompiled=False: RunCommand didn't compile. Verify per-module using
-    #    Application.Run to force on-demand compilation of each standard module.
-    errors = []
-    try:
-        vbe = app.VBE
-        proj = vbe.ActiveVBProject
-        for comp in proj.VBComponents:
-            if comp.Type != 1:  # standard modules only (vbext_ct_StdModule)
-                continue
-            cm = comp.CodeModule
-            # Find the first Public Function to call
-            func_name = None
-            for line_num in range(cm.CountOfDeclarationLines + 1, cm.CountOfLines + 1):
-                try:
-                    pname = cm.ProcOfLine(line_num, 0)  # vbext_pk_Proc=0
-                    if pname:
-                        # Verify it's a Function (not Sub) to use Run
-                        proc_line = cm.ProcBodyLine(pname, 0)
-                        proc_text = cm.Lines(proc_line, 1).strip().lower()
-                        if proc_text.startswith("public function"):
-                            func_name = pname
-                            break
-                except Exception:
-                    continue
-            if not func_name:
-                continue
-            # Try Application.Run -- forces compilation of the entire module
-            try:
-                app.Run(f"{comp.Name}.{func_name}")
-            except Exception as exc:
-                err_str = str(exc).lower()
-                if "compile" in err_str or "expected" in err_str or "type mismatch" in err_str or "byref" in err_str:
-                    errors.append(f"{comp.Name}.{func_name}: {exc}")
-                # Other runtime errors (division by zero, etc.) are OK -- the module compiled
-    except Exception as exc:
-        # If we can't access VBE, report warning
-        return {
-            "status": "compiled",
-            "note": f"IsCompiled=False, per-module verification failed: {exc}"
-        }
-
-    if errors:
+    # 3. Structural verification: catch orphan code outside Sub/Function
+    #    (RunCommand can still miss this for form/report modules)
+    struct_errors = _verify_module_structure(app)
+    if struct_errors:
         return {
             "status": "error",
-            "error_detail": "Compilation errors detected via Application.Run:\n" + "\n".join(errors),
+            "error_detail": "Structural errors in VBA modules:\n" + "\n".join(struct_errors),
         }
 
-    # 4. Lint form/report modules: orphan event handlers + Me.X refs to missing controls
+    # 4. Lint form/report modules: orphan event handlers + Me.X refs
     warnings = _lint_form_modules(app)
     result = {"status": "compiled"}
     if warnings:

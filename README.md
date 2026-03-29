@@ -319,6 +319,11 @@ The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/s
 
 ## Changelog
 
+### v0.7.13 — 2026-03-29
+
+**Bug fix:**
+- **`access_compile_vba` false positive — reported "compiled" on broken code**: Two root causes: (1) VBE edits via COM don't always invalidate `IsCompiled`, so `RunCommand(126)` on an already-compiled project was a no-op. (2) Without the VBE window visible, `RunCommand(126)` silently skips form/report module compilation. Fix: dirty trick (insert+remove dummy comment) forces `IsCompiled=False`, then VBE MainWindow is opened before compiling so `RunCommand` behaves like clicking Debug > Compile. Additionally, new `_verify_module_structure()` scans all modules (standard + form/report) for executable code outside Sub/Function blocks as a safety net — catches the specific pattern of accidentally deleted Sub headers leaving orphan code
+
 ### v0.7.12 — 2026-03-27
 
 **Bug fix:**

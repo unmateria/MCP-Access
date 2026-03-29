@@ -122,6 +122,11 @@ CRUD for QueryDefs via DAO. `delete` requires `confirm=true`. `_QUERYDEF_TYPE` m
 ### Compile VBA (ac_compile_vba)
 Uses `app.RunCommand(126)` (`acCmdCompileAndSaveAllModules`). Invalidates VBE caches after compilation. Optional `timeout` parameter — if compilation shows a MsgBox (error dialog), the watchdog dismisses it automatically (same pattern as `ac_run_vba`). After the error, `_get_vbe_error_location()` reads `VBE.ActiveCodePane.GetSelection()` to report the exact module, line number, and surrounding code where the error occurred.
 
+**Reliable compilation (v0.7.13)**: Two issues caused false "compiled" results:
+1. VBE edits via COM don't always invalidate `IsCompiled`, so `RunCommand(126)` on an already-compiled project is a no-op. Fix: insert+remove a dummy comment in a standard module before compiling to force `IsCompiled=False`.
+2. `RunCommand(126)` without the VBE window open silently skips form/report modules. Fix: open `VBE.MainWindow.Visible=True` before compiling, restore afterwards.
+3. As a safety net, `_verify_module_structure()` scans ALL modules (standard + form/report) for executable code outside Sub/Function/Property/Type/Enum blocks. This catches the specific pattern of accidentally deleted Sub headers leaving orphan code that VBA absorbs into the previous procedure.
+
 ### Output report (ac_output_report)
 Uses `DoCmd.OutputTo(acOutputReport=3, ...)`. `_OUTPUT_FORMATS` maps format names to Access format strings. Auto-generates output_path if omitted.
 
