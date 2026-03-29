@@ -669,7 +669,7 @@ def ac_vbe_patch_proc(
 
 def ac_vbe_append(
     db_path: str, object_type: str, object_name: str,
-    new_code: str
+    code: str
 ) -> str:
     """
     Appends code to the end of a VBA module.
@@ -680,7 +680,7 @@ def ac_vbe_append(
     cm = _get_code_module(app, object_type, object_name)
     total = cm.CountOfLines
     # Decode HTML entities that MCP transport may have encoded (& → &amp; etc.)
-    decoded = html_mod.unescape(new_code)
+    decoded = html_mod.unescape(code)
     normalized = decoded.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
     cm.InsertLines(total + 1, normalized)
     inserted = len(decoded.splitlines())

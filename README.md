@@ -121,7 +121,7 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 | `access_vbe_get_proc` | Get a procedure's code and position by name |
 | `access_vbe_module_info` | List all procedures with their line numbers |
 | `access_vbe_replace_lines` | Replace/insert/delete lines in a VBA module directly via VBE |
-| `access_vbe_find` | Search text in a module and return matching lines with numbers |
+| `access_vbe_find` | Search text in ONE specific module. To search all modules at once, use `access_vbe_search_all` |
 | `access_vbe_search_all` | Search text across ALL modules/forms/reports in the database at once |
 | `access_vbe_replace_proc` | Replace a full procedure by name (auto-calculates line bounds) |
 | `access_vbe_patch_proc` | Surgical find/replace within a procedure — more efficient than `replace_proc` when only a few lines change |
@@ -151,7 +151,7 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 |------|-------------|
 | `access_get_db_property` | Read a DB property (`CurrentDb.Properties`) or Access option (`GetOption`) |
 | `access_set_db_property` | Set a DB property or Access option — creates the property if it doesn't exist |
-| `access_get_form_property` | Read form/report properties (RecordSource, Caption, DefaultView, etc.). Omit `property_names` for all |
+| `access_get_form_property` | Read form or report properties (RecordSource, Caption, DefaultView, etc.). `object_type` required (`form` or `report`). Omit `property_names` for all |
 | `access_set_form_property` | Set form/report properties (RecordSource, Caption, DefaultView, HasModule, etc.) via COM in Design view |
 
 ### Linked tables
@@ -318,6 +318,13 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/session.py` that swallows real errors and returns a generic `-32602` code with no detail. A local patch is applied to this machine that includes the actual exception and traceback in the error response. If you upgrade the `mcp` package, re-apply the patch — see `CLAUDE.md` for details.
 
 ## Changelog
+
+### v0.7.15 — 2026-03-30
+
+**Usability improvements (reduce LLM hallucination of parameter names):**
+- **`access_vbe_append`**: renamed `new_code` parameter to `code` for consistency with `access_set_code` and other tools
+- **`access_vbe_find`**: description now clarifies it searches ONE module and suggests `access_vbe_search_all` for cross-module search
+- **`access_get_form_property`**: description now explicitly states `object_type` is required (`form` or `report`)
 
 ### v0.7.14 — 2026-03-29
 

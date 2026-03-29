@@ -189,7 +189,7 @@ def call_tool_sync(name: str, arguments: dict) -> str:
                 arguments["db_path"],
                 arguments["object_type"],
                 arguments["object_name"],
-                arguments["new_code"],
+                arguments["code"],
             )
 
         # -- Control-level ------------------------------------------------

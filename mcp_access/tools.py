@@ -195,9 +195,10 @@ TOOLS = [
     types.Tool(
         name="access_vbe_find",
         description=(
-            "Searches for text or regex in a VBA module. Returns matches [{line, content, proc}]. "
+            "Searches for text or regex in ONE specific VBA module. Returns matches [{line, content, proc}]. "
             "Each match includes 'proc' (procedure name). "
-            "Optional: proc_name to limit search to a single procedure."
+            "Optional: proc_name to limit search to a single procedure. "
+            "To search ALL modules/forms/reports at once, use access_vbe_search_all instead."
         ),
         inputSchema={
             "type": "object",
@@ -303,9 +304,9 @@ TOOLS = [
                 "db_path": {"type": "string", "description": "Path to .accdb/.mdb file"},
                 "object_type": {"type": "string", "enum": ["module", "form", "report"]},
                 "object_name": {"type": "string", "description": "Object name"},
-                "new_code":    {"type": "string", "description": "Code to append"},
+                "code":    {"type": "string", "description": "Code to append"},
             },
-            "required": ["db_path", "object_type", "object_name", "new_code"],
+            "required": ["db_path", "object_type", "object_name", "code"],
         },
     ),
     # -- Control-level tools -------------------------------------------------
@@ -976,8 +977,9 @@ TOOLS = [
     types.Tool(
         name="access_get_form_property",
         description=(
-            "Reads properties of a form/report (RecordSource, Caption, DefaultView, "
-            "HasModule, etc.). If property_names is omitted, returns all readable properties."
+            "Reads properties of a form or report (RecordSource, Caption, DefaultView, "
+            "HasModule, etc.). object_type ('form' or 'report') is required. "
+            "If property_names is omitted, returns all readable properties."
         ),
         inputSchema={
             "type": "object",
