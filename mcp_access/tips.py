@@ -41,7 +41,10 @@ _TIPS: dict[str, str] = {
         "  Str() adds leading space to positive numbers — use CStr() instead\n"
         "  Chr(128) truncates MsgBox text — use ChrW(8364) or \"EUR\" for euro symbol\n"
         "  ListBox AddItem — column separator is \";\", never use Format \"#,##0.00\" (comma breaks columns)\n"
-        "  GetClipboardFilePath() can throw — always wrap in On Error Resume Next"
+        "  GetClipboardFilePath() can throw — always wrap in On Error Resume Next\n\n"
+        "Startup:\n"
+        "  SHIFT bypass is automatic — OpenCurrentDatabase always holds SHIFT to skip AutoExec/startup forms.\n"
+        "  Any auto-opened forms are closed automatically after opening the database."
     ),
     "sql": (
         "Jet SQL DDL (access_execute_sql):\n"
@@ -62,7 +65,12 @@ _TIPS: dict[str, str] = {
         "'Trust access to the VBA project object model' must be enabled in Trust Center.\n"
         "After design operations (set_control_props, create_control, delete_control),\n"
         "  close the form in Design view before accessing VBE CodeModule.\n"
-        "access_vbe_append: was encoding & as &amp; (fixed in v0.7.3 with html.unescape)."
+        "access_vbe_append: was encoding & as &amp; (fixed in v0.7.3 with html.unescape).\n\n"
+        "Reading VBA code:\n"
+        "  For specific procedures: use access_vbe_get_proc (fast, precise).\n"
+        "  For procedure index: use access_vbe_module_info first.\n"
+        "  access_get_code exports the ENTIRE form (controls + VBA, can be 90KB+) — avoid for VBA investigation.\n"
+        "  Recommended flow: access_vbe_module_info → access_vbe_get_proc for each relevant proc."
     ),
     "compile": (
         "access_compile_vba tips:\n"

@@ -183,7 +183,7 @@ Uses `Application.Eval` via `InvokeTypes` (same pattern as `_invoke_app_run`). E
 Uses `db.Relations.Delete(name)` via DAO.
 
 ### Find usages (ac_find_usages)
-Cross-reference search in 3 locations: VBA code (all modules/forms/reports), SQL of all queries, and control properties (ControlSource, RecordSource, RowSource, DefaultValue, ValidationRule) via SaveAsText exports. `max_results` default 200.
+Cross-reference search in 3 locations: VBA code (all modules/forms/reports), SQL of all queries, and control properties (ControlSource, RecordSource, RowSource, SourceObject, DefaultValue, ValidationRule) via SaveAsText exports. `max_results` default 200.
 
 ## Adding a new tool
 

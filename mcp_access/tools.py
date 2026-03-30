@@ -25,7 +25,8 @@ TOOLS = [
         name="access_get_code",
         description=(
             "Reads code/definition of an Access object. "
-            "Modules: .bas code. Forms/reports: internal format (props + VBA)."
+            "Modules: .bas code. Forms/reports: internal format (props + VBA). "
+            "For reading specific VBA procedures, prefer access_vbe_get_proc (faster, smaller output)."
         ),
         inputSchema={
             "type": "object",
@@ -917,7 +918,7 @@ TOOLS = [
         name="access_find_usages",
         description=(
             "Searches for text or regex in VBA, query SQL and control properties "
-            "(ControlSource, RecordSource, RowSource, DefaultValue, ValidationRule). "
+            "(ControlSource, RecordSource, RowSource, SourceObject, DefaultValue, ValidationRule). "
             "Returns results grouped: vba_matches, query_matches, control_matches."
         ),
         inputSchema={

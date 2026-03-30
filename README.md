@@ -247,7 +247,7 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 
 | Tool | Description |
 |------|-------------|
-| `access_find_usages` | Search a name across VBA code, query SQL, and control properties (ControlSource, RecordSource, RowSource, DefaultValue, ValidationRule) in one call |
+| `access_find_usages` | Search a name across VBA code, query SQL, and control properties (ControlSource, RecordSource, RowSource, SourceObject, DefaultValue, ValidationRule) in one call |
 
 ### Knowledge base
 
@@ -318,6 +318,16 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/session.py` that swallows real errors and returns a generic `-32602` code with no detail. A local patch is applied to this machine that includes the actual exception and traceback in the error response. If you upgrade the `mcp` package, re-apply the patch — see `CLAUDE.md` for details.
 
 ## Changelog
+
+### v0.7.16 — 2026-03-30
+
+**Bug fix:**
+- **`access_find_usages` missed SubForm SourceObject**: Control property search didn't include `SourceObject`, so SubForm/SubReport references to other forms were invisible. Deleting a form that was a SubForm's SourceObject would break the parent form silently. Fix: added `SourceObject` to `CONTROL_SEARCH_PROPS`
+
+**Improvements:**
+- **`access_get_code` description** now recommends `access_vbe_get_proc` for reading specific VBA procedures (faster, smaller output — avoids 90KB+ exports for large forms)
+- **`access_tips("vbe")`** expanded with guidance: use `access_vbe_module_info` → `access_vbe_get_proc` flow instead of `access_get_code` for VBA investigation
+- **`access_tips("gotchas")`** documents that SHIFT bypass on database open is automatic (no manual intervention needed)
 
 ### v0.7.15 — 2026-03-30
 
