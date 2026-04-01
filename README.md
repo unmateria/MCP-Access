@@ -123,9 +123,9 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 | `access_vbe_replace_lines` | Replace/insert/delete lines in a VBA module directly via VBE |
 | `access_vbe_find` | Search text in ONE specific module. To search all modules at once, use `access_vbe_search_all` |
 | `access_vbe_search_all` | Search text across ALL modules/forms/reports in the database at once |
-| `access_vbe_replace_proc` | Replace a full procedure by name (auto-calculates line bounds) |
-| `access_vbe_patch_proc` | Surgical find/replace within a procedure — more efficient than `replace_proc` when only a few lines change |
-| `access_vbe_append` | Append code at the end of a module |
+| `access_vbe_replace_proc` | Replace a full procedure by name (auto-calculates line bounds). Strips misplaced `Option` lines, runs structural health check |
+| `access_vbe_patch_proc` | Surgical find/replace within a procedure. Whitespace-tolerant fallback matching + contextual error messages when patches fail |
+| `access_vbe_append` | Append code at the end of a module. Auto-strips `Option Explicit`/`Option Compare` to prevent misplacement |
 
 ### Form & report controls
 
@@ -318,6 +318,14 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/session.py` that swallows real errors and returns a generic `-32602` code with no detail. A local patch is applied to this machine that includes the actual exception and traceback in the error response. If you upgrade the `mcp` package, re-apply the patch — see `CLAUDE.md` for details.
 
 ## Changelog
+
+### v0.7.17 — 2026-04-01
+
+**VBE robustness — 3 layers of protection for VBA editing:**
+
+- **Whitespace-tolerant matching in `access_vbe_patch_proc`**: When exact match fails, a whitespace-normalized fallback strips leading indentation and retries. If both fail, `difflib.SequenceMatcher` finds the closest line and returns contextual error with 3 surrounding lines — no more opaque "not found" errors
+- **Structural health check on all write operations**: After every VBE write (`replace_lines`, `replace_proc`, `patch_proc`, `append`), checks for: (1) `Option Explicit`/`Option Compare` misplaced below line 5, (2) duplicate labels, (3) unexpected line count changes (batch mode). Warnings in return string, never fails the operation
+- **Option Explicit/Compare protection**: `access_vbe_append` auto-strips `Option` lines (they'd end up at the bottom of the module). `replace_proc` and `patch_proc` strip them when replacing non-top procedures. `access_set_code` and `access_import_text` auto-prepend `Option Compare Database` + `Option Explicit` when missing from injected VBA
 
 ### v0.7.16 — 2026-03-30
 

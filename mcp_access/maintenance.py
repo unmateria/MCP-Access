@@ -121,12 +121,31 @@ def ac_decompile_compact(db_path: str) -> dict:
     if not msaccess:
         raise RuntimeError("MSACCESS.EXE not found in known Office 16 paths")
 
+    # Hold SHIFT during /decompile to bypass AutoExec/startup forms
+    import ctypes
+    VK_SHIFT = 0x10
+    KEYEVENTF_KEYUP = 0x0002
+    _kbd = ctypes.windll.user32.keybd_event
+    shift_held = False
+    try:
+        _kbd(VK_SHIFT, 0, 0, 0)       # Press SHIFT
+        time.sleep(0.3)                # Let key state register
+        shift_held = True
+    except Exception:
+        pass  # SHIFT simulation failed — AutoExec may run
+
     proc = subprocess.Popen(
         [msaccess, resolved, "/decompile"],
         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
     )
     # Access opens the DB in decompiled state and stays open -- wait and kill
-    time.sleep(8)
+    time.sleep(3)  # Wait for Access to read key state during startup
+    if shift_held:
+        try:
+            _kbd(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0)  # Release SHIFT
+        except Exception:
+            pass
+    time.sleep(5)  # Remaining wait before kill (total ~8s)
     try:
         subprocess.run(
             ["taskkill", "/F", "/T", "/PID", str(proc.pid)],

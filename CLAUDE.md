@@ -78,6 +78,28 @@ After design operations (`ac_set_control_props`, `ac_create_control`, `ac_delete
 
 All design operations invalidate all three caches in their `finally` block.
 
+### VBE robustness (v0.7.17)
+Three layers of protection added to all VBE write operations:
+
+**1. Whitespace-tolerant matching in `ac_vbe_patch_proc`:**
+- When exact `str.replace` fails, `_ws_normalized_match()` strips leading whitespace from each line and does a sliding-window search. This catches patches where indentation differs (4 spaces vs 8, tabs vs spaces).
+- If both exact and ws-normalized match fail, `_closest_match_context()` uses `difflib.SequenceMatcher` to find the most similar line and returns a contextual snippet (3 lines around the best candidate), making errors actionable instead of just "not found".
+- Fallback matches are reported in the result as `ws_fallback_notes`.
+
+**2. Structural health check (`_check_module_health`):**
+Called after every write operation (`replace_lines` single+batch, `replace_proc`, `patch_proc`, `append`). Three checks:
+- **Option placement**: Detects `Option Explicit`/`Option Compare` on lines > 5 (should always be at the top).
+- **Duplicate labels**: Regex scan for `label:` patterns that appear more than once (common after copy-paste errors).
+- **Line count sanity** (batch mode only): Compares expected total (`original - deleted + inserted`) with actual `cm.CountOfLines`.
+
+Warnings are appended to the return string, never fail the operation.
+
+**3. Option Explicit/Compare protection:**
+- `_strip_option_lines()` removes `Option Explicit`/`Option Compare` from code being written to wrong positions.
+- `ac_vbe_append`: Always strips Option lines (append goes to end of module — Option there is always wrong). Returns NOOP if code was only Option lines.
+- `ac_vbe_replace_proc` / `ac_vbe_patch_proc`: Strips Option lines only when `start > 5` (proc is not at the top of the module).
+- `_inject_vba_after_import` (code.py + controls.py): Auto-prepends `Option Compare Database` and `Option Explicit` if not present in the first 5 lines of injected VBA.
+
 ### ac_execute_sql safety
 - SELECT results are limited by `limit` parameter (default 500, max 10000). If truncated, response includes `truncated: true`.
 - DELETE/DROP/TRUNCATE/ALTER require `confirm_destructive=true` — without it the server returns an error.

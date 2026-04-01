@@ -225,6 +225,18 @@ def _inject_vba_after_import(app: Any, object_type: str, name: str, vba_code: st
     if not vba_code.endswith("\r\n"):
         vba_code += "\r\n"
 
+    # Ensure Option Compare Database and Option Explicit at the top
+    vba_lines = vba_code.split("\r\n")
+    has_compare = any(re.match(r'^\s*Option\s+Compare', l, re.I) for l in vba_lines[:5])
+    has_explicit = any(re.match(r'^\s*Option\s+Explicit', l, re.I) for l in vba_lines[:5])
+    prepend = []
+    if not has_compare:
+        prepend.append("Option Compare Database")
+    if not has_explicit:
+        prepend.append("Option Explicit")
+    if prepend:
+        vba_code = "\r\n".join(prepend) + "\r\n" + vba_code
+
     cm.InsertLines(1, vba_code)
 
     # Invalidate caches

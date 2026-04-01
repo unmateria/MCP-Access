@@ -5,6 +5,7 @@ Extracted from the monolithic access_mcp_server.py — same logic,
 only imports updated to point at the refactored package structure.
 """
 
+import difflib
 import html as html_mod
 import os
 import re
@@ -67,6 +68,139 @@ def _cm_all_code(cm: Any, cache_key: str) -> str:
         total = cm.CountOfLines
         _vbe_code_cache[cache_key] = cm.Lines(1, total) if total > 0 else ""
     return _vbe_code_cache[cache_key]
+
+
+# ---------------------------------------------------------------------------
+# Structural helpers — Option protection, health check, ws-matching
+# ---------------------------------------------------------------------------
+
+_OPTION_RE = re.compile(r'^\s*Option\s+(Explicit|Compare\s+\w+)\s*$', re.IGNORECASE)
+
+
+def _strip_option_lines(code: str) -> tuple[str, list[str]]:
+    """
+    Removes Option Explicit / Option Compare lines from code.
+    Returns (cleaned_code, list[str] warnings).
+    """
+    warnings: list[str] = []
+    out_lines: list[str] = []
+    for line in code.splitlines(keepends=True):
+        if _OPTION_RE.match(line.rstrip('\r\n')):
+            warnings.append(f"Stripped misplaced Option line: {line.strip()!r}")
+        else:
+            out_lines.append(line)
+    return "".join(out_lines), warnings
+
+
+def _check_module_health(cm: Any, cache_key: str, expected_total: int = 0) -> list[str]:
+    """
+    Structural health check after a write operation.
+    Returns list of WARNING strings (empty = OK).
+    """
+    warnings: list[str] = []
+    # Force fresh read (cache was just invalidated)
+    total = cm.CountOfLines
+    if total == 0:
+        return warnings
+    all_code = cm.Lines(1, total)
+    lines = all_code.splitlines()
+
+    # Check 1 — Option placement: should be in first 5 lines
+    for i, line in enumerate(lines):
+        if _OPTION_RE.match(line.rstrip('\r\n')) and i >= 5:
+            warnings.append(
+                f"WARNING: '{line.strip()}' found at line {i + 1} (expected in first 5 lines)"
+            )
+
+    # Check 2 — Duplicate labels
+    label_re = re.compile(r'^(\w+):\s*$')
+    label_positions: dict[str, list[int]] = {}
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        # Skip comments, Case statements, pure numbers
+        if stripped.startswith("'") or stripped.startswith("Case "):
+            continue
+        m = label_re.match(stripped)
+        if m:
+            label = m.group(1)
+            # Exclude numeric labels and common non-label patterns
+            if label.isdigit():
+                continue
+            label_positions.setdefault(label, []).append(i + 1)
+    for label, positions in label_positions.items():
+        if len(positions) > 1:
+            warnings.append(
+                f"WARNING: Duplicate label '{label}:' at lines {positions}"
+            )
+
+    # Check 3 — Count sanity
+    if expected_total > 0 and total != expected_total:
+        warnings.append(
+            f"WARNING: Expected {expected_total} lines after edit, but module has {total}"
+        )
+
+    return warnings
+
+
+def _ws_normalized_match(proc_code: str, find_text: str) -> tuple[int, int] | None:
+    """
+    Whitespace-tolerant matching: strips leading whitespace from each line
+    and does a sliding window search.
+    Returns (start_idx, end_idx) 0-based line indices into proc_code lines, or None.
+    """
+    proc_lines = proc_code.splitlines()
+    find_lines = find_text.splitlines()
+    # Remove empty trailing lines from find_text
+    while find_lines and not find_lines[-1].strip():
+        find_lines.pop()
+    if not find_lines:
+        return None
+
+    proc_stripped = [l.lstrip() for l in proc_lines]
+    find_stripped = [l.lstrip() for l in find_lines]
+    window = len(find_stripped)
+
+    for i in range(len(proc_stripped) - window + 1):
+        if proc_stripped[i : i + window] == find_stripped:
+            return (i, i + window - 1)
+    return None
+
+
+def _closest_match_context(proc_code: str, find_text: str, proc_name: str) -> str:
+    """
+    When both exact and ws-normalized match fail, finds the most similar line
+    using difflib and returns a contextual snippet for a descriptive error.
+    """
+    proc_lines = proc_code.splitlines()
+    find_lines = [l.strip() for l in find_text.splitlines() if l.strip()]
+    if not find_lines:
+        return f"Empty find text in proc '{proc_name}'"
+
+    # Use the first non-empty find line as the reference
+    ref = find_lines[0]
+    best_ratio = 0.0
+    best_idx = 0
+    sm = difflib.SequenceMatcher(None, ref, "")
+    for i, line in enumerate(proc_lines):
+        sm.set_seq2(line.strip())
+        ratio = sm.ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_idx = i
+
+    # Build context: 3 lines around best candidate
+    start = max(0, best_idx - 1)
+    end = min(len(proc_lines), best_idx + 2)
+    context_lines = []
+    for j in range(start, end):
+        marker = ">>>" if j == best_idx else "   "
+        context_lines.append(f"  {marker} L{j + 1}: {proc_lines[j].rstrip()}")
+
+    return (
+        f"Best match ({best_ratio:.0%} similar) near line {best_idx + 1} "
+        f"of '{proc_name}':\n" + "\n".join(context_lines) +
+        f"\n  Looking for: {ref[:80]!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +355,7 @@ def ac_vbe_replace_lines(
 
     if operations:
         # ── Batch mode: sort bottom-to-top and execute sequentially ──
+        original_total = cm.CountOfLines
         sorted_ops = sorted(operations, key=lambda op: op["start_line"], reverse=True)
         results = []
         for op in sorted_ops:
@@ -243,11 +378,17 @@ def ac_vbe_replace_lines(
         lines_summary = ", ".join(
             f"L{r['start_line']}" for r in results
         )
-        return (
+        # Health check with expected count
+        expected = original_total - total_deleted + total_inserted
+        health = _check_module_health(cm, cache_key, expected_total=expected)
+        status = (
             f"OK batch: {len(results)} operations executed (bottom→top: {lines_summary}). "
             f"Total: {total_deleted} deleted, {total_inserted} inserted "
             f"→ module now has {new_total} lines"
         )
+        if health:
+            status += f"\n" + "\n".join(health)
+        return status
 
     # ── Single mode (backward compatible) ──
     r = _exec_single_replace(cm, app, object_type, object_name, start_line, count, new_code)
@@ -261,11 +402,15 @@ def ac_vbe_replace_lines(
     except Exception:
         pass  # save is best-effort; compact/close will also persist
     new_total = cm.CountOfLines
+    # Health check
+    health = _check_module_health(cm, cache_key)
     status = (
         f"OK: lines {r['start_line']}–{r['end']} replaced "
         f"({r['deleted']} deleted, {r['inserted']} inserted){r['clamp_note']} "
         f"→ module now has {new_total} lines"
     )
+    if health:
+        status += f"\n" + "\n".join(health)
     if new_code:
         lines = new_code.splitlines()
         preview = (
@@ -550,6 +695,10 @@ def ac_vbe_replace_proc(
     count = min(count, total - start + 1)
     # Backup original proc in RAM for rollback if it fails
     backup_code = cm.Lines(start, count)
+    # Strip Option lines if proc is NOT at the top of the module
+    option_warnings = []
+    if new_code and start > 5:
+        new_code, option_warnings = _strip_option_lines(new_code)
     # Delete old procedure and insert new one with automatic rollback
     try:
         cm.DeleteLines(start, count)
@@ -569,12 +718,18 @@ def ac_vbe_replace_proc(
     cache_key = f"{object_type}:{object_name}"
     _vbe_code_cache.pop(cache_key, None)
     new_total = cm.CountOfLines
+    # Health check
+    health = _check_module_health(cm, cache_key)
     action = "replaced" if new_code else "deleted"
     status = (
         f"OK: proc '{proc_name}' {action} "
         f"({count} deleted, {inserted} inserted) "
         f"→ module now has {new_total} lines"
     )
+    if option_warnings:
+        status += f"\n" + "\n".join(option_warnings)
+    if health:
+        status += f"\n" + "\n".join(health)
     if new_code:
         lines = new_code.splitlines()
         preview = (
@@ -626,6 +781,7 @@ def ac_vbe_patch_proc(
     # Apply patches sequentially
     applied = 0
     not_found = []
+    ws_fallback_notes = []
     for i, patch in enumerate(patches):
         find_text = patch["find"]
         replace_text = patch.get("replace", "")
@@ -636,10 +792,30 @@ def ac_vbe_patch_proc(
             proc_code = proc_code.replace(find_text, replace_text, 1)
             applied += 1
         else:
-            not_found.append(f"patch[{i}]: '{find_text[:50]}...' not found")
+            # Fallback: whitespace-normalized match
+            ws_match = _ws_normalized_match(proc_code, find_text)
+            if ws_match is not None:
+                s_idx, e_idx = ws_match
+                code_lines = proc_code.splitlines(keepends=True)
+                # Replace matched lines with replace_text as-is
+                replace_normalized = replace_text
+                if not replace_normalized.endswith(("\r\n", "\n")) and replace_normalized:
+                    replace_normalized += "\r\n"
+                code_lines[s_idx : e_idx + 1] = [replace_normalized] if replace_normalized else []
+                proc_code = "".join(code_lines)
+                applied += 1
+                ws_fallback_notes.append(f"patch[{i}]: matched via ws-normalized fallback")
+            else:
+                ctx = _closest_match_context(proc_code, find_text, proc_name)
+                not_found.append(f"patch[{i}]: not found. {ctx}")
 
     if applied == 0:
-        return f"NOOP: no patches matched in '{proc_name}'. Errors: {'; '.join(not_found)}"
+        return f"NOOP: no patches matched in '{proc_name}'. Errors:\n" + "\n".join(not_found)
+
+    # Strip Option lines if proc is NOT at the top of the module
+    option_warnings = []
+    if start > 5:
+        proc_code, option_warnings = _strip_option_lines(proc_code)
 
     # Replace entire proc with patched code
     try:
@@ -658,12 +834,20 @@ def ac_vbe_patch_proc(
     _vbe_code_cache.pop(cache_key, None)
     new_total = cm.CountOfLines
     new_count = cm.ProcCountLines(proc_name, 0) if applied > 0 else 0
+    # Health check
+    health = _check_module_health(cm, cache_key)
     result = (
         f"OK: {applied}/{len(patches)} patches applied in '{proc_name}' "
         f"({count} → {new_count} lines) → module now has {new_total} lines"
     )
+    if ws_fallback_notes:
+        result += f"\nWS-fallback: {'; '.join(ws_fallback_notes)}"
+    if option_warnings:
+        result += f"\n" + "\n".join(option_warnings)
+    if health:
+        result += f"\n" + "\n".join(health)
     if not_found:
-        result += f"\nNot found: {'; '.join(not_found)}"
+        result += f"\nNot found:\n" + "\n".join(not_found)
     return result
 
 
@@ -681,6 +865,10 @@ def ac_vbe_append(
     total = cm.CountOfLines
     # Decode HTML entities that MCP transport may have encoded (& → &amp; etc.)
     decoded = html_mod.unescape(code)
+    # Strip Option lines that would end up misplaced at the end of the module
+    decoded, option_warnings = _strip_option_lines(decoded)
+    if not decoded.strip():
+        return "NOOP: code contained only Option lines (stripped to prevent misplacement)"
     normalized = decoded.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
     cm.InsertLines(total + 1, normalized)
     inserted = len(decoded.splitlines())
@@ -693,4 +881,11 @@ def ac_vbe_append(
     except Exception:
         pass
     new_total = cm.CountOfLines
-    return f"OK: {inserted} lines appended → module now has {new_total} lines"
+    # Health check
+    health = _check_module_health(cm, cache_key)
+    result = f"OK: {inserted} lines appended → module now has {new_total} lines"
+    if option_warnings:
+        result += f"\n" + "\n".join(option_warnings)
+    if health:
+        result += f"\n" + "\n".join(health)
+    return result
