@@ -240,22 +240,10 @@ class _Session:
         except Exception:
             log.warning("Could not simulate Shift — AutoExec may run")
 
-        # Run OpenCurrentDatabase with a watchdog: if it blocks >10s,
-        # screenshot the Access window, dismiss any dialog (Enter), and report.
+        # Run OpenCurrentDatabase in THIS thread (COM worker) with a watchdog
+        # in a separate thread to dismiss blocking dialogs after 10s.
         _open_done = threading.Event()
-        _open_error: list = []  # [exception] if any
         _dialog_info: list = []  # [screenshot_path] if watchdog triggered
-
-        def _do_open():
-            try:
-                cls._app.OpenCurrentDatabase(path)
-            except Exception as e:
-                if "already have the database open" in str(e).lower():
-                    log.info("DB was already open — syncing state")
-                else:
-                    _open_error.append(e)
-            finally:
-                _open_done.set()
 
         def _watchdog():
             """If open takes >10s, screenshot + dismiss dialog with Enter."""
@@ -266,7 +254,6 @@ class _Session:
                 _h = cls._app.hWndAccessApp
                 hwnd = int(_h() if callable(_h) else _h)
                 # Try to capture screenshot
-                screenshot_path = None
                 try:
                     from .ui import _capture_window
                     img, _, _ = _capture_window(hwnd, max_width=960)
@@ -283,18 +270,13 @@ class _Session:
                     log.warning("Could not capture screenshot: %s", e2)
 
                 # Dismiss dialog: press Enter (accepts default button)
-                import win32gui
-                import win32con
-                # Find the foreground window (likely the dialog)
                 fg = ctypes.windll.user32.GetForegroundWindow()
                 if fg and fg != hwnd:
-                    # It's a dialog on top of Access — send Enter
                     log.info("Sending Enter to dismiss dialog (hwnd=%s)", fg)
                     ctypes.windll.user32.PostMessageW(fg, 0x0100, 0x0D, 0)  # WM_KEYDOWN VK_RETURN
                     time.sleep(0.1)
                     ctypes.windll.user32.PostMessageW(fg, 0x0101, 0x0D, 0)  # WM_KEYUP VK_RETURN
                 else:
-                    # Try sending Enter to Access main window
                     log.info("Sending Enter to Access main window")
                     ctypes.windll.user32.PostMessageW(hwnd, 0x0100, 0x0D, 0)
                     time.sleep(0.1)
@@ -302,21 +284,26 @@ class _Session:
             except Exception as e3:
                 log.warning("Watchdog error: %s", e3)
 
-        open_thread = threading.Thread(target=_do_open, daemon=True)
         watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
-        open_thread.start()
         watchdog_thread.start()
-        open_thread.join(timeout=60)  # Absolute max wait
 
-        if shift_held:
-            try:
-                _kbd(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0)  # Release SHIFT
-                log.info("SHIFT released")
-            except Exception:
-                pass
-
-        if _open_error:
-            raise _open_error[0]
+        # Call OpenCurrentDatabase in the current thread (COM worker — same
+        # apartment that created _app).  The watchdog will dismiss any dialog.
+        try:
+            cls._app.OpenCurrentDatabase(path)
+        except Exception as e:
+            if "already have the database open" in str(e).lower():
+                log.info("DB was already open — syncing state")
+            else:
+                raise
+        finally:
+            _open_done.set()  # signal watchdog to stop
+            if shift_held:
+                try:
+                    _kbd(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0)  # Release SHIFT
+                    log.info("SHIFT released")
+                except Exception:
+                    pass
 
         if _dialog_info:
             log.warning("A blocking dialog was auto-dismissed. Screenshot: %s", _dialog_info[0])
