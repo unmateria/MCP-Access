@@ -4,6 +4,7 @@ VBA compilation and linting.
 
 import re
 import threading
+import time
 from typing import Optional
 
 from .core import _Session, _vbe_code_cache, log
@@ -251,6 +252,207 @@ def _verify_module_structure(app) -> list:
     return errors
 
 
+def _find_block_mismatches(app) -> list:
+    """Parse ALL VBA modules for mismatched block structures.
+
+    Catches: If/End If, For/Next, Do/Loop, While/Wend,
+    Select Case/End Select, With/End With.
+
+    Returns list of error dicts: {module, line, error}.
+    """
+    # Patterns for block openers (multiline only — single-line If is excluded)
+    _LINE_CONT = re.compile(r"\s+_$")
+
+    errors = []
+    try:
+        vbe = app.VBE
+        proj = vbe.ActiveVBProject
+        for comp in proj.VBComponents:
+            if comp.Type not in (1, 100):  # standard modules + form/report
+                continue
+            cm = comp.CodeModule
+            total = cm.CountOfLines
+            if total == 0:
+                continue
+            code = cm.Lines(1, total)
+            lines = code.split("\n")
+            _check_blocks_in_module(comp.Name, lines, errors)
+    except Exception as exc:
+        log.warning("_find_block_mismatches failed: %s", exc)
+    return errors
+
+
+def _check_blocks_in_module(module_name: str, lines: list, errors: list):
+    """Check block structure in a single module's lines."""
+    # Stack of (block_type, line_number)
+    stack: list = []
+    in_proc = False
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        # Join continuation lines
+        full_line = raw
+        while full_line.rstrip().endswith(" _") and i + 1 < len(lines):
+            i += 1
+            full_line = full_line.rstrip()[:-1] + " " + lines[i].strip()
+        stripped = full_line.strip()
+        line_num = i + 1  # 1-based
+
+        # Skip blank / comment
+        if not stripped or stripped.startswith("'"):
+            i += 1
+            continue
+
+        upper = stripped.upper()
+
+        # Conditional compilation directives: #If / #ElseIf / #Else / #End If
+        # These are separate from runtime If/End If — handle first.
+        if upper.startswith("#"):
+            if re.match(r"#IF\s+", upper):
+                stack.append(("#If", line_num))
+            elif re.match(r"#END\s+IF", upper):
+                if stack and stack[-1][0] == "#If":
+                    stack.pop()
+            # #ElseIf, #Else — no stack change
+            i += 1
+            continue
+
+        # Track proc boundaries to reset stack per-proc
+        if re.match(r"(?:PRIVATE\s+|PUBLIC\s+|FRIEND\s+)?(?:STATIC\s+)?(?:SUB|FUNCTION|PROPERTY\s+(?:GET|LET|SET))\s",
+                     upper):
+            in_proc = True
+            stack = []
+            i += 1
+            continue
+
+        if re.match(r"END\s+(?:SUB|FUNCTION|PROPERTY)", upper):
+            # Check for unclosed blocks at end of proc
+            if stack:
+                blk_type, blk_line = stack[0]  # report the first unclosed
+                errors.append({
+                    "module": module_name,
+                    "line": blk_line,
+                    "error": f"Block {blk_type} without End {blk_type} (unclosed at End Sub/Function, line {line_num})",
+                })
+            in_proc = False
+            stack = []
+            i += 1
+            continue
+
+        if not in_proc:
+            i += 1
+            continue
+
+        # --- Block openers ---
+
+        # Multiline If: "If ... Then" where Then is at end of line (not single-line If)
+        # Single-line If has executable code after Then on the same line.
+        # Accept optional trailing comment: If x Then  ' comment
+        m_if = re.match(r"(?:#?)IF\s+.+\sTHEN\s*(?:'.*)?$", upper)
+        if m_if:
+            stack.append(("If", line_num))
+            i += 1
+            continue
+
+        # ElseIf — doesn't change stack depth, just validate there's an If open
+        if re.match(r"ELSEIF\s+", upper):
+            i += 1
+            continue
+
+        # Else — same
+        if upper == "ELSE" or upper.startswith("ELSE ") or upper == "ELSE:":
+            i += 1
+            continue
+
+        # For Each ... / For ...
+        # Single-line: "For Each x In y: doSomething: Next" — has Next on same line
+        if re.match(r"FOR\s+(?:EACH\s+)?\w+", upper):
+            if not re.search(r":\s*NEXT\b", upper):
+                stack.append(("For", line_num))
+            i += 1
+            continue
+
+        # Do ...
+        # Single-line: "Do While x: something: Loop" — has Loop on same line
+        if upper == "DO" or re.match(r"DO\s+(?:WHILE|UNTIL)\s", upper):
+            if not re.search(r":\s*LOOP\b", upper):
+                stack.append(("Do", line_num))
+            i += 1
+            continue
+
+        # While ...
+        if re.match(r"WHILE\s+", upper) and not re.match(r"WHILE\s+WEND", upper):
+            stack.append(("While", line_num))
+            i += 1
+            continue
+
+        # Select Case ...
+        if re.match(r"SELECT\s+CASE\s", upper):
+            stack.append(("Select", line_num))
+            i += 1
+            continue
+
+        # With ...
+        if re.match(r"WITH\s+", upper):
+            stack.append(("With", line_num))
+            i += 1
+            continue
+
+        # --- Block closers ---
+
+        if re.match(r"END\s+IF", upper):
+            if stack and stack[-1][0] == "If":
+                stack.pop()
+            elif not stack:
+                errors.append({
+                    "module": module_name,
+                    "line": line_num,
+                    "error": "End If without matching If",
+                })
+            else:
+                # Mismatched — the top of stack is not If
+                blk_type, blk_line = stack[-1]
+                errors.append({
+                    "module": module_name,
+                    "line": line_num,
+                    "error": f"End If but expected End {blk_type} (opened at line {blk_line})",
+                })
+            i += 1
+            continue
+
+        if upper.startswith("NEXT"):
+            if stack and stack[-1][0] == "For":
+                stack.pop()
+            i += 1
+            continue
+
+        if upper == "LOOP" or re.match(r"LOOP\s+(?:WHILE|UNTIL)\s", upper):
+            if stack and stack[-1][0] == "Do":
+                stack.pop()
+            i += 1
+            continue
+
+        if upper == "WEND":
+            if stack and stack[-1][0] == "While":
+                stack.pop()
+            i += 1
+            continue
+
+        if re.match(r"END\s+SELECT", upper):
+            if stack and stack[-1][0] == "Select":
+                stack.pop()
+            i += 1
+            continue
+
+        if re.match(r"END\s+WITH", upper):
+            if stack and stack[-1][0] == "With":
+                stack.pop()
+            i += 1
+            continue
+
+        i += 1
+
+
 def ac_compile_vba(db_path: str, timeout: Optional[int] = None) -> dict:
     """Compile VBA with VBE open + structural verification.
 
@@ -344,6 +546,34 @@ def ac_compile_vba(db_path: str, timeout: Optional[int] = None) -> dict:
         if dialog_screenshots:
             result["dialog_screenshot"] = dialog_screenshots[0]
         return result
+
+    # 2b. Verify IsCompiled — RunCommand(126) can silently fail for form/report
+    #     modules without raising an exception or showing a MsgBox.
+    #     If not compiled, analyze VBA code for block mismatches.
+    try:
+        if not app.IsCompiled:
+            log.warning("IsCompiled=False after RunCommand — analyzing VBA blocks...")
+            block_errors = _find_block_mismatches(app)
+            if block_errors:
+                detail_lines = []
+                for e in block_errors[:10]:  # limit to 10
+                    detail_lines.append(f"  {e['module']} line {e['line']}: {e['error']}")
+                return {
+                    "status": "error",
+                    "error_detail": "VBA compile errors detected (IsCompiled=False):\n"
+                                   + "\n".join(detail_lines),
+                    "errors": block_errors[:10],
+                }
+            # No block mismatches found but still not compiled — generic error
+            return {
+                "status": "error",
+                "error_detail": "VBA project is NOT compiled after RunCommand. "
+                                "No block mismatches found — the error may be a "
+                                "missing reference, undeclared variable, or type mismatch. "
+                                "Open VBE and do Debug > Compile manually to see the exact error.",
+            }
+    except Exception:
+        pass  # IsCompiled not available — continue with structural checks
 
     # 3. Structural verification: catch orphan code outside Sub/Function
     #    (RunCommand can still miss this for form/report modules)

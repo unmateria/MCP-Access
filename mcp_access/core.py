@@ -9,6 +9,7 @@ import concurrent.futures
 import ctypes
 import logging
 import os
+import subprocess
 import time
 import sys
 import threading
@@ -75,6 +76,7 @@ class _Session:
     _app: Optional[Any] = None
     _db_open: Optional[str] = None
     _cm_cache: dict = {}   # "type:name" -> CodeModule COM object
+    _decompiled_dbs: set = set()  # DBs already decompiled in this session
 
     @classmethod
     def connect(cls, db_path: str) -> Any:
@@ -98,6 +100,7 @@ class _Session:
         cls._app = None
         cls._db_open = None
         cls._cm_cache.clear()
+        cls._decompiled_dbs.clear()
         _vbe_code_cache.clear()
         _parsed_controls_cache.clear()
 
@@ -125,9 +128,85 @@ class _Session:
         cls._switch(path)
 
     @classmethod
+    def _decompile(cls, path: str) -> None:
+        """Run MSACCESS /decompile + SHIFT on the DB before opening via COM.
+        Strips orphaned p-code so compile errors are real, not phantom."""
+        msaccess_candidates = [
+            r"C:\Program Files\Microsoft Office\root\Office16\MSACCESS.EXE",
+            r"C:\Program Files (x86)\Microsoft Office\root\Office16\MSACCESS.EXE",
+        ]
+        msaccess = next((p for p in msaccess_candidates if os.path.exists(p)), None)
+        if not msaccess:
+            log.warning("MSACCESS.EXE not found — skipping /decompile")
+            cls._decompiled_dbs.add(path)  # don't retry
+            return
+
+        # Close COM session completely so the file is unlocked
+        if cls._app is not None:
+            log.info("Closing COM session for /decompile...")
+            try:
+                if cls._db_open:
+                    cls._app.CloseCurrentDatabase()
+            except Exception:
+                pass
+            try:
+                cls._app.Quit(1)  # acQuitSaveNone
+            except Exception:
+                pass
+            cls._app = None
+            cls._db_open = None
+            cls._cm_cache.clear()
+            _vbe_code_cache.clear()
+            _parsed_controls_cache.clear()
+
+        log.info("Decompiling %s ...", path)
+
+        # Hold SHIFT while launching /decompile
+        VK_SHIFT = 0x10
+        KEYEVENTF_KEYUP = 0x0002
+        _kbd = ctypes.windll.user32.keybd_event
+        shift_held = False
+        try:
+            _kbd(VK_SHIFT, 0, 0, 0)
+            time.sleep(0.3)
+            shift_held = True
+        except Exception:
+            pass
+
+        proc = subprocess.Popen(
+            [msaccess, path, "/decompile"],
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+        )
+        time.sleep(3)
+        if shift_held:
+            try:
+                _kbd(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0)
+            except Exception:
+                pass
+        time.sleep(5)  # total ~8s for /decompile to finish
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True, timeout=10,
+            )
+        except Exception:
+            pass
+
+        cls._decompiled_dbs.add(path)
+        log.info("Decompile done for %s", path)
+
+        # Re-launch COM (was killed above)
+        cls._launch()
+
+    @classmethod
     def _switch(cls, path: str) -> None:
         if not os.path.isfile(path):
             raise FileNotFoundError(f"File not found: {path}")
+
+        # Auto-decompile on first open of each DB in this session
+        if path not in cls._decompiled_dbs:
+            cls._decompile(path)
+
         if cls._db_open is not None:
             log.info("Closing previous DB: %s", cls._db_open)
             try:
@@ -137,7 +216,6 @@ class _Session:
         log.info("Opening DB: %s", path)
 
         # Hold Shift during OpenCurrentDatabase to bypass AutoExec/startup forms
-        # Uses ctypes directly (no win32api dependency) + sleep for reliability
         VK_SHIFT = 0x10
         KEYEVENTF_KEYUP = 0x0002
         _kbd = ctypes.windll.user32.keybd_event
@@ -200,6 +278,7 @@ class _Session:
                 cls._app = None
                 cls._db_open = None
                 cls._cm_cache.clear()
+                cls._decompiled_dbs.clear()
                 _vbe_code_cache.clear()
                 _parsed_controls_cache.clear()
 
