@@ -321,13 +321,15 @@ The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/s
 
 ### v0.7.18 — 2026-04-05
 
-**Auto-decompile on first database open:**
-- `_Session._switch()` now runs `MSACCESS.EXE /decompile` with SHIFT held automatically the first time each `.accdb` is opened in a session. This strips orphaned VBA p-code that causes phantom compile errors (e.g. "Block If without End If" invisible to `RunCommand(126)` but visible in VBE Debug > Compile). Tracked per-DB in `_decompiled_dbs` set — only runs once per session. Adds ~10s latency on first open
+**`access_compile_vba` — complete rewrite for reliable error detection:**
+- **VBE CommandBars compile**: Now compiles via `VBE.CommandBars("Menu Bar").Controls("Debug").Execute()` instead of `RunCommand(126)`. This is equivalent to clicking Debug > Compile in VBE and reliably compiles ALL modules including form/report (RunCommand silently skipped them)
+- **Error dialog text capture**: Watchdog reads the Microsoft error dialog text via Win32 `GetWindowText` before dismissing it. Returns the exact error message (e.g. "Compile error: Block If without End If") + module name + line number via `VBE.ActiveCodePane.GetSelection()`
+- **Watchdog always active**: Polls every 0.5s regardless of timeout parameter, preventing hangs from unexpected dialogs
+- **Block mismatch parser (fallback)**: When `IsCompiled=False` but no dialog was caught, `_find_block_mismatches()` statically analyzes VBA code for unclosed blocks. Handles single-line If, comments after Then, `#If`/`#End If`, and colon-separated statements
+- **Lint removed from compile**: `_lint_form_modules()` no longer runs during compilation — it opened every form in Design view causing dozens of "Save changes?" dialogs and broken reference errors
 
-**`access_compile_vba` — block mismatch detection:**
-- After `RunCommand(126)`, checks `app.IsCompiled`. If False (silent compile failure), `_find_block_mismatches()` parses ALL VBA modules for unclosed blocks: `If/End If`, `For/Next`, `Do/Loop`, `While/Wend`, `Select Case/End Select`, `With/End With`. Returns module name, line number, and error description for each mismatch
-- Correctly handles: single-line `If x Then action` (not a block), comments after `Then`, conditional compilation (`#If`/`#End If`), and single-line colon-separated statements (`For Each x In y: ...: Next`, `Do While x: ...: Loop`)
-- Previously `access_compile_vba` returned `"compiled"` even with real errors in form/report modules — now reliably detects and reports them
+**Auto-decompile moved to compile only:**
+- `/decompile` + SHIFT now runs automatically on first compile per session (not on every DB open). Previous approach caused SHIFT key stuck issues and MSACCESS.EXE process accumulation on MCP reconnect
 
 ### v0.7.17 — 2026-04-01
 

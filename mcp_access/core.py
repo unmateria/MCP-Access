@@ -203,10 +203,6 @@ class _Session:
         if not os.path.isfile(path):
             raise FileNotFoundError(f"File not found: {path}")
 
-        # Auto-decompile on first open of each DB in this session
-        if path not in cls._decompiled_dbs:
-            cls._decompile(path)
-
         if cls._db_open is not None:
             log.info("Closing previous DB: %s", cls._db_open)
             try:

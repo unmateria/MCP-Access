@@ -453,25 +453,101 @@ def _check_blocks_in_module(module_name: str, lines: list, errors: list):
         i += 1
 
 
+def _read_dialog_text(hwnd_access: int) -> Optional[str]:
+    """Read text from an Access/VBE error dialog without dismissing it.
+    Returns the static text content or None if no dialog found."""
+    import win32gui
+    import win32process
+
+    try:
+        _, access_pid = win32process.GetWindowThreadProcessId(hwnd_access)
+    except Exception:
+        return None
+
+    dialogs = []
+    def _find(hwnd, _):
+        try:
+            if not win32gui.IsWindowVisible(hwnd):
+                return True
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            if pid != access_pid:
+                return True
+            if win32gui.GetClassName(hwnd) == '#32770':
+                dialogs.append(hwnd)
+        except Exception:
+            pass
+        return True
+
+    try:
+        win32gui.EnumWindows(_find, None)
+    except Exception:
+        return None
+
+    if not dialogs:
+        return None
+
+    # Read static text controls inside the dialog
+    texts = []
+    def _read_children(hwnd, _):
+        try:
+            cls = win32gui.GetClassName(hwnd)
+            if cls == 'Static':
+                text = win32gui.GetWindowText(hwnd)
+                if text:
+                    texts.append(text)
+        except Exception:
+            pass
+        return True
+
+    try:
+        win32gui.EnumChildWindows(dialogs[0], _read_children, None)
+    except Exception:
+        pass
+
+    return "\n".join(texts) if texts else None
+
+
+def _compile_dialog_watchdog(hwnd_access: int, stop_event: threading.Event,
+                              dismissed: list, dialog_texts: list,
+                              screenshot_holder: list, interval: float = 1.0):
+    """Poll for compile error dialogs. Reads text BEFORE dismissing."""
+    from .vba_exec import _dismiss_access_dialogs
+
+    while not stop_event.is_set():
+        # Read dialog text first
+        text = _read_dialog_text(hwnd_access)
+        if text:
+            dialog_texts.append(text)
+        # Then dismiss (captures screenshot + clicks OK)
+        if _dismiss_access_dialogs(hwnd_access,
+                                   screenshot_holder if not dismissed else None):
+            dismissed.append(True)
+        stop_event.wait(interval)
+
+
 def ac_compile_vba(db_path: str, timeout: Optional[int] = None) -> dict:
-    """Compile VBA with VBE open + structural verification.
+    """Compile VBA via VBE Debug > Compile menu + structural verification.
 
-    Opens the VBE MainWindow so RunCommand(126) behaves like clicking
-    Debug > Compile.  Additionally runs _verify_module_structure() to
-    catch orphan code outside Sub/Function blocks (a pattern that
-    RunCommand sometimes misses for form/report modules).
+    Uses VBE CommandBars to trigger compilation (reliable for ALL modules
+    including form/report, unlike RunCommand(126) which silently skips them).
 
-    With timeout, a watchdog auto-dismisses error MsgBox.
-    Returns dict with status + optional error_detail, error_location, dialog_screenshot.
+    A watchdog reads the error dialog text via Win32 GetWindowText before
+    dismissing it, and VBE.ActiveCodePane gives the exact error location.
+
+    Fallback: block mismatch parser + structural verification.
+    Returns dict with status + optional error_detail, error_location.
     """
-    # Lazy import to avoid circular dependency
-    from .vba_exec import _dialog_watchdog
+    from pathlib import Path
+    resolved = str(Path(db_path).resolve())
+
+    # 0. Auto-decompile if not done yet in this session.
+    #    Strips orphaned p-code so compile errors are real, not phantom.
+    if resolved not in _Session._decompiled_dbs:
+        _Session._decompile(resolved)
 
     app = _Session.connect(db_path)
 
-    # 0. Force project to "not compiled" state.
-    #    VBE edits via COM don't always invalidate IsCompiled, so RunCommand on
-    #    an already-compiled project can be a no-op.
+    # 0b. Force project to "not compiled" state.
     vbe_was_visible = False
     try:
         vbe_was_visible = bool(app.VBE.MainWindow.Visible)
@@ -488,29 +564,48 @@ def ac_compile_vba(db_path: str, timeout: Optional[int] = None) -> dict:
     except Exception:
         pass
 
-    # 1. Open VBE so RunCommand(126) compiles ALL modules (including form/report).
-    #    Without VBE visible, RunCommand often silently skips form/report modules.
+    # 1. Open VBE — required for CommandBars compile and ActiveCodePane.
     try:
         app.VBE.MainWindow.Visible = True
     except Exception:
         pass
 
-    # 2. RunCommand(126) = acCmdCompileAndSaveAllModules
-    stop_event = None
-    dialog_screenshots: list = []
-    dismissed: list = []
-    if timeout:
-        _h = app.hWndAccessApp
-        hwnd = int(_h() if callable(_h) else _h)
-        stop_event = threading.Event()
-        watchdog = threading.Thread(
-            target=_dialog_watchdog,
-            args=[hwnd, stop_event, dismissed, dialog_screenshots, 2.0],
-            daemon=True,
-        )
-        watchdog.start()
+    # 2. Find the Compile menu item in VBE Debug menu (ID 578).
+    compile_item = None
     try:
-        app.RunCommand(AC_CMD_COMPILE)
+        debug_menu = app.VBE.CommandBars("Menu Bar").Controls("Debug")
+        for i in range(1, debug_menu.Controls.Count + 1):
+            ctrl = debug_menu.Controls(i)
+            if "compil" in ctrl.Caption.lower().replace("&", ""):
+                compile_item = ctrl
+                break
+    except Exception:
+        log.warning("Could not find VBE Debug > Compile menu item")
+
+    # 3. Compile with watchdog that reads dialog text before dismissing.
+    #    Watchdog ALWAYS runs to prevent hangs from unexpected dialogs.
+    _h = app.hWndAccessApp
+    hwnd = int(_h() if callable(_h) else _h)
+    stop_event = threading.Event()
+    dismissed: list = []
+    dialog_texts: list = []
+    dialog_screenshots: list = []
+
+    watchdog = threading.Thread(
+        target=_compile_dialog_watchdog,
+        args=[hwnd, stop_event, dismissed, dialog_texts,
+              dialog_screenshots, 0.5],  # poll every 0.5s for fast response
+        daemon=True,
+    )
+    watchdog.start()
+
+    try:
+        if compile_item:
+            compile_item.Execute()
+        else:
+            app.RunCommand(AC_CMD_COMPILE)
+        # Give watchdog time to catch any late async dialog.
+        time.sleep(2)
     except Exception as exc:
         err_loc = _get_vbe_error_location(app)
         result = {
@@ -519,13 +614,9 @@ def ac_compile_vba(db_path: str, timeout: Optional[int] = None) -> dict:
         }
         if err_loc:
             result["error_location"] = err_loc
-        if dialog_screenshots:
-            result["dialog_screenshot"] = dialog_screenshots[0]
         return result
     finally:
-        if stop_event:
-            stop_event.set()
-        # Restore VBE visibility
+        stop_event.set()
         if not vbe_was_visible:
             try:
                 app.VBE.MainWindow.Visible = False
@@ -535,28 +626,28 @@ def ac_compile_vba(db_path: str, timeout: Optional[int] = None) -> dict:
     _vbe_code_cache.clear()
     _Session._cm_cache.clear()
 
+    # 4. Check results: dialog dismissed = compile error caught.
     if dismissed:
+        err_loc = _get_vbe_error_location(app)
+        error_msg = dialog_texts[0] if dialog_texts else "Compile error (dialog auto-dismissed)"
         result = {
             "status": "error",
-            "error_detail": "VBA compilation error -- error MsgBox auto-dismissed.",
+            "error_detail": error_msg,
         }
-        err_loc = _get_vbe_error_location(app)
         if err_loc:
             result["error_location"] = err_loc
         if dialog_screenshots:
             result["dialog_screenshot"] = dialog_screenshots[0]
         return result
 
-    # 2b. Verify IsCompiled — RunCommand(126) can silently fail for form/report
-    #     modules without raising an exception or showing a MsgBox.
-    #     If not compiled, analyze VBA code for block mismatches.
+    # 5. Verify IsCompiled — safety net for edge cases.
     try:
         if not app.IsCompiled:
-            log.warning("IsCompiled=False after RunCommand — analyzing VBA blocks...")
+            log.warning("IsCompiled=False after compile — analyzing VBA blocks...")
             block_errors = _find_block_mismatches(app)
             if block_errors:
                 detail_lines = []
-                for e in block_errors[:10]:  # limit to 10
+                for e in block_errors[:10]:
                     detail_lines.append(f"  {e['module']} line {e['line']}: {e['error']}")
                 return {
                     "status": "error",
@@ -564,19 +655,16 @@ def ac_compile_vba(db_path: str, timeout: Optional[int] = None) -> dict:
                                    + "\n".join(detail_lines),
                     "errors": block_errors[:10],
                 }
-            # No block mismatches found but still not compiled — generic error
             return {
                 "status": "error",
-                "error_detail": "VBA project is NOT compiled after RunCommand. "
+                "error_detail": "VBA project is NOT compiled. "
                                 "No block mismatches found — the error may be a "
-                                "missing reference, undeclared variable, or type mismatch. "
-                                "Open VBE and do Debug > Compile manually to see the exact error.",
+                                "missing reference, undeclared variable, or type mismatch.",
             }
     except Exception:
-        pass  # IsCompiled not available — continue with structural checks
+        pass
 
-    # 3. Structural verification: catch orphan code outside Sub/Function
-    #    (RunCommand can still miss this for form/report modules)
+    # 6. Structural verification (code-only, no design view).
     struct_errors = _verify_module_structure(app)
     if struct_errors:
         return {
@@ -584,9 +672,7 @@ def ac_compile_vba(db_path: str, timeout: Optional[int] = None) -> dict:
             "error_detail": "Structural errors in VBA modules:\n" + "\n".join(struct_errors),
         }
 
-    # 4. Lint form/report modules: orphan event handlers + Me.X refs
-    warnings = _lint_form_modules(app)
-    result = {"status": "compiled"}
-    if warnings:
-        result["warnings"] = warnings
-    return result
+    # NOTE: _lint_form_modules deliberately NOT called here.
+    # It opens every form in Design view which triggers "save changes" dialogs
+    # and can surface broken form references, blocking the compile.
+    return {"status": "compiled"}

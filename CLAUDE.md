@@ -141,8 +141,8 @@ After add/remove, invalidates `_vbe_code_cache` and `_Session._cm_cache` since r
 ### Query management (ac_manage_query)
 CRUD for QueryDefs via DAO. `delete` requires `confirm=true`. `_QUERYDEF_TYPE` maps DAO QueryDef.Type to readable names (0=Select, 32=Delete, 48=Update, etc.).
 
-### Auto-decompile on first open (v0.7.18)
-`_Session._switch()` now runs `/decompile` + SHIFT automatically the first time each `.accdb` is opened in a session. This strips orphaned p-code so compile errors are real, not phantom. Tracked in `_decompiled_dbs` set (cleared on `_force_cleanup` / `quit`). Adds ~10s latency on first open only. If `MSACCESS.EXE` is not found, logs a warning and continues.
+### Auto-decompile on compile (v0.7.18)
+`ac_compile_vba` runs `/decompile` + SHIFT automatically the first time each `.accdb` is compiled in a session (NOT on every DB open — that caused SHIFT key issues and process accumulation on MCP reconnect). Tracked in `_decompiled_dbs` set. Adds ~10s latency on first compile only.
 
 ### Compile VBA (ac_compile_vba)
 Uses `app.RunCommand(126)` (`acCmdCompileAndSaveAllModules`). Invalidates VBE caches after compilation. Optional `timeout` parameter — if compilation shows a MsgBox (error dialog), the watchdog dismisses it automatically (same pattern as `ac_run_vba`). After the error, `_get_vbe_error_location()` reads `VBE.ActiveCodePane.GetSelection()` to report the exact module, line number, and surrounding code where the error occurred.
@@ -152,7 +152,11 @@ Uses `app.RunCommand(126)` (`acCmdCompileAndSaveAllModules`). Invalidates VBE ca
 2. `RunCommand(126)` without the VBE window open silently skips form/report modules. Fix: open `VBE.MainWindow.Visible=True` before compiling, restore afterwards.
 3. As a safety net, `_verify_module_structure()` scans ALL modules (standard + form/report) for executable code outside Sub/Function/Property/Type/Enum blocks. This catches the specific pattern of accidentally deleted Sub headers leaving orphan code that VBA absorbs into the previous procedure.
 
-**Block mismatch detection (v0.7.18)**: After `RunCommand(126)`, checks `app.IsCompiled`. If False, `_find_block_mismatches()` parses ALL VBA modules for mismatched block structures: `If/End If`, `For/Next`, `Do/Loop`, `While/Wend`, `Select Case/End Select`, `With/End With`. Handles: single-line `If x Then action` (not pushed to stack), comments after `Then`, conditional compilation directives (`#If`/`#End If`), single-line `For Each...: Next` and `Do While...: Loop` with colons. Returns module name, line number, and error description for each mismatch.
+**VBE CommandBars compile (v0.7.18)**: Compiles via `VBE.CommandBars("Menu Bar").Controls("Debug").Controls(1).Execute()` instead of `RunCommand(126)`. This is equivalent to clicking Debug > Compile in the VBE IDE and reliably compiles ALL modules including form/report. A watchdog (polling every 0.5s, always active) reads the error dialog text via `Win32 GetWindowText` before dismissing it, and `VBE.ActiveCodePane.GetSelection()` gives the exact module + line. Returns the exact Microsoft error message (e.g. "Compile error: Block If without End If").
+
+**Block mismatch detection (v0.7.18)**: Fallback when `IsCompiled=False` but no dialog was caught. `_find_block_mismatches()` parses ALL VBA modules for mismatched block structures: `If/End If`, `For/Next`, `Do/Loop`, `While/Wend`, `Select Case/End Select`, `With/End With`. Handles: single-line `If x Then action`, comments after `Then`, conditional compilation directives (`#If`/`#End If`), single-line colon statements. Returns module name, line number, and error description.
+
+**Lint removed from compile (v0.7.18)**: `_lint_form_modules()` is no longer called during compilation. It opened every form in Design view which triggered "Save changes?" dialogs and surfaced broken form references, blocking the compile with 50+ dialogs. Lint is still available as a standalone function.
 
 ### Output report (ac_output_report)
 Uses `DoCmd.OutputTo(acOutputReport=3, ...)`. `_OUTPUT_FORMATS` maps format names to Access format strings. Auto-generates output_path if omitted.
@@ -251,10 +255,10 @@ This patch is local to this machine and will be lost on `pip install --upgrade m
 - `AutomationSecurity = 3` (msoAutomationSecurityForceDisable) does NOT work — Access ignores it for database-level AutoExec macros.
 - VK_ESCAPE to dismiss modal forms is unreliable (doesn't always reach the right window).
 
-### Auto-decompile on first database open
-- `_switch()` calls `_decompile(path)` if the DB has not been decompiled yet in this session (`_decompiled_dbs` set).
-- `_decompile()` closes COM completely (`CloseCurrentDatabase` + `Quit`), spawns `MSACCESS.EXE /decompile` with SHIFT held, waits ~8s, kills the process, then re-launches COM via `_launch()`.
-- Without this, stale p-code can cause phantom compile errors (e.g. "Block If without End If" that only surfaces after manual Debug > Compile in VBE) while `RunCommand(126)` silently reports "compiled".
+### Auto-decompile (on compile, NOT on DB open)
+- `ac_compile_vba()` calls `_Session._decompile(path)` if the DB has not been decompiled yet in this session.
+- `_decompile()` closes COM completely, spawns `MSACCESS.EXE /decompile` with SHIFT held, waits ~8s, kills the process, then re-launches COM.
+- **NOT in `_switch()`** — auto-decompile on every DB open caused SHIFT key stuck issues and MSACCESS.EXE process accumulation on MCP reconnect (each `/mcp` = new session = new decompile).
 
 ### "You already have the database open" after MCP reconnect
 - After `/mcp` reconnect, the MCP server process restarts (`_Session._app = None`) but Access.exe keeps running with the DB open. New `Dispatch("Access.Application")` connects to the existing instance, and `OpenCurrentDatabase` fails with "already have the database open".
