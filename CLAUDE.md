@@ -255,6 +255,20 @@ This patch is local to this machine and will be lost on `pip install --upgrade m
 - `AutomationSecurity = 3` (msoAutomationSecurityForceDisable) does NOT work — Access ignores it for database-level AutoExec macros.
 - VK_ESCAPE to dismiss modal forms is unreliable (doesn't always reach the right window).
 
+### Recovery dialog suppression (v0.7.19)
+- When Access is killed via `Stop-Process` (or crashes), the next open shows a "last time you opened this file it caused a serious error" dialog that blocks `OpenCurrentDatabase`.
+- Fix: `_suppress_recovery_dialog()` writes two registry DWORDs to `HKCU\Software\Microsoft\Office\16.0\Access\Resiliency`: `DisableAllCallersWarning=1` and `DoNotShowUI=1`. Called before every `OpenCurrentDatabase` in `_switch()`.
+
+### OpenCurrentDatabase watchdog (v0.7.19)
+- `OpenCurrentDatabase` runs in a background thread. A watchdog thread waits 10 seconds.
+- If the open hasn't completed in 10s, the watchdog:
+  1. Captures a screenshot of the Access window via `_capture_window()` and saves to `%TEMP%\access_blocked_*.png`
+  2. Detects if a dialog window is on top of Access (`GetForegroundWindow() != Access hwnd`)
+  3. Sends `VK_RETURN` (Enter) via `PostMessageW` to dismiss the dialog (accepts default button)
+  4. Logs the screenshot path and dialog dismissal
+- This handles any unexpected blocking dialog (recovery, save changes, etc.) without user intervention.
+- Absolute timeout: 60 seconds (thread join). If still blocked after that, the thread is abandoned (daemon).
+
 ### Auto-decompile (on compile, NOT on DB open)
 - `ac_compile_vba()` calls `_Session._decompile(path)` if the DB has not been decompiled yet in this session.
 - `_decompile()` closes COM completely, spawns `MSACCESS.EXE /decompile` with SHIFT held, waits ~8s, kills the process, then re-launches COM.

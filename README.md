@@ -319,6 +319,16 @@ The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/s
 
 ## Changelog
 
+### v0.7.19 — 2026-04-05
+
+**OpenCurrentDatabase watchdog — auto-dismiss blocking dialogs:**
+- `OpenCurrentDatabase` now runs in a background thread with a 10-second watchdog. If the open blocks (recovery dialog, save changes prompt, or any unexpected modal dialog), the watchdog:
+  1. Captures a screenshot of the Access window and saves to `%TEMP%\access_blocked_*.png`
+  2. Detects the blocking dialog via `GetForegroundWindow`
+  3. Sends Enter (`VK_RETURN`) via `PostMessageW` to dismiss it (accepts default button)
+  4. Logs the screenshot path for debugging
+- **Recovery dialog suppression**: Before every `OpenCurrentDatabase`, writes `DisableAllCallersWarning=1` and `DoNotShowUI=1` to `HKCU\Software\Microsoft\Office\16.0\Access\Resiliency` registry key. This prevents the "last time you opened this file it caused a serious error" dialog that appears after a crash or `Stop-Process`
+
 ### v0.7.18 — 2026-04-05
 
 **`access_compile_vba` — complete rewrite for reliable error detection:**
