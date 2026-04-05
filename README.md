@@ -247,7 +247,7 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 
 | Tool | Description |
 |------|-------------|
-| `access_find_usages` | Search a name across VBA code, query SQL, and control properties (ControlSource, RecordSource, RowSource, SourceObject, DefaultValue, ValidationRule) in one call |
+| `access_find_usages` | Search a name across VBA code, query SQL, and control properties (ControlSource, RecordSource, RowSource, SourceObject, DefaultValue, ValidationRule, LinkChildFields, LinkMasterFields) in one call |
 
 ### Knowledge base
 
@@ -318,6 +318,14 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/session.py` that swallows real errors and returns a generic `-32602` code with no detail. A local patch is applied to this machine that includes the actual exception and traceback in the error response. If you upgrade the `mcp` package, re-apply the patch — see `CLAUDE.md` for details.
 
 ## Changelog
+
+### v0.7.20 — 2026-04-05
+
+**Bug fixes** — thanks to [@CaptainStormfield](https://github.com/CaptainStormfield) ([PR #11](https://github.com/unmateria/MCP-Access/pull/11)):
+- **`access_get_form_property` crash on binary GUID properties**: `_serialize_value` handled `bytes` but not `memoryview`, causing JSON serialization crash. Fix: extended type check to `(bytes, memoryview)`
+- **`access_find_usages` missed subform link references**: `LinkChildFields` and `LinkMasterFields` were not in `CONTROL_SEARCH_PROPS`, so stale subform link references after table/field renames went undetected
+- **`access_list_controls` / `access_get_control` missed Subform controls**: Access exports `Begin Subform` (lowercase f) but the constant was `"SubForm"` (capital F), causing case-sensitive matching to skip subforms entirely. Also fixed wrong control number in tips (was 114, correct is 112)
+- **Spurious duplicate-label warnings in VBE health check**: The check scanned modules flat, flagging `ErrHandler:` as duplicate when it appeared in separate procedures. VBA labels are procedure-scoped — fix tracks Sub/Function/Property boundaries and only flags duplicates within the same procedure
 
 ### v0.7.19 — 2026-04-05
 

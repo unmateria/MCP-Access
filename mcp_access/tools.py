@@ -918,7 +918,8 @@ TOOLS = [
         name="access_find_usages",
         description=(
             "Searches for text or regex in VBA, query SQL and control properties "
-            "(ControlSource, RecordSource, RowSource, SourceObject, DefaultValue, ValidationRule). "
+            "(ControlSource, RecordSource, RowSource, SourceObject, DefaultValue, ValidationRule, "
+            "LinkChildFields, LinkMasterFields). "
             "Returns results grouped: vba_matches, query_matches, control_matches."
         ),
         inputSchema={

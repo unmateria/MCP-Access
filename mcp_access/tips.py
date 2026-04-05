@@ -25,7 +25,7 @@ _TIPS: dict[str, str] = {
         "  119 = acCustomControl (ActiveX) — use class_name param for ProgID (e.g. 'Shell.Explorer.2')\n"
         "  128 = acWebBrowser (native, NOT ActiveX — no OLE needed)\n"
         "  Common: 100=Label, 109=TextBox, 106=ComboBox, 105=ListBox, 104=CommandButton,\n"
-        "          110=CheckBox, 114=SubForm, 122=Image, 101=Rectangle"
+        "          110=CheckBox, 112=Subform, 122=Image, 101=Rectangle"
     ),
     "gotchas": (
         "COM & ODBC:\n"

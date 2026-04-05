@@ -217,6 +217,6 @@ def serialize_value(val: Any) -> Any:
             return float(val)
     except ImportError:
         pass
-    if isinstance(val, bytes):
+    if isinstance(val, (bytes, memoryview)):
         return f"<binary {len(val)} bytes>"
     return val

@@ -112,11 +112,18 @@ def _check_module_health(cm: Any, cache_key: str, expected_total: int = 0) -> li
                 f"WARNING: '{line.strip()}' found at line {i + 1} (expected in first 5 lines)"
             )
 
-    # Check 2 — Duplicate labels
+    # Check 2 — Duplicate labels (scoped per procedure)
     label_re = re.compile(r'^(\w+):\s*$')
-    label_positions: dict[str, list[int]] = {}
+    proc_re = re.compile(r'^(?:Public|Private|Friend|Static)?\s*(?:Sub|Function|Property\s+\w+)\s+', re.IGNORECASE)
+    end_proc_re = re.compile(r'^End\s+(?:Sub|Function|Property)\b', re.IGNORECASE)
+    label_positions: dict[tuple[str, str], list[int]] = {}
+    current_proc = ""
     for i, line in enumerate(lines):
         stripped = line.strip()
+        if proc_re.match(stripped):
+            current_proc = stripped
+        elif end_proc_re.match(stripped):
+            current_proc = ""
         # Skip comments, Case statements, pure numbers
         if stripped.startswith("'") or stripped.startswith("Case "):
             continue
@@ -126,11 +133,12 @@ def _check_module_health(cm: Any, cache_key: str, expected_total: int = 0) -> li
             # Exclude numeric labels and common non-label patterns
             if label.isdigit():
                 continue
-            label_positions.setdefault(label, []).append(i + 1)
-    for label, positions in label_positions.items():
+            label_positions.setdefault((current_proc, label), []).append(i + 1)
+    for (proc, label), positions in label_positions.items():
         if len(positions) > 1:
             warnings.append(
                 f"WARNING: Duplicate label '{label}:' at lines {positions}"
+                + (f" in '{proc}'" if proc else "")
             )
 
     # Check 3 — Count sanity

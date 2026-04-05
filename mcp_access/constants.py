@@ -36,7 +36,7 @@ CTRL_TYPE: dict[int, str] = {
     109: "TextBox",
     110: "ListBox",
     111: "ComboBox",
-    112: "SubForm",
+    112: "Subform",
     113: "ObjectFrame",
     114: "PageBreak",
     118: "Page",
@@ -166,5 +166,5 @@ OUTPUT_FORMATS: dict[str, str] = {
 # ---------------------------------------------------------------------------
 CONTROL_SEARCH_PROPS = frozenset({
     "ControlSource", "RecordSource", "RowSource", "DefaultValue", "ValidationRule",
-    "SourceObject",
+    "SourceObject", "LinkChildFields", "LinkMasterFields",
 })

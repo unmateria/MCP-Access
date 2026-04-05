@@ -89,7 +89,7 @@ Three layers of protection added to all VBE write operations:
 **2. Structural health check (`_check_module_health`):**
 Called after every write operation (`replace_lines` single+batch, `replace_proc`, `patch_proc`, `append`). Three checks:
 - **Option placement**: Detects `Option Explicit`/`Option Compare` on lines > 5 (should always be at the top).
-- **Duplicate labels**: Regex scan for `label:` patterns that appear more than once (common after copy-paste errors).
+- **Duplicate labels**: Regex scan for `label:` patterns that appear more than once within the same procedure (common after copy-paste errors). Scoped per Sub/Function/Property — same label in different procedures is valid VBA and not flagged.
 - **Line count sanity** (batch mode only): Compares expected total (`original - deleted + inserted`) with actual `cm.CountOfLines`.
 
 Warnings are appended to the return string, never fail the operation.
@@ -214,7 +214,7 @@ Uses `Application.Eval` via `InvokeTypes` (same pattern as `_invoke_app_run`). E
 Uses `db.Relations.Delete(name)` via DAO.
 
 ### Find usages (ac_find_usages)
-Cross-reference search in 3 locations: VBA code (all modules/forms/reports), SQL of all queries, and control properties (ControlSource, RecordSource, RowSource, SourceObject, DefaultValue, ValidationRule) via SaveAsText exports. `max_results` default 200.
+Cross-reference search in 3 locations: VBA code (all modules/forms/reports), SQL of all queries, and control properties (ControlSource, RecordSource, RowSource, SourceObject, DefaultValue, ValidationRule, LinkChildFields, LinkMasterFields) via SaveAsText exports. `max_results` default 200.
 
 ## Adding a new tool
 
