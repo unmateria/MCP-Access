@@ -359,6 +359,18 @@ def ac_vbe_replace_lines(
     Returns the status + preview of inserted code to avoid an extra get_proc call.
     """
     app = _Session.connect(db_path)
+
+    # Close form/report in Design view if open (prevents "Catastrophic failure")
+    if object_type in ("form", "report"):
+        ac_obj_type = AC_FORM if object_type == "form" else AC_REPORT
+        try:
+            app.DoCmd.Close(ac_obj_type, object_name, AC_SAVE_YES)
+        except Exception:
+            pass
+
+    cache_key_pre = f"{object_type}:{object_name}"
+    _Session._cm_cache.pop(cache_key_pre, None)
+
     cm = _get_code_module(app, object_type, object_name)
 
     if operations:
@@ -869,6 +881,18 @@ def ac_vbe_append(
     without needing to calculate line numbers.
     """
     app = _Session.connect(db_path)
+
+    # Close form/report in Design view if open (prevents "Catastrophic failure")
+    if object_type in ("form", "report"):
+        ac_obj_type = AC_FORM if object_type == "form" else AC_REPORT
+        try:
+            app.DoCmd.Close(ac_obj_type, object_name, AC_SAVE_YES)
+        except Exception:
+            pass
+
+    cache_key_pre = f"{object_type}:{object_name}"
+    _Session._cm_cache.pop(cache_key_pre, None)
+
     cm = _get_code_module(app, object_type, object_name)
     total = cm.CountOfLines
     # Decode HTML entities that MCP transport may have encoded (& → &amp; etc.)

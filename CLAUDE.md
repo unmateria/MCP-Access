@@ -71,10 +71,12 @@ The parser scans for `Begin <TypeName>` where TypeName matches known control typ
 **Container types** (`_CONTAINER_TYPES = {"Page", "OptionGroup"}`): When the parser finds a container control, it records the container, then re-scans inside the block instead of skipping it. Child controls get a `"parent"` field with the container's name. A `container_stack` tracks nesting so deeply nested containers (Page inside OptionGroup, etc.) are handled correctly.
 
 ### VBE + Design view conflict
-After design operations (`ac_set_control_props`, `ac_create_control`, `ac_delete_control`), the form may remain open in Design view. `ac_vbe_replace_proc` now:
-1. Closes the form in Design view (DoCmd.Close with acSaveYes)
-2. Invalidates `_cm_cache` for the object
-3. Then accesses the VBE CodeModule
+After design operations (`ac_set_control_props`, `ac_create_control`, `ac_delete_control`), the form may remain open in Design view. All VBE write functions (`ac_vbe_replace_proc`, `ac_vbe_patch_proc`, `ac_vbe_replace_lines`, `ac_vbe_append`) now:
+1. Close the form/report in Design view (DoCmd.Close with acSaveYes)
+2. Invalidate `_cm_cache` for the object
+3. Then access the VBE CodeModule
+
+Without this, accessing VBE while the object is open in Design view causes `"Catastrophic failure" (-2147418113)`.
 
 All design operations invalidate all three caches in their `finally` block.
 

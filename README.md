@@ -326,6 +326,7 @@ The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/s
 - **`access_find_usages` missed subform link references**: `LinkChildFields` and `LinkMasterFields` were not in `CONTROL_SEARCH_PROPS`, so stale subform link references after table/field renames went undetected
 - **`access_list_controls` / `access_get_control` missed Subform controls**: Access exports `Begin Subform` (lowercase f) but the constant was `"SubForm"` (capital F), causing case-sensitive matching to skip subforms entirely. Also fixed wrong control number in tips (was 114, correct is 112)
 - **Spurious duplicate-label warnings in VBE health check**: The check scanned modules flat, flagging `ErrHandler:` as duplicate when it appeared in separate procedures. VBA labels are procedure-scoped — fix tracks Sub/Function/Property boundaries and only flags duplicates within the same procedure
+- **`access_vbe_append` / `access_vbe_replace_lines` "Catastrophic failure" after design operations** ([#12](https://github.com/unmateria/MCP-Access/issues/12) — thanks [@CaptainStormfield](https://github.com/CaptainStormfield)): These VBE tools did not close the form/report in Design view before accessing the VBE CodeModule, causing `com_error(-2147418113)`. Fix: all VBE write functions now close the object and invalidate `_cm_cache` before accessing VBE, matching the pattern already used by `access_vbe_replace_proc` and `access_vbe_patch_proc`
 
 ### v0.7.19 — 2026-04-05
 
