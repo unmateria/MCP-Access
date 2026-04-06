@@ -102,6 +102,22 @@ Warnings are appended to the return string, never fail the operation.
 - `ac_vbe_replace_proc` / `ac_vbe_patch_proc`: Strips Option lines only when `start > 5` (proc is not at the top of the module).
 - `_inject_vba_after_import` (code.py + controls.py): Auto-prepends `Option Compare Database` and `Option Explicit` if not present in the first 5 lines of injected VBA.
 
+### Property procedure support (v0.7.21)
+VBE `ProcStartLine`/`ProcBodyLine`/`ProcCountLines`/`ProcOfLine` require a `kind` argument: `0` = `vbext_pk_Proc` (Sub/Function), `3` = `vbext_pk_Property` (Property Get/Let/Set). All call sites previously hardcoded kind=0, so Property procedures were invisible.
+
+Three helpers in `vbe.py`:
+- `_proc_kind(cm, name)` — tries kind=0, falls back to kind=3
+- `_proc_bounds(cm, name)` → `(start, body, count, kind)` — used by `get_proc`, `module_info`, `replace_proc`, `patch_proc`, `find`
+- `_proc_of_line(cm, line)` → `str` — used by `find` to enrich matches with owning proc name
+
+### VBProject resolution after decompile (v0.7.21)
+`app.VBE.VBProjects(1)` can return `acwzmain` (wizard library) instead of the user's project after decompile+compact. `_get_vb_project(app)` in `core.py` enumerates all `VBProjects` and matches by `.FileName` against `_Session._db_open`. Falls back to index 1. Used by `_get_code_module()` and `_eval_via_temp_module()`.
+
+### VBE component init after decompile (v0.7.21)
+After decompile+compact, `VBComponents(name)` may raise "Subscript out of range" even though the component exists. `_get_code_module()` now retries once after calling `_force_vbe_init()`:
+- Forms/reports: opens briefly in Design view and closes (forces Access to load code-behind)
+- Modules: toggles `VBE.MainWindow.Visible` (forces VBE component enumeration)
+
 ### ac_execute_sql safety
 - SELECT results are limited by `limit` parameter (default 500, max 10000). If truncated, response includes `truncated: true`.
 - DELETE/DROP/TRUNCATE/ALTER require `confirm_destructive=true` — without it the server returns an error.

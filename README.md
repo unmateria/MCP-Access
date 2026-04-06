@@ -319,6 +319,13 @@ The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/s
 
 ## Changelog
 
+### v0.7.21 — 2026-04-06
+
+**Bug fixes** — thanks to [@CaptainStormfield](https://github.com/CaptainStormfield) ([PR #17](https://github.com/unmateria/MCP-Access/pull/17)):
+- **Property Get/Let/Set procedures invisible to VBE tools**: All VBE call sites (`get_proc`, `module_info`, `replace_proc`, `patch_proc`, `find`) hardcoded `kind=0` (`vbext_pk_Proc`). Property procedures require `kind=3` (`vbext_pk_Property`). New helpers `_proc_kind()`, `_proc_bounds()`, `_proc_of_line()` try kind=0 first and fall back to kind=3
+- **Wrong VBProject after decompile+compact**: `app.VBE.VBProjects(1)` could return `acwzmain` (wizard library) instead of the user's database project. New `_get_vb_project(app)` enumerates all VBProjects and matches by `.FileName` against the open database path
+- **"Subscript out of range" after decompile**: `VBComponents(name)` could fail even though the component exists. `_get_code_module()` now retries once after forcing VBE initialisation (opens form/report briefly in Design view, or toggles `VBE.MainWindow.Visible` for modules)
+
 ### v0.7.20 — 2026-04-05
 
 **Bug fixes** — thanks to [@CaptainStormfield](https://github.com/CaptainStormfield) ([PR #11](https://github.com/unmateria/MCP-Access/pull/11)):

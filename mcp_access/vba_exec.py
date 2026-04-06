@@ -10,7 +10,7 @@ import threading
 import time
 from typing import Any, Optional
 
-from .core import _Session, log
+from .core import _Session, _get_vb_project, log
 
 
 # ---------------------------------------------------------------------------
@@ -283,7 +283,7 @@ def _invoke_app_eval(app, expression: str):
 
 def _eval_via_temp_module(app, expression: str, original_exc: Exception):
     """Fallback: create temp standard module with wrapper function, run it, clean up."""
-    proj = app.VBE.VBProjects(1)
+    proj = _get_vb_project(app)
     comp = None
     try:
         # Create temp standard module (type 1 = vbext_ct_StdModule)

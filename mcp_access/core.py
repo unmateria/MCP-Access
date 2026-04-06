@@ -351,6 +351,35 @@ class _Session:
 atexit.register(_Session.quit)
 
 
+def _get_vb_project(app):
+    """Return the VBProject that belongs to the current database.
+
+    ``app.VBE.VBProjects(1)`` may return the wrong project (e.g. the
+    ``acwzmain`` wizard library) after a decompile+compact cycle.  This
+    helper enumerates all loaded VBProjects and picks the one whose
+    ``.FileName`` matches ``_Session._db_open``.  Falls back to index 1
+    if no match is found (single-project scenario).
+    """
+    db_path = _Session._db_open
+    try:
+        projects = app.VBE.VBProjects
+        count = projects.Count
+        if db_path:
+            db_norm = os.path.normcase(os.path.abspath(db_path))
+            for i in range(1, count + 1):
+                try:
+                    proj = projects(i)
+                    fname = getattr(proj, "FileName", "") or ""
+                    if fname and os.path.normcase(os.path.abspath(fname)) == db_norm:
+                        return proj
+                except Exception:
+                    continue
+        # Fallback: first project
+        return projects(1)
+    except Exception:
+        return app.VBE.VBProjects(1)
+
+
 def invalidate_all_caches():
     """Convenience: clear all 3 caches at once."""
     _vbe_code_cache.clear()
