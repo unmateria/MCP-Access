@@ -17,7 +17,7 @@ from .core import (
     invalidate_object_caches,
 )
 from .constants import (
-    VBE_PREFIX, AC_FORM, AC_REPORT, AC_SAVE_YES,
+    VBE_PREFIX, AC_FORM, AC_REPORT, AC_SAVE_YES, AC_DESIGN, AC_SAVE_NO,
     CONTROL_SEARCH_PROPS,
 )
 from .helpers import text_matches, read_tmp
@@ -44,8 +44,46 @@ def _get_code_module(app: Any, object_type: str, object_name: str) -> Any:
         return cm
     component_name = VBE_PREFIX[object_type] + object_name
     try:
-        project = app.VBE.VBProjects(1)
-        component = project.VBComponents(component_name)
+        # Bug fix: enumerate VBProjects by filename instead of using VBProjects(1).
+        # After decompile+compact, VBProjects(1) may return the acwzmain (Access
+        # Wizard library) project instead of the database project, causing
+        # "Can't perform operation since the project is protected".
+        project = None
+        db_path_lower = (_Session._db_open or "").lower()
+        try:
+            for i in range(1, app.VBE.VBProjects.Count + 1):
+                proj = app.VBE.VBProjects(i)
+                try:
+                    if proj.FileName.lower() == db_path_lower:
+                        project = proj
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        if project is None:
+            project = app.VBE.VBProjects(1)  # fallback
+
+        # Bug fix: after decompile, form/report code modules are not loaded into
+        # VBProject until the object is opened in Design view. Detect "subscript
+        # out of range" and retry after opening in Design view.
+        try:
+            component = project.VBComponents(component_name)
+        except Exception as load_exc:
+            if object_type in ("form", "report") and "subscript out of range" in str(load_exc).lower():
+                ac_obj_type = AC_FORM if object_type == "form" else AC_REPORT
+                try:
+                    if object_type == "form":
+                        app.DoCmd.OpenForm(object_name, AC_DESIGN)
+                    else:
+                        app.DoCmd.OpenReport(object_name, AC_DESIGN)
+                except Exception:
+                    pass
+                component = project.VBComponents(component_name)  # retry
+                app.DoCmd.Close(ac_obj_type, object_name, AC_SAVE_NO)
+            else:
+                raise
+
         cm = component.CodeModule
         _Session._cm_cache[cache_key] = cm
         return cm
@@ -150,6 +188,27 @@ def _check_module_health(cm: Any, cache_key: str, expected_total: int = 0) -> li
     return warnings
 
 
+def _proc_bounds(cm: Any, proc_name: str) -> tuple[int, int]:
+    """
+    Returns (start_line, count) for a named procedure, trying Sub/Function kind (0)
+    first and Property kind (3) as fallback. Raises RuntimeError if not found.
+
+    Bug fix: ProcStartLine(name, 0) fails for Property Get/Let/Set because
+    VBE uses vbext_pk_Property (3) for those — not vbext_pk_Proc (0).
+    """
+    for kind in (0, 3):
+        try:
+            start = cm.ProcStartLine(proc_name, kind)
+            count = cm.ProcCountLines(proc_name, kind)
+            return start, count
+        except Exception:
+            continue
+    raise RuntimeError(
+        f"Procedure '{proc_name}' not found "
+        f"(tried Sub/Function kind=0 and Property kind=3)"
+    )
+
+
 def _ws_normalized_match(proc_code: str, find_text: str) -> tuple[int, int] | None:
     """
     Whitespace-tolerant matching: strips leading whitespace from each line
@@ -249,13 +308,14 @@ def ac_vbe_get_proc(
     app = _Session.connect(db_path)
     cm = _get_code_module(app, object_type, object_name)
     try:
-        start = cm.ProcStartLine(proc_name, 0)   # 0 = vbext_pk_Proc (COM call — fast)
-        body  = cm.ProcBodyLine(proc_name, 0)
-        count = cm.ProcCountLines(proc_name, 0)
-    except Exception as exc:
-        raise RuntimeError(
-            f"Procedure '{proc_name}' not found in '{object_name}': {exc}"
-        )
+        start, count = _proc_bounds(cm, proc_name)
+        # ProcBodyLine uses the same kind — try 0 then 3 to match _proc_bounds
+        try:
+            body = cm.ProcBodyLine(proc_name, 0)
+        except Exception:
+            body = cm.ProcBodyLine(proc_name, 3)
+    except RuntimeError as exc:
+        raise RuntimeError(f"Procedure '{proc_name}' not found in '{object_name}': {exc}") from exc
     # Extract text from cache instead of an extra cm.Lines call
     cache_key = f"{object_type}:{object_name}"
     all_lines = _cm_all_code(cm, cache_key).splitlines()
@@ -297,9 +357,11 @@ def ac_vbe_module_info(
                     continue
                 seen.add(pname)
                 try:
-                    pstart = cm.ProcStartLine(pname, 0)
-                    body   = cm.ProcBodyLine(pname, 0)
-                    pcount = cm.ProcCountLines(pname, 0)
+                    pstart, pcount = _proc_bounds(cm, pname)
+                    try:
+                        body = cm.ProcBodyLine(pname, 0)
+                    except Exception:
+                        body = cm.ProcBodyLine(pname, 3)
                     # Clamp count to not exceed total_lines
                     pcount = min(pcount, total - pstart + 1)
                     procs.append({"name": pname, "start_line": pstart,
@@ -469,13 +531,12 @@ def ac_vbe_find(
     search_end = len(all_code.splitlines())
     if proc_name:
         try:
-            search_start = cm.ProcStartLine(proc_name, 0)
-            proc_count = cm.ProcCountLines(proc_name, 0)
+            search_start, proc_count = _proc_bounds(cm, proc_name)
             search_end = min(search_start + proc_count - 1, search_end)
-        except Exception as exc:
+        except RuntimeError as exc:
             raise RuntimeError(
                 f"Procedure '{proc_name}' not found in '{object_name}': {exc}"
-            )
+            ) from exc
 
     matches: list[dict] = []
     lines = all_code.splitlines()
@@ -704,12 +765,9 @@ def ac_vbe_replace_proc(
 
     cm = _get_code_module(app, object_type, object_name)
     try:
-        start = cm.ProcStartLine(proc_name, 0)
-        count = cm.ProcCountLines(proc_name, 0)
-    except Exception as exc:
-        raise RuntimeError(
-            f"Procedure '{proc_name}' not found in '{object_name}': {exc}"
-        )
+        start, count = _proc_bounds(cm, proc_name)
+    except RuntimeError as exc:
+        raise RuntimeError(f"Procedure '{proc_name}' not found in '{object_name}': {exc}") from exc
     # Clamp count to actual module total (ProcCountLines can inflate the last proc)
     total = cm.CountOfLines
     count = min(count, total - start + 1)
@@ -785,12 +843,9 @@ def ac_vbe_patch_proc(
 
     cm = _get_code_module(app, object_type, object_name)
     try:
-        start = cm.ProcStartLine(proc_name, 0)
-        count = cm.ProcCountLines(proc_name, 0)
-    except Exception as exc:
-        raise RuntimeError(
-            f"Procedure '{proc_name}' not found in '{object_name}': {exc}"
-        )
+        start, count = _proc_bounds(cm, proc_name)
+    except RuntimeError as exc:
+        raise RuntimeError(f"Procedure '{proc_name}' not found in '{object_name}': {exc}") from exc
     total = cm.CountOfLines
     count = min(count, total - start + 1)
 
