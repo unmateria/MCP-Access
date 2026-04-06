@@ -93,9 +93,22 @@ def ac_decompile_compact(db_path: str) -> dict:
 
     original_size = os.path.getsize(resolved)
 
-    # 1. Close COM session and release the file completely
+    # 1. Close COM session and release the file completely.
+    # Before quitting, temporarily clear StartupForm so the /decompile subprocess
+    # opens the database without invoking any startup form or wizard.
+    # SHIFT simulation alone is unreliable for a separate CREATE_NEW_PROCESS_GROUP
+    # process — Access may check GetKeyState before the injected event is visible.
+    startup_form_backup = None
     try:
         app = _Session.connect(resolved)
+        try:
+            startup_form_backup = app.GetOption("Startup Form")
+            if startup_form_backup:
+                app.SetOption("Startup Form", "")
+                log.info("Cleared StartupForm for /decompile (was %r)", startup_form_backup)
+        except Exception as e:
+            log.warning("Could not clear StartupForm before /decompile: %s", e)
+            startup_form_backup = None
         try:
             app.CloseCurrentDatabase()
         except Exception:
@@ -162,6 +175,13 @@ def ac_decompile_compact(db_path: str) -> dict:
         app2.RunCommand(137)  # acCmdCompileAllModules = 137
     except Exception:
         pass  # compiling is not critical for the compact
+    # Restore StartupForm now that /decompile is done
+    if startup_form_backup:
+        try:
+            app2.SetOption("Startup Form", startup_form_backup)
+            log.info("Restored StartupForm to %r", startup_form_backup)
+        except Exception as e:
+            log.warning("Could not restore StartupForm: %s", e)
     try:
         app2.CloseCurrentDatabase()
     except Exception:
