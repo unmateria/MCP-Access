@@ -178,13 +178,33 @@ class _Session:
             [msaccess, path, "/decompile"],
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
         )
-        time.sleep(3)
+
+        # Polling loop: 16 × 0.5s = 8s total.  Release SHIFT at ~3s mark
+        # and poll for any blocking dialogs (wizards, recovery prompts)
+        # via _dismiss_dialogs_by_pid.  Breaks early if the subprocess
+        # exits on its own.
+        for i in range(16):
+            if i == 6 and shift_held:  # ~3s mark
+                try:
+                    _kbd(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0)
+                except Exception:
+                    pass
+                shift_held = False
+            if proc.poll() is not None:
+                break  # subprocess already exited
+            try:
+                from .vba_exec import _dismiss_dialogs_by_pid  # lazy — circular
+                _dismiss_dialogs_by_pid(proc.pid)
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+        # Ensure SHIFT released even on early exit
         if shift_held:
             try:
                 _kbd(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0)
             except Exception:
                 pass
-        time.sleep(5)  # total ~8s for /decompile to finish
         try:
             subprocess.run(
                 ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
@@ -240,49 +260,40 @@ class _Session:
         except Exception:
             log.warning("Could not simulate Shift — AutoExec may run")
 
-        # Run OpenCurrentDatabase in THIS thread (COM worker) with a watchdog
-        # in a separate thread to dismiss blocking dialogs after 10s.
+        # Capture Access hwnd on THIS thread (COM worker — same apartment
+        # that created _app).  COM STA proxies cannot be accessed from the
+        # watchdog thread, so we must resolve hwnd here before spawning it.
+        try:
+            _h = cls._app.hWndAccessApp
+            access_hwnd = int(_h() if callable(_h) else _h)
+        except Exception as e_hwnd:
+            log.warning("Could not capture Access hwnd for watchdog: %s", e_hwnd)
+            access_hwnd = 0
+
+        # Polling watchdog: after a 2s grace period, poll every 0.5s and
+        # dismiss any dialog via proper button click (Cancel first — NEVER
+        # VK_RETURN, which would advance wizards and create stray objects).
         _open_done = threading.Event()
-        _dialog_info: list = []  # [screenshot_path] if watchdog triggered
+        _dialog_screenshots: list = []
 
         def _watchdog():
-            """If open takes >10s, screenshot + dismiss dialog with Enter."""
-            if _open_done.wait(10):
-                return  # Completed within 10s, no action needed
-            log.warning("OpenCurrentDatabase blocked >10s — checking for dialog")
-            try:
-                _h = cls._app.hWndAccessApp
-                hwnd = int(_h() if callable(_h) else _h)
-                # Try to capture screenshot
-                try:
-                    from .ui import _capture_window
-                    img, _, _ = _capture_window(hwnd, max_width=960)
-                    import tempfile
-                    from datetime import datetime
-                    screenshot_path = os.path.join(
-                        tempfile.gettempdir(),
-                        f"access_blocked_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-                    )
-                    img.save(screenshot_path)
-                    log.warning("Blocking dialog screenshot saved: %s", screenshot_path)
-                    _dialog_info.append(screenshot_path)
-                except Exception as e2:
-                    log.warning("Could not capture screenshot: %s", e2)
-
-                # Dismiss dialog: press Enter (accepts default button)
-                fg = ctypes.windll.user32.GetForegroundWindow()
-                if fg and fg != hwnd:
-                    log.info("Sending Enter to dismiss dialog (hwnd=%s)", fg)
-                    ctypes.windll.user32.PostMessageW(fg, 0x0100, 0x0D, 0)  # WM_KEYDOWN VK_RETURN
-                    time.sleep(0.1)
-                    ctypes.windll.user32.PostMessageW(fg, 0x0101, 0x0D, 0)  # WM_KEYUP VK_RETURN
-                else:
-                    log.info("Sending Enter to Access main window")
-                    ctypes.windll.user32.PostMessageW(hwnd, 0x0100, 0x0D, 0)
-                    time.sleep(0.1)
-                    ctypes.windll.user32.PostMessageW(hwnd, 0x0101, 0x0D, 0)
-            except Exception as e3:
-                log.warning("Watchdog error: %s", e3)
+            # Lazy import to avoid circular dependency with vba_exec
+            from .vba_exec import _dismiss_access_dialogs
+            # Grace period — normal opens complete in <2s
+            if _open_done.wait(2):
+                return
+            log.warning("OpenCurrentDatabase blocked >2s — polling for dialogs")
+            while not _open_done.is_set():
+                if access_hwnd:
+                    try:
+                        if _dismiss_access_dialogs(
+                            access_hwnd,
+                            _dialog_screenshots if not _dialog_screenshots else None,
+                        ):
+                            log.warning("Dialog dismissed during OpenCurrentDatabase")
+                    except Exception as e_wd:
+                        log.warning("Watchdog dismiss error: %s", e_wd)
+                _open_done.wait(0.5)
 
         watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
         watchdog_thread.start()
@@ -305,8 +316,9 @@ class _Session:
                 except Exception:
                     pass
 
-        if _dialog_info:
-            log.warning("A blocking dialog was auto-dismissed. Screenshot: %s", _dialog_info[0])
+        if _dialog_screenshots:
+            log.warning("A blocking dialog was auto-dismissed. Screenshot: %s",
+                        _dialog_screenshots[0])
 
         cls._db_open = path
 
@@ -349,6 +361,35 @@ class _Session:
 
 
 atexit.register(_Session.quit)
+
+
+def _get_vb_project(app):
+    """Return the VBProject that belongs to the current database.
+
+    ``app.VBE.VBProjects(1)`` may return the wrong project (e.g. the
+    ``acwzmain`` wizard library) after a decompile+compact cycle.  This
+    helper enumerates all loaded VBProjects and picks the one whose
+    ``.FileName`` matches ``_Session._db_open``.  Falls back to index 1
+    if no match is found (single-project scenario).
+    """
+    db_path = _Session._db_open
+    try:
+        projects = app.VBE.VBProjects
+        count = projects.Count
+        if db_path:
+            db_norm = os.path.normcase(os.path.abspath(db_path))
+            for i in range(1, count + 1):
+                try:
+                    proj = projects(i)
+                    fname = getattr(proj, "FileName", "") or ""
+                    if fname and os.path.normcase(os.path.abspath(fname)) == db_norm:
+                        return proj
+                except Exception:
+                    continue
+        # Fallback: first project
+        return projects(1)
+    except Exception:
+        return app.VBE.VBProjects(1)
 
 
 def invalidate_all_caches():

@@ -10,7 +10,7 @@ import threading
 import time
 from typing import Any, Optional
 
-from .core import _Session, log
+from .core import _Session, _get_vb_project, log
 
 
 # ---------------------------------------------------------------------------
@@ -58,32 +58,41 @@ def _invoke_app_run(app, procedure: str, call_args: list):
 # Dialog dismissal helpers
 # ---------------------------------------------------------------------------
 
-def _dismiss_access_dialogs(hwnd_access: int, screenshot_holder: Optional[list] = None) -> bool:
-    """Dismiss modal dialogs owned by the Access process.
+# Button priority for dialog dismissal.  CANCEL is first so wizards are
+# cancelled (not advanced — pressing Enter on a "Create Report Wizard"
+# dialog would click "Next >" and create stray Report1 objects).
+# END is kept in the list to preserve existing behaviour for VBA runtime
+# error dialogs which have no Cancel button.
+_BUTTON_PRIORITY = (
+    "cancel", "cancelar",
+    "end", "finalizar",
+    "ok", "aceptar",
+)
 
-    Uses process-ID matching (not just owner hwnd) to also catch VBE-owned
-    dialogs.  Tries clicking End/OK/Finalizar buttons first (more reliable
-    for VBA runtime-error dialogs), then falls back to WM_CLOSE.
+
+def _dismiss_dialogs_by_pid(pid: int, screenshot_holder: Optional[list] = None) -> bool:
+    """Dismiss modal dialogs owned by a process ID.
+
+    Matches any window where class == '#32770' OR the title contains
+    'wizard' / 'asistente' (catches non-standard wizard windows that do
+    not use the #32770 class).  Used during /decompile subprocess where
+    we have a PID but no COM Application object.
     Returns True if any dialog was found and dismissed.
     """
     import win32gui
     import win32process
-
-    try:
-        _, access_pid = win32process.GetWindowThreadProcessId(hwnd_access)
-    except Exception:
-        return False
 
     found = []
     def _cb(hwnd, found):
         try:
             if not win32gui.IsWindowVisible(hwnd):
                 return True
-            _, pid = win32process.GetWindowThreadProcessId(hwnd)
-            if pid != access_pid:
+            _, wpid = win32process.GetWindowThreadProcessId(hwnd)
+            if wpid != pid:
                 return True
             cls = win32gui.GetClassName(hwnd)
-            if cls == '#32770':
+            title = (win32gui.GetWindowText(hwnd) or "").lower()
+            if cls == '#32770' or "wizard" in title or "asistente" in title:
                 found.append(hwnd)
         except Exception:
             pass
@@ -103,8 +112,11 @@ def _dismiss_access_dialogs(hwnd_access: int, screenshot_holder: Optional[list] 
             # Lazy import to avoid circular dependency
             from .ui import _capture_window
             img, _, _ = _capture_window(found[0], max_width=800)
+            prefix = "access_dialog"
+            # Callers that hand in a holder can signal a custom prefix by
+            # pre-seeding the list with a string starting with "prefix:".
             path = os.path.join(tempfile.gettempdir(),
-                                f"access_dialog_{int(time.time())}.png")
+                                f"{prefix}_{int(time.time())}.png")
             img.save(path)
             screenshot_holder.append(path)
         except Exception:
@@ -122,21 +134,44 @@ def _dismiss_access_dialogs(hwnd_access: int, screenshot_holder: Optional[list] 
     return True
 
 
+def _dismiss_access_dialogs(hwnd_access: int, screenshot_holder: Optional[list] = None) -> bool:
+    """Dismiss modal dialogs owned by the Access process.
+
+    Thin wrapper around `_dismiss_dialogs_by_pid`: resolves the PID of the
+    window and delegates.  Preserves backward compatibility with all
+    existing callers (`ac_run_vba`, `_dialog_watchdog`, `_compile_dialog_watchdog`).
+    """
+    import win32process
+    try:
+        _, pid = win32process.GetWindowThreadProcessId(hwnd_access)
+    except Exception:
+        return False
+    return _dismiss_dialogs_by_pid(pid, screenshot_holder)
+
+
 def _try_click_button(dialog_hwnd: int):
-    """Find and click End/OK/Finalizar/Aceptar button in a dialog."""
+    """Find and click a button in a dialog, preferring Cancel over End/OK.
+
+    Uses a two-pass approach:
+    1. EnumChildWindows to collect every Button-class child with its text.
+    2. Iterate _BUTTON_PRIORITY and click the first matching button.
+
+    Cancel-first priority makes wizards safe to dismiss (pressing their
+    default button would advance the wizard and create stray objects).
+    Runtime-error dialogs (no Cancel button) fall through to End, which
+    preserves the existing `ac_run_vba` behaviour.
+    """
     import win32gui
 
-    target_texts = {"end", "finalizar", "ok", "aceptar",
-                    "&end", "&finalizar", "&ok", "&aceptar"}
-    found_btn = [None]
+    buttons: list[tuple[int, str]] = []
 
     def _cb(hwnd, _):
         try:
             if win32gui.GetClassName(hwnd) == 'Button':
-                text = win32gui.GetWindowText(hwnd).lower().strip()
-                if text in target_texts or text.lstrip('&') in target_texts:
-                    found_btn[0] = hwnd
-                    return False
+                text = (win32gui.GetWindowText(hwnd) or "").lower().strip()
+                # Strip accelerator marker (&)
+                text = text.lstrip('&').replace('&', '')
+                buttons.append((hwnd, text))
         except Exception:
             pass
         return True
@@ -146,11 +181,15 @@ def _try_click_button(dialog_hwnd: int):
     except Exception:
         pass
 
-    if found_btn[0]:
-        try:
-            win32gui.PostMessage(found_btn[0], 0x00F5, 0, 0)  # BM_CLICK
-        except Exception:
-            pass
+    # Second pass: iterate priority list, click the first match
+    for target in _BUTTON_PRIORITY:
+        for btn_hwnd, btn_text in buttons:
+            if btn_text == target:
+                try:
+                    win32gui.PostMessage(btn_hwnd, 0x00F5, 0, 0)  # BM_CLICK
+                except Exception:
+                    pass
+                return
 
 
 def _dialog_watchdog(hwnd_access: int, stop_event: threading.Event,
@@ -283,7 +322,7 @@ def _invoke_app_eval(app, expression: str):
 
 def _eval_via_temp_module(app, expression: str, original_exc: Exception):
     """Fallback: create temp standard module with wrapper function, run it, clean up."""
-    proj = app.VBE.VBProjects(1)
+    proj = _get_vb_project(app)
     comp = None
     try:
         # Create temp standard module (type 1 = vbext_ct_StdModule)

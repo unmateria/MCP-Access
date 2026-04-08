@@ -186,6 +186,96 @@ def _split_code_behind(code: str) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Class module header injection (for ac_set_code object_type="class_module")
+# ---------------------------------------------------------------------------
+#
+# Access distinguishes class vs standard modules in LoadFromText by the
+# presence of the four Attribute VB_* lines (VB_GlobalNameSpace, VB_Creatable,
+# VB_PredeclaredId, VB_Exposed) at the top of the text -- NOT by a
+# "VERSION 1.0 CLASS" header.  That header is the format used by
+# VBComponent.Export / VBComponents.Import (a different mechanism).  If
+# LoadFromText receives text starting with "VERSION 1.0 CLASS", Access
+# interprets those lines as literal VBA code and creates a *standard*
+# module with garbage at the top.  Tested against Access 2016 on
+# production DB 2026-04-08 — Type=2 only when the 4 attributes are present.
+
+_VB_ATTR_RE = re.compile(r"^\s*Attribute\s+VB_GlobalNameSpace\s*=", re.IGNORECASE)
+# Also detect the legacy (wrong) VERSION header so callers can't accidentally
+# hand us a VBComponent.Export-style file — we'd strip it below.
+_VERSION_CLASS_RE = re.compile(r"^\s*VERSION\s+\d+\.\d+\s+CLASS\s*$", re.IGNORECASE)
+
+
+def _ensure_class_module_header(code: str, name: str) -> str:
+    """Prepend the four Attribute VB_* lines if missing (class module marker).
+
+    `Application.LoadFromText(acModule=5)` decides class vs standard by the
+    presence of these four attribute lines at the top of the file:
+        Attribute VB_GlobalNameSpace = False
+        Attribute VB_Creatable = False
+        Attribute VB_PredeclaredId = False
+        Attribute VB_Exposed = False
+
+    This helper:
+      - strips a leading BOM (if any),
+      - strips any `VERSION 1.0 CLASS` / `BEGIN` / `MultiUse` / `END` /
+        `Attribute VB_Name = "..."` block that the user may have pasted from
+        a VBComponent.Export file (wrong format for LoadFromText),
+      - if `Attribute VB_GlobalNameSpace` is already present in the first
+        handful of non-blank lines, returns code unchanged (round-trip safe),
+      - otherwise prepends the 4 attribute lines,
+      - normalises the body's line endings to CRLF.
+    """
+    if code.startswith("\ufeff"):
+        code = code.lstrip("\ufeff")
+
+    # Strip VBComponent.Export header block if present (wrong format; Access
+    # would interpret these lines as VBA code).  We scan at most 8 lines.
+    lines = code.splitlines()
+    if lines and _VERSION_CLASS_RE.match(lines[0] or ""):
+        # Skip until we see either "END" (end of BEGIN block) or the first
+        # Attribute VB_Name line (which we also strip — LoadFromText takes
+        # the name as a parameter, Attribute VB_Name in the text is ignored
+        # or conflicts).
+        idx = 0
+        saw_end = False
+        for i, ln in enumerate(lines[:8]):
+            stripped = ln.strip()
+            if stripped.upper() == "END":
+                saw_end = True
+                idx = i + 1
+                break
+        if saw_end:
+            lines = lines[idx:]
+            # Also strip a leading Attribute VB_Name = "..." if present
+            while lines and re.match(r'^\s*Attribute\s+VB_Name\s*=', lines[0], re.IGNORECASE):
+                lines = lines[1:]
+        code = "\n".join(lines)
+
+    # Check if the 4 Attribute VB_* lines are already present at top
+    first_lines = [ln for ln in code.splitlines()[:10] if ln.strip()]
+    if any(_VB_ATTR_RE.match(ln) for ln in first_lines):
+        # Normalise endings, return unchanged header-wise
+        body = code.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+        if body and not body.endswith("\r\n"):
+            body += "\r\n"
+        return body
+
+    header = (
+        "Attribute VB_GlobalNameSpace = False\r\n"
+        "Attribute VB_Creatable = False\r\n"
+        "Attribute VB_PredeclaredId = False\r\n"
+        "Attribute VB_Exposed = False\r\n"
+    )
+
+    # Normalise body to CRLF and ensure trailing newline
+    body = code.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+    if body and not body.endswith("\r\n"):
+        body += "\r\n"
+
+    return header + body
+
+
+# ---------------------------------------------------------------------------
 # Inject VBA after import
 # ---------------------------------------------------------------------------
 
@@ -258,11 +348,17 @@ def ac_set_code(db_path: str, object_type: str, name: str, code: str) -> str:
     If the code contains a CodeBehindForm/CodeBehindReport section, it is automatically
     split: first the form/report is imported without VBA, then the VBA code is injected
     via VBE (avoiding encoding issues with LoadFromText).
+
+    object_type='class_module' creates a VBA class module: the canonical
+    `VERSION 1.0 CLASS` header is prepended automatically if missing.
     """
-    if object_type not in AC_TYPE:
+    valid_types = set(AC_TYPE) | {"class_module"}
+    if object_type not in valid_types:
         raise ValueError(
-            f"Invalid object_type '{object_type}'. Valid: {list(AC_TYPE)}"
+            f"Invalid object_type '{object_type}'. Valid: {sorted(valid_types)}"
         )
+    # class_module re-uses acModule (5) but with a different text header
+    _ac_type_code = AC_TYPE["module"] if object_type == "class_module" else AC_TYPE[object_type]
     app = _Session.connect(db_path)
 
     # Split CodeBehindForm/CodeBehindReport if present
@@ -281,13 +377,17 @@ def ac_set_code(db_path: str, object_type: str, name: str, code: str) -> str:
         log.info("ac_set_code: restoring binary sections for '%s'", name)
         code = restore_binary_sections(app, object_type, name, code)
 
+    # Ensure class module header is present (no-op if already there)
+    if object_type == "class_module":
+        code = _ensure_class_module_header(code, name)
+
     # Backup existing object in case import fails
     backup_tmp = None
-    if object_type in ("form", "report", "module"):
+    if object_type in ("form", "report", "module", "class_module"):
         try:
             fd_bk, backup_tmp = tempfile.mkstemp(suffix=".txt", prefix="access_mcp_bk_")
             os.close(fd_bk)
-            app.SaveAsText(AC_TYPE[object_type], name, backup_tmp)
+            app.SaveAsText(_ac_type_code, name, backup_tmp)
         except Exception:
             # Doesn't exist yet — no backup needed
             if backup_tmp:
@@ -300,23 +400,28 @@ def ac_set_code(db_path: str, object_type: str, name: str, code: str) -> str:
     fd, tmp = tempfile.mkstemp(suffix=".txt", prefix="access_mcp_")
     os.close(fd)
     try:
-        # VBA modules (.bas) expect ANSI/cp1252; forms/reports/queries/macros expect UTF-16LE with BOM
-        enc = "cp1252" if object_type == "module" else "utf-16"
+        # VBA modules (.bas and class modules) expect ANSI/cp1252;
+        # forms/reports/queries/macros expect UTF-16LE with BOM
+        enc = "cp1252" if object_type in ("module", "class_module") else "utf-16"
         write_tmp(tmp, code, encoding=enc)
         try:
-            app.LoadFromText(AC_TYPE[object_type], name, tmp)
+            app.LoadFromText(_ac_type_code, name, tmp)
         except Exception as import_exc:
             # Restaurar backup si existe
             if backup_tmp and os.path.exists(backup_tmp):
                 log.warning("ac_set_code: import failed, restoring backup for '%s'", name)
                 try:
-                    app.LoadFromText(AC_TYPE[object_type], name, backup_tmp)
+                    app.LoadFromText(_ac_type_code, name, backup_tmp)
                 except Exception:
                     log.error("ac_set_code: could not restore backup for '%s'", name)
             raise import_exc
 
-        # Invalidate caches for this object (code and controls changed)
+        # Invalidate caches for this object (code and controls changed).
+        # class_module also aliases the "module" key because access_get_code
+        # and _get_code_module read via the "module" key for all .bas modules.
         invalidate_object_caches(object_type, name)
+        if object_type == "class_module":
+            invalidate_object_caches("module", name)
 
         # Inject VBA if there was CodeBehindForm
         vba_msg = ""

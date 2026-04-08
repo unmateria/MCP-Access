@@ -3,9 +3,70 @@ Compact and repair operations.
 """
 
 import os
+import threading
 from pathlib import Path
 
 from .core import _Session, _vbe_code_cache, _parsed_controls_cache, log
+
+
+# ---------------------------------------------------------------------------
+# CompactRepair watchdog -- polls for blocking dialogs (wizards, recovery
+# prompts, ODBC credential prompts) while CompactRepair runs, and dismisses
+# them via proper button click (Cancel first — never VK_RETURN).
+# ---------------------------------------------------------------------------
+
+def _call_with_dialog_watchdog(app, label: str, callable_fn) -> None:
+    """Run a blocking COM call with a polling dialog-dismiss watchdog.
+
+    Captures the Access hwnd on the caller (COM STA) thread, spawns a daemon
+    thread that polls every 0.5s after a 1s grace period, and dismisses any
+    Access-owned dialog via `_dismiss_access_dialogs` (which now uses the
+    Cancel-first button priority and wizard-title detection).
+
+    Used around any COM call that could block on an unexpected dialog:
+    `CompactRepair`, `RunCommand`, etc.  `label` is used in log messages.
+    """
+    # Lazy import to avoid circular dependency with vba_exec
+    from .vba_exec import _dismiss_access_dialogs
+
+    # Capture hwnd on the COM-worker thread (same apartment as `app`)
+    try:
+        _h = app.hWndAccessApp
+        hwnd = int(_h() if callable(_h) else _h)
+    except Exception as e_hwnd:
+        log.warning("Could not capture Access hwnd for %s watchdog: %s", label, e_hwnd)
+        hwnd = 0
+
+    stop_event = threading.Event()
+    dismissed: list = []
+
+    def _watchdog():
+        if stop_event.wait(1.0):  # 1s grace period
+            return
+        while not stop_event.is_set():
+            if hwnd:
+                try:
+                    if _dismiss_access_dialogs(hwnd):
+                        if not dismissed:
+                            log.warning("Dialog dismissed during %s", label)
+                        dismissed.append(True)
+                except Exception as e_wd:
+                    log.warning("%s watchdog error: %s", label, e_wd)
+            stop_event.wait(0.5)
+
+    watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
+    watchdog_thread.start()
+    try:
+        callable_fn()
+    finally:
+        stop_event.set()
+
+
+def _compact_with_watchdog(app, src: str, dst: str) -> None:
+    """Call app.CompactRepair(src, dst) with a polling dialog watchdog.
+    Thin wrapper around `_call_with_dialog_watchdog`.
+    """
+    _call_with_dialog_watchdog(app, "CompactRepair", lambda: app.CompactRepair(src, dst))
 
 
 def ac_compact_repair(db_path: str) -> dict:
@@ -36,7 +97,7 @@ def ac_compact_repair(db_path: str) -> dict:
                 os.unlink(p)
 
         try:
-            app.CompactRepair(resolved, tmp_path)
+            _compact_with_watchdog(app, resolved, tmp_path)
         except Exception as exc:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
@@ -138,14 +199,32 @@ def ac_decompile_compact(db_path: str) -> dict:
         [msaccess, resolved, "/decompile"],
         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
     )
-    # Access opens the DB in decompiled state and stays open -- wait and kill
-    time.sleep(3)  # Wait for Access to read key state during startup
-    if shift_held:
+
+    # Polling loop: 16 × 0.5s = 8s total.  Release SHIFT at the ~3s mark,
+    # and poll for any blocking dialogs (wizards, recovery prompts) via
+    # _dismiss_dialogs_by_pid on the subprocess PID.
+    from .vba_exec import _dismiss_dialogs_by_pid
+    for i in range(16):
+        if i == 6 and shift_held:  # ~3s mark
+            try:
+                _kbd(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0)  # Release SHIFT
+            except Exception:
+                pass
+            shift_held = False
+        if proc.poll() is not None:
+            break
         try:
-            _kbd(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0)  # Release SHIFT
+            _dismiss_dialogs_by_pid(proc.pid)
         except Exception:
             pass
-    time.sleep(5)  # Remaining wait before kill (total ~8s)
+        time.sleep(0.5)
+
+    # Ensure SHIFT released even on early exit
+    if shift_held:
+        try:
+            _kbd(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0)
+        except Exception:
+            pass
     try:
         subprocess.run(
             ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
@@ -158,8 +237,19 @@ def ac_decompile_compact(db_path: str) -> dict:
 
     # 3. Reabrir via COM y recompilar VBA
     app2 = _Session.connect(resolved)
+    # v0.7.22 BUG FIX: 137 = acCmdNewObjectReport (opens Report Wizard!),
+    # NOT acCmdCompileAllModules.  Correct values per Microsoft docs:
+    #   acCmdCompileAllModules        = 125
+    #   acCmdCompileAndSaveAllModules = 126
+    # Every call to ac_decompile_compact was silently launching the Report
+    # Wizard and blocking the COM thread indefinitely.  This is the root
+    # cause of the wizard hang reported by @CaptainStormfield + @unmateria.
+    # Defence-in-depth: also wrap in the dialog watchdog so any future
+    # unexpected dialog during compile is dismissed automatically.
     try:
-        app2.RunCommand(137)  # acCmdCompileAllModules = 137
+        _call_with_dialog_watchdog(
+            app2, "RunCommand(compile)", lambda: app2.RunCommand(126)
+        )  # acCmdCompileAndSaveAllModules
     except Exception:
         pass  # compiling is not critical for the compact
     try:
@@ -181,7 +271,7 @@ def ac_decompile_compact(db_path: str) -> dict:
             os.unlink(p)
 
     try:
-        app2.CompactRepair(resolved, tmp_path)
+        _compact_with_watchdog(app2, resolved, tmp_path)
     except Exception as exc:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)

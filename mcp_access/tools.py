@@ -44,13 +44,15 @@ TOOLS = [
             "Imports code into the database. Overwrites if exists, creates if not. "
             "Call access_get_code first to read the original. "
             "For forms/reports: supports CodeBehindForm/CodeBehindReport (VBA is injected via VBE). "
+            "For object_type='class_module': creates a VBA class module "
+            "(adds VERSION 1.0 CLASS header automatically if missing). "
             "Automatic backup and restore on import failure."
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 "db_path": {"type": "string", "description": "Path to .accdb/.mdb file"},
-                "object_type": {"type": "string", "enum": ["module", "form", "report", "query", "macro"]},
+                "object_type": {"type": "string", "enum": ["module", "class_module", "form", "report", "query", "macro"]},
                 "object_name": {"type": "string", "description": "Object name"},
                 "code": {"type": "string", "description": "Full object content"},
             },
