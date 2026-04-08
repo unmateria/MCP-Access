@@ -14,13 +14,55 @@ from typing import Any
 
 from .core import (
     AC_TYPE, _Session, _vbe_code_cache, _parsed_controls_cache, log,
-    invalidate_object_caches,
+    invalidate_object_caches, _get_vb_project,
 )
 from .constants import (
-    VBE_PREFIX, AC_FORM, AC_REPORT, AC_SAVE_YES,
+    VBE_PREFIX, AC_FORM, AC_REPORT, AC_SAVE_YES, AC_DESIGN,
     CONTROL_SEARCH_PROPS,
 )
 from .helpers import text_matches, read_tmp
+
+
+# ---------------------------------------------------------------------------
+# Property procedure helpers (Bug fix: kind=0 vs kind=3)
+# ---------------------------------------------------------------------------
+# VBE ProcStartLine/ProcBodyLine/ProcCountLines/ProcOfLine require a ``kind``
+# argument: 0 = vbext_pk_Proc (Sub/Function), 3 = vbext_pk_Property
+# (Property Get/Let/Set).  Using the wrong kind raises an error.
+# These helpers try kind=0 first (most common) and fall back to kind=3.
+
+_VBEXT_PK_PROC = 0
+_VBEXT_PK_PROPERTY = 3
+
+
+def _proc_kind(cm, name: str) -> int:
+    """Return the correct VBE ``kind`` constant for *name* (0 or 3)."""
+    try:
+        cm.ProcStartLine(name, _VBEXT_PK_PROC)
+        return _VBEXT_PK_PROC
+    except Exception:
+        cm.ProcStartLine(name, _VBEXT_PK_PROPERTY)  # let it raise if also fails
+        return _VBEXT_PK_PROPERTY
+
+
+def _proc_bounds(cm, name: str):
+    """Return ``(start, body, count, kind)`` for procedure *name*."""
+    kind = _proc_kind(cm, name)
+    start = cm.ProcStartLine(name, kind)
+    body = cm.ProcBodyLine(name, kind)
+    count = cm.ProcCountLines(name, kind)
+    return start, body, count, kind
+
+
+def _proc_of_line(cm, line: int) -> str:
+    """Return the procedure name that owns *line*, or ``""``."""
+    try:
+        return cm.ProcOfLine(line, _VBEXT_PK_PROC)
+    except Exception:
+        try:
+            return cm.ProcOfLine(line, _VBEXT_PK_PROPERTY)
+        except Exception:
+            return ""
 
 
 # ---------------------------------------------------------------------------
@@ -44,18 +86,60 @@ def _get_code_module(app: Any, object_type: str, object_name: str) -> Any:
         return cm
     component_name = VBE_PREFIX[object_type] + object_name
     try:
-        project = app.VBE.VBProjects(1)
+        project = _get_vb_project(app)
         component = project.VBComponents(component_name)
         cm = component.CodeModule
         _Session._cm_cache[cache_key] = cm
         return cm
     except Exception as exc:
-        _Session._cm_cache.pop(cache_key, None)  # invalidate stale cache entry
+        # After decompile+compact, VBComponents may be uninitialised.
+        # Force VBE to recognise the component and retry once.
+        log.info("_get_code_module: first attempt failed for '%s', forcing VBE init: %s",
+                 component_name, exc)
+        try:
+            _force_vbe_init(app, object_type, object_name)
+            project = _get_vb_project(app)
+            component = project.VBComponents(component_name)
+            cm = component.CodeModule
+            _Session._cm_cache[cache_key] = cm
+            log.info("_get_code_module: retry succeeded for '%s'", component_name)
+            return cm
+        except Exception:
+            pass  # fall through to original error
+        _Session._cm_cache.pop(cache_key, None)
         raise RuntimeError(
             f"Could not access CodeModule '{component_name}'. "
             f"Is 'Trust access to the VBA project object model' enabled "
             f"in Access Trust Center settings?\nError: {exc}"
         )
+
+
+def _force_vbe_init(app, object_type: str, object_name: str):
+    """Force VBE to recognise a component after decompile+compact.
+
+    For forms/reports: briefly open in Design view and close — this makes
+    Access load the VBA code-behind so VBComponents can find it.
+    For modules: toggle VBE.MainWindow.Visible to trigger enumeration.
+    """
+    if object_type in ("form", "report"):
+        ac_obj = AC_FORM if object_type == "form" else AC_REPORT
+        try:
+            app.DoCmd.OpenForm(object_name, AC_DESIGN) if object_type == "form" \
+                else app.DoCmd.OpenReport(object_name, AC_DESIGN)
+            app.DoCmd.Close(ac_obj, object_name, AC_SAVE_YES)
+            log.info("_force_vbe_init: opened/closed '%s' in Design view", object_name)
+        except Exception as e:
+            log.warning("_force_vbe_init: open/close failed for '%s': %s", object_name, e)
+    else:
+        try:
+            vbe = app.VBE
+            was_visible = vbe.MainWindow.Visible
+            vbe.MainWindow.Visible = True
+            if not was_visible:
+                vbe.MainWindow.Visible = False
+            log.info("_force_vbe_init: toggled VBE.MainWindow.Visible")
+        except Exception as e:
+            log.warning("_force_vbe_init: VBE toggle failed: %s", e)
 
 
 def _cm_all_code(cm: Any, cache_key: str) -> str:
@@ -249,9 +333,7 @@ def ac_vbe_get_proc(
     app = _Session.connect(db_path)
     cm = _get_code_module(app, object_type, object_name)
     try:
-        start = cm.ProcStartLine(proc_name, 0)   # 0 = vbext_pk_Proc (COM call — fast)
-        body  = cm.ProcBodyLine(proc_name, 0)
-        count = cm.ProcCountLines(proc_name, 0)
+        start, body, count, _kind = _proc_bounds(cm, proc_name)
     except Exception as exc:
         raise RuntimeError(
             f"Procedure '{proc_name}' not found in '{object_name}': {exc}"
@@ -297,9 +379,7 @@ def ac_vbe_module_info(
                     continue
                 seen.add(pname)
                 try:
-                    pstart = cm.ProcStartLine(pname, 0)
-                    body   = cm.ProcBodyLine(pname, 0)
-                    pcount = cm.ProcCountLines(pname, 0)
+                    pstart, body, pcount, _kind = _proc_bounds(cm, pname)
                     # Clamp count to not exceed total_lines
                     pcount = min(pcount, total - pstart + 1)
                     procs.append({"name": pname, "start_line": pstart,
@@ -469,9 +549,9 @@ def ac_vbe_find(
     search_end = len(all_code.splitlines())
     if proc_name:
         try:
-            search_start = cm.ProcStartLine(proc_name, 0)
-            proc_count = cm.ProcCountLines(proc_name, 0)
-            search_end = min(search_start + proc_count - 1, search_end)
+            p_start, _p_body, p_count, _p_kind = _proc_bounds(cm, proc_name)
+            search_start = p_start
+            search_end = min(p_start + p_count - 1, search_end)
         except Exception as exc:
             raise RuntimeError(
                 f"Procedure '{proc_name}' not found in '{object_name}': {exc}"
@@ -484,11 +564,7 @@ def ac_vbe_find(
             continue
         if text_matches(search_text, raw_line, match_case, use_regex):
             # Enrich with owning procedure name
-            owning_proc = ""
-            try:
-                owning_proc = cm.ProcOfLine(i, 0)
-            except Exception:
-                pass  # line outside a proc (Declarations, etc.)
+            owning_proc = _proc_of_line(cm, i)
             matches.append({
                 "line": i, "content": raw_line.rstrip("\r"), "proc": owning_proc,
             })
@@ -704,8 +780,7 @@ def ac_vbe_replace_proc(
 
     cm = _get_code_module(app, object_type, object_name)
     try:
-        start = cm.ProcStartLine(proc_name, 0)
-        count = cm.ProcCountLines(proc_name, 0)
+        start, _body, count, kind = _proc_bounds(cm, proc_name)
     except Exception as exc:
         raise RuntimeError(
             f"Procedure '{proc_name}' not found in '{object_name}': {exc}"
@@ -785,8 +860,7 @@ def ac_vbe_patch_proc(
 
     cm = _get_code_module(app, object_type, object_name)
     try:
-        start = cm.ProcStartLine(proc_name, 0)
-        count = cm.ProcCountLines(proc_name, 0)
+        start, _body, count, kind = _proc_bounds(cm, proc_name)
     except Exception as exc:
         raise RuntimeError(
             f"Procedure '{proc_name}' not found in '{object_name}': {exc}"
@@ -853,7 +927,7 @@ def ac_vbe_patch_proc(
     # Invalidate cache
     _vbe_code_cache.pop(cache_key, None)
     new_total = cm.CountOfLines
-    new_count = cm.ProcCountLines(proc_name, 0) if applied > 0 else 0
+    new_count = cm.ProcCountLines(proc_name, kind) if applied > 0 else 0
     # Health check
     health = _check_module_health(cm, cache_key)
     result = (
