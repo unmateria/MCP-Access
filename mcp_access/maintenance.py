@@ -4,6 +4,7 @@ Compact and repair operations.
 
 import os
 import threading
+import time
 from pathlib import Path
 
 from .core import _Session, _vbe_code_cache, _parsed_controls_cache, log
@@ -232,6 +233,7 @@ def ac_decompile_compact(db_path: str) -> dict:
         )
     except Exception:
         pass
+    time.sleep(1)  # let Windows evict the dead process's ROT entry
 
     decompile_size = os.path.getsize(resolved)
 

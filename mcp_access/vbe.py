@@ -24,30 +24,51 @@ from .helpers import text_matches, read_tmp
 
 
 # ---------------------------------------------------------------------------
-# Property procedure helpers (Bug fix: kind=0 vs kind=3)
+# Property procedure helpers (v0.7.23 — all 4 VBE proc kinds)
 # ---------------------------------------------------------------------------
 # VBE ProcStartLine/ProcBodyLine/ProcCountLines/ProcOfLine require a ``kind``
-# argument: 0 = vbext_pk_Proc (Sub/Function), 3 = vbext_pk_Property
-# (Property Get/Let/Set).  Using the wrong kind raises an error.
-# These helpers try kind=0 first (most common) and fall back to kind=3.
+# argument.  The VBE enum ``vbext_ProcKind`` has four values:
+#   0 = vbext_pk_Proc     (Sub / Function)
+#   1 = vbext_pk_Let      (Property Let)
+#   2 = vbext_pk_Set      (Property Set)
+#   3 = vbext_pk_Get      (Property Get)
+# Prior code only tried kind=0 and kind=3, so Property Let and Property Set
+# were invisible.  We now iterate all four kinds.
 
 _VBEXT_PK_PROC = 0
-_VBEXT_PK_PROPERTY = 3
+_VBEXT_PK_LET = 1
+_VBEXT_PK_SET = 2
+_VBEXT_PK_GET = 3
+_ALL_PROC_KINDS = (0, 1, 2, 3)
+
+# Maps regex-captured keyword → VBE kind for ac_vbe_module_info
+_KEYWORD_TO_KIND: dict[str, int] = {
+    "sub": 0,
+    "function": 0,
+    "property get": 3,
+    "property let": 1,
+    "property set": 2,
+}
 
 
 def _proc_kind(cm, name: str) -> int:
-    """Return the correct VBE ``kind`` constant for *name* (0 or 3)."""
-    try:
-        cm.ProcStartLine(name, _VBEXT_PK_PROC)
-        return _VBEXT_PK_PROC
-    except Exception:
-        cm.ProcStartLine(name, _VBEXT_PK_PROPERTY)  # let it raise if also fails
-        return _VBEXT_PK_PROPERTY
+    """Return the first VBE ``kind`` constant (0–3) for which *name* exists."""
+    for kind in _ALL_PROC_KINDS:
+        try:
+            cm.ProcStartLine(name, kind)
+            return kind
+        except Exception:
+            continue
+    raise RuntimeError(f"Procedure '{name}' not found with any VBE kind (0–3)")
 
 
-def _proc_bounds(cm, name: str):
-    """Return ``(start, body, count, kind)`` for procedure *name*."""
-    kind = _proc_kind(cm, name)
+def _proc_bounds(cm, name: str, kind: int = None):
+    """Return ``(start, body, count, kind)`` for procedure *name*.
+
+    If *kind* is given, uses it directly; otherwise discovers via ``_proc_kind``.
+    """
+    if kind is None:
+        kind = _proc_kind(cm, name)
     start = cm.ProcStartLine(name, kind)
     body = cm.ProcBodyLine(name, kind)
     count = cm.ProcCountLines(name, kind)
@@ -56,13 +77,12 @@ def _proc_bounds(cm, name: str):
 
 def _proc_of_line(cm, line: int) -> str:
     """Return the procedure name that owns *line*, or ``""``."""
-    try:
-        return cm.ProcOfLine(line, _VBEXT_PK_PROC)
-    except Exception:
+    for kind in _ALL_PROC_KINDS:
         try:
-            return cm.ProcOfLine(line, _VBEXT_PK_PROPERTY)
+            return cm.ProcOfLine(line, kind)
         except Exception:
-            return ""
+            continue
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -366,26 +386,41 @@ def ac_vbe_module_info(
     total = len(all_lines)
     procs: list[dict] = []
     if total > 0:
-        seen: set[str] = set()
+        seen: set[tuple[str, str]] = set()  # (name_lower, keyword_lower)
         for i, raw_line in enumerate(all_lines, start=1):
             m = re.match(
                 r'^(?:Public\s+|Private\s+|Friend\s+)?'
-                r'(?:Function|Sub|Property\s+(?:Get|Let|Set))\s+(\w+)',
+                r'(Function|Sub|Property\s+(?:Get|Let|Set))\s+(\w+)',
                 raw_line.strip(), re.IGNORECASE,
             )
             if m:
-                pname = m.group(1)
-                if pname in seen:
+                keyword = m.group(1)   # e.g. "Property Let"
+                pname = m.group(2)
+                dedup_key = (pname.lower(), keyword.lower())
+                if dedup_key in seen:
                     continue
-                seen.add(pname)
+                seen.add(dedup_key)
+                kind = _KEYWORD_TO_KIND.get(keyword.lower())
                 try:
-                    pstart, body, pcount, _kind = _proc_bounds(cm, pname)
+                    pstart, body, pcount, _kind = _proc_bounds(cm, pname, kind=kind)
                     # Clamp count to not exceed total_lines
                     pcount = min(pcount, total - pstart + 1)
-                    procs.append({"name": pname, "start_line": pstart,
-                                  "body_line": body, "count": pcount})
+                    procs.append({"name": pname, "keyword": keyword,
+                                  "start_line": pstart, "body_line": body,
+                                  "count": pcount})
                 except Exception:
-                    procs.append({"name": pname, "start_line": i})
+                    # VBE failed to locate this variant — scan forward
+                    # in the source text for the matching End keyword.
+                    end_kw = ("end property" if keyword.lower().startswith("property")
+                              else f"end {keyword}".lower())
+                    count = 1
+                    for j in range(i - 1, total):  # 0-based scan from declaration
+                        if all_lines[j].strip().lower() == end_kw:
+                            count = (j + 1) - i + 1  # both 1-based, inclusive
+                            break
+                    procs.append({"name": pname, "keyword": keyword,
+                                  "start_line": i, "body_line": i,
+                                  "count": count})
     return {"total_lines": total, "procs": procs}
 
 

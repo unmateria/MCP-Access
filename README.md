@@ -319,6 +319,15 @@ The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/s
 
 ## Changelog
 
+### v0.7.23 — 2026-04-11
+
+**Bug fixes** — thanks to [@CaptainStormfield](https://github.com/CaptainStormfield):
+
+- **Property Let/Set procedures invisible to all VBE tools**: `_proc_kind()` only tried `kind=0` (`vbext_pk_Proc`) and `kind=3` (`vbext_pk_Get`), completely missing `kind=1` (`vbext_pk_Let`) and `kind=2` (`vbext_pk_Set`). Any Let-only or Set-only property (e.g. `Property Let ItemPrefix`) would fail with "Sub or Function not defined". Fix: new `_ALL_PROC_KINDS = (0, 1, 2, 3)` tuple — `_proc_kind()`, `_proc_of_line()`, and all callers now iterate all four VBE proc kinds. The old constant `_VBEXT_PK_PROPERTY = 3` was misleadingly named (3 is specifically `vbext_pk_Get`, not a generic "property" kind) and has been replaced with explicit `_VBEXT_PK_LET = 1`, `_VBEXT_PK_SET = 2`, `_VBEXT_PK_GET = 3`.
+- **`access_vbe_module_info` silently dropped Property Let/Set entries**: The `seen` set deduplicated by procedure name alone, so when `Property Get Foo` was encountered first, `Property Let Foo` with the same name was skipped entirely. Fix: deduplicate by `(name.lower(), keyword.lower())` so Get, Let, and Set variants of the same property are listed as separate entries. Each entry now includes a `"keyword"` field (e.g. `"Property Get"`, `"Property Let"`). A `_KEYWORD_TO_KIND` mapping lets `module_info` pass the correct VBE kind directly to `_proc_bounds()` instead of relying on the blind iteration in `_proc_kind()`.
+- **Fallback for VBE kind-specific lookup failures**: When VBE's `ProcStartLine` fails for a specific kind (Access quirk with certain Let-only or Set-only properties), the old fallback emitted an entry with no `body_line` or `count`. Fix: scans forward in the source text from the declaration line to the matching `End Property`/`End Sub`/`End Function` keyword to derive an accurate count.
+- **Zombie COM object after `ac_decompile_compact`**: After `taskkill /F /T` kills the `/decompile` subprocess, Access doesn't run cleanup code and can leave a stale entry in the Windows Running Object Table (ROT). The subsequent `Dispatch("Access.Application")` in `_Session._launch()` latched onto this dead ROT entry, yielding a zombie COM object that passed the `_app.Visible` health check but failed on any database operation. Fix: replaced `win32com.client.Dispatch` with `win32com.client.DispatchEx` — always creates a fresh instance, bypassing the ROT entirely. Added a 1-second sleep after `taskkill` in both `_Session._decompile()` and `ac_decompile_compact()` as belt-and-suspenders to allow Windows time to evict the dead entry.
+
 ### v0.7.22 — 2026-04-08
 
 **Bug fixes** — thanks to [@CaptainStormfield](https://github.com/CaptainStormfield) and [@unmateria](https://github.com/unmateria) (wizard-during-compact report), and [@TvanStiphout-Home](https://github.com/TvanStiphout-Home) (class module request):

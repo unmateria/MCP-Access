@@ -114,7 +114,7 @@ class _Session:
                 "pywin32 not installed. Run: pip install pywin32"
             )
         log.info("Launching Access.Application...")
-        cls._app = win32com.client.Dispatch("Access.Application")
+        cls._app = win32com.client.DispatchEx("Access.Application")
         try:
             cls._app.Visible = True   # required for VBE to be accessible via COM
         except Exception as e:
@@ -212,6 +212,7 @@ class _Session:
             )
         except Exception:
             pass
+        time.sleep(1)  # let Windows evict the dead process's ROT entry
 
         cls._decompiled_dbs.add(path)
         log.info("Decompile done for %s", path)

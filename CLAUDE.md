@@ -102,13 +102,22 @@ Warnings are appended to the return string, never fail the operation.
 - `ac_vbe_replace_proc` / `ac_vbe_patch_proc`: Strips Option lines only when `start > 5` (proc is not at the top of the module).
 - `_inject_vba_after_import` (code.py + controls.py): Auto-prepends `Option Compare Database` and `Option Explicit` if not present in the first 5 lines of injected VBA.
 
-### Property procedure support (v0.7.21)
-VBE `ProcStartLine`/`ProcBodyLine`/`ProcCountLines`/`ProcOfLine` require a `kind` argument: `0` = `vbext_pk_Proc` (Sub/Function), `3` = `vbext_pk_Property` (Property Get/Let/Set). All call sites previously hardcoded kind=0, so Property procedures were invisible.
+### Property procedure support (v0.7.21, fixed in v0.7.23)
+VBE `ProcStartLine`/`ProcBodyLine`/`ProcCountLines`/`ProcOfLine` require a `kind` argument. The `vbext_ProcKind` enum has four values:
+- `0` = `vbext_pk_Proc` (Sub/Function)
+- `1` = `vbext_pk_Let` (Property Let)
+- `2` = `vbext_pk_Set` (Property Set)
+- `3` = `vbext_pk_Get` (Property Get)
 
-Three helpers in `vbe.py`:
-- `_proc_kind(cm, name)` — tries kind=0, falls back to kind=3
-- `_proc_bounds(cm, name)` → `(start, body, count, kind)` — used by `get_proc`, `module_info`, `replace_proc`, `patch_proc`, `find`
-- `_proc_of_line(cm, line)` → `str` — used by `find` to enrich matches with owning proc name
+v0.7.21 tried kind=0 and kind=3, missing Let (1) and Set (2). v0.7.23 iterates all four via `_ALL_PROC_KINDS = (0, 1, 2, 3)`.
+
+Four helpers in `vbe.py`:
+- `_proc_kind(cm, name)` — iterates all four kinds, returns first match
+- `_proc_bounds(cm, name, kind=None)` → `(start, body, count, kind)` — accepts optional explicit `kind` (used by `module_info` with `_KEYWORD_TO_KIND` mapping); falls back to `_proc_kind` when `kind` is `None`
+- `_proc_of_line(cm, line)` → `str` — iterates all four kinds
+- `_KEYWORD_TO_KIND` — maps regex-captured keywords (`"sub"`, `"function"`, `"property get"`, `"property let"`, `"property set"`) to VBE kind constants
+
+`ac_vbe_module_info` deduplicates by `(name.lower(), keyword.lower())` (not just name), so paired `Property Get`/`Property Let` appear as separate entries with a `"keyword"` field. Fallback when VBE fails: scans forward in source text to the matching `End` keyword to derive accurate `body_line` and `count`.
 
 ### VBProject resolution after decompile (v0.7.21)
 `app.VBE.VBProjects(1)` can return `acwzmain` (wizard library) instead of the user's project after decompile+compact. `_get_vb_project(app)` in `core.py` enumerates all `VBProjects` and matches by `.FileName` against `_Session._db_open`. Falls back to index 1. Used by `_get_code_module()` and `_eval_via_temp_module()`.
@@ -348,8 +357,13 @@ The first implementation of this plan injected the VBE-style `VERSION 1.0 CLASS`
 - `_decompile()` closes COM completely, spawns `MSACCESS.EXE /decompile` with SHIFT held, waits ~8s, kills the process, then re-launches COM.
 - **NOT in `_switch()`** — auto-decompile on every DB open caused SHIFT key stuck issues and MSACCESS.EXE process accumulation on MCP reconnect (each `/mcp` = new session = new decompile).
 
+### DispatchEx instead of Dispatch (v0.7.23)
+- `_Session._launch()` uses `win32com.client.DispatchEx("Access.Application")` instead of `Dispatch`. `DispatchEx` always creates a fresh COM instance, bypassing the Windows Running Object Table (ROT) entirely. After `taskkill /F /T` kills a `/decompile` subprocess, Access doesn't run cleanup code and can leave a stale ROT entry. `Dispatch` latches onto this dead entry, yielding a zombie COM object that passes `_app.Visible` but fails on any database operation. `DispatchEx` eliminates this class of bugs.
+- Belt-and-suspenders: `time.sleep(1)` after `taskkill` in both `_Session._decompile()` (core.py) and `ac_decompile_compact()` (maintenance.py) gives Windows time to evict the dead process's ROT entry before reconnecting.
+- Do NOT switch back to `Dispatch` — there is no reason to reuse an existing Access process. The MCP server manages its own COM session exclusively.
+
 ### "You already have the database open" after MCP reconnect
-- After `/mcp` reconnect, the MCP server process restarts (`_Session._app = None`) but Access.exe keeps running with the DB open. New `Dispatch("Access.Application")` connects to the existing instance, and `OpenCurrentDatabase` fails with "already have the database open".
+- After `/mcp` reconnect, the MCP server process restarts (`_Session._app = None`) but Access.exe keeps running with the DB open. New `DispatchEx("Access.Application")` creates a fresh instance, but `OpenCurrentDatabase` may fail with "already have the database open" if another Access process holds the file.
 - Fix: `_switch()` catches this specific error and syncs internal state (`_db_open = path`) without re-opening.
 
 ### dbAttachSavePWD and linked tables
@@ -374,7 +388,7 @@ The first implementation of this plan injected the VBE-style `VERSION 1.0 CLASS`
 ### Application.Run and late-bound COM (DISP_E_BADPARAMCOUNT)
 - `Application.Run` has 31 params (1 required + 30 optional). pywin32's late-bound `Dispatch` uses `IDispatch.Invoke()` which only passes provided args — Access COM rejects this with `DISP_E_BADPARAMCOUNT` because the 30 optional params lack `VT_ERROR/DISP_E_PARAMNOTFOUND` markers.
 - Fix: `_invoke_app_run()` calls `_oleobj_.InvokeTypes()` directly with full arg types + `pythoncom.Missing` padding. Same protocol as `EnsureDispatch`-generated wrappers, but without changing the binding model for all other tools.
-- Do NOT switch `_Session._launch()` to `EnsureDispatch` — it would change binding for all 56 tools and add `gen_py` cache dependency.
+- Do NOT switch `_Session._launch()` to `EnsureDispatch` — it would change binding for all 61 tools and add `gen_py` cache dependency. `DispatchEx` (used since v0.7.23) is late-bound like `Dispatch` but always creates a fresh instance.
 
 ### ac_run_vba and modal dialogs
 - Without `timeout`: `Application.Run` blocks indefinitely if VBA shows `MsgBox`/`InputBox`.
