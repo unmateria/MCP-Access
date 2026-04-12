@@ -301,7 +301,12 @@ class _Session:
 
         # Call OpenCurrentDatabase in the current thread (COM worker — same
         # apartment that created _app).  The watchdog will dismiss any dialog.
+        # AutomationSecurity=3 (msoAutomationSecurityForceDisable) prevents the
+        # AutoExec macro object from firing at the engine level — complementing
+        # the Shift key approach which works at the UI level.  Restored to 1
+        # (msoAutomationSecurityLow) immediately after open so VBA works normally.
         try:
+            cls._app.AutomationSecurity = 3
             cls._app.OpenCurrentDatabase(path)
         except Exception as e:
             if "already have the database open" in str(e).lower():
@@ -310,6 +315,10 @@ class _Session:
                 raise
         finally:
             _open_done.set()  # signal watchdog to stop
+            try:
+                cls._app.AutomationSecurity = 1  # always restore
+            except Exception:
+                pass
             if shift_held:
                 try:
                     _kbd(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0)  # Release SHIFT
