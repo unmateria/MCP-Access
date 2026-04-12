@@ -80,6 +80,85 @@ _parsed_controls_cache: dict = {} # "form:name" / "report:name" → resultado _p
 # ---------------------------------------------------------------------------
 # Sesion COM — singleton, mantiene Access vivo entre llamadas
 # ---------------------------------------------------------------------------
+def _dao_suppress_startup(path: str) -> str:
+    """
+    Open the database via DAO (no Access startup fires) and blank out the
+    StartupForm property so the COM session won't trigger it.
+    Returns the original StartupForm value so it can be restored later.
+    Manual opens are unaffected — the value is restored in _dao_restore_startup().
+    """
+    try:
+        import win32com.client
+        dao = win32com.client.Dispatch("DAO.DBEngine.36")
+        db = dao.OpenDatabase(path, False, False)  # non-exclusive, read-write
+        try:
+            original = str(db.Properties("StartupForm").Value or "")
+        except Exception:
+            original = ""
+        if original:
+            try:
+                db.Properties("StartupForm").Value = ""
+                log.info("StartupForm suppressed (was '%s')", original)
+            except Exception as e:
+                log.warning("Could not suppress StartupForm: %s", e)
+                original = ""  # nothing to restore
+        db.Close()
+        return original
+    except Exception as e:
+        log.warning("DAO startup suppression failed (non-fatal): %s", e)
+        return ""
+
+
+def _open_with_shift_bypass(app: Any, path: str) -> None:
+    """
+    Open an Access database while holding the Shift key down.
+    This is the programmatic equivalent of the user holding Shift on open,
+    which bypasses ALL startup code: AutoExec, StartupForm, and any VBA
+    event procedures (including modal login dialogs).
+
+    Works when AllowBypassKey=True (the default). If the database has
+    AllowBypassKey=False the Shift key is ignored by Access and startup
+    runs normally — callers should still apply AutomationSecurity=3 and
+    DAO StartupForm suppression as a fallback.
+
+    pywin32 (win32api / win32con) is already required by the server.
+    """
+    import win32api
+    import win32con
+
+    VK_SHIFT = win32con.VK_SHIFT
+    KEYEVENTF_KEYUP = win32con.KEYEVENTF_KEYUP
+
+    try:
+        win32api.keybd_event(VK_SHIFT, 0, 0, 0)          # press Shift
+        time.sleep(0.05)                                   # let Access see it
+        app.OpenCurrentDatabase(path)
+    finally:
+        win32api.keybd_event(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0)  # release Shift
+
+
+def _dao_restore_startup(path: str, startup_form: str) -> None:
+    """
+    Restore StartupForm after Access has closed the database.
+    Called from _Session._switch() when switching DBs and from quit().
+    """
+    if not startup_form:
+        return
+    try:
+        import win32com.client
+        dao = win32com.client.Dispatch("DAO.DBEngine.36")
+        db = dao.OpenDatabase(path, False, False)
+        try:
+            db.Properties("StartupForm").Value = startup_form
+            log.info("StartupForm restored to '%s'", startup_form)
+        except Exception as e:
+            log.warning("Could not restore StartupForm: %s", e)
+        finally:
+            db.Close()
+    except Exception as e:
+        log.warning("DAO startup restore failed: %s", e)
+
+
 class _Session:
     """
     Mantiene una instancia de Access.Application entre tool calls.
@@ -88,6 +167,7 @@ class _Session:
     _app: Optional[Any] = None
     _db_open: Optional[str] = None
     _cm_cache: dict = {}   # "type:name" → CodeModule COM object
+    _saved_startup_form: str = ""  # StartupForm value suppressed at open time
 
     @classmethod
     def connect(cls, db_path: str) -> Any:
@@ -110,6 +190,7 @@ class _Session:
         """Reset state without calling methods on a dead COM object."""
         cls._app = None
         cls._db_open = None
+        cls._saved_startup_form = ""
         cls._cm_cache.clear()
         _vbe_code_cache.clear()
         _parsed_controls_cache.clear()
@@ -137,10 +218,31 @@ class _Session:
                 cls._app.CloseCurrentDatabase()
             except Exception as e:
                 log.warning("Error cerrando BD anterior: %s", e)
+            # Restore StartupForm on the previous DB now that Access released it
+            _dao_restore_startup(cls._db_open, cls._saved_startup_form)
+            cls._saved_startup_form = ""
         log.info("Abriendo BD: %s", path)
+        # Use DAO (no Access startup fires) to blank the StartupForm property
+        # so the Access Application won't open it either.
+        # The original value is saved and restored when the DB is closed.
+        cls._saved_startup_form = _dao_suppress_startup(path)
         try:
-            cls._app.OpenCurrentDatabase(path)
+            # Three-layer startup bypass:
+            # Layer 1 — AutomationSecurity=3 suppresses named AutoExec macros.
+            # Layer 2 — DAO pre-suppression blanks StartupForm in the file.
+            # Layer 3 — Shift key held during OpenCurrentDatabase bypasses ALL
+            #            remaining startup code (VBA event procs, modal login forms,
+            #            etc.) exactly like a user holding Shift when opening manually.
+            #            Only works when AllowBypassKey=True (the default); if the DB
+            #            has disabled the bypass key we fall back to layers 1 & 2.
+            cls._app.AutomationSecurity = 3
+            _open_with_shift_bypass(cls._app, path)
+            cls._app.AutomationSecurity = 1
         except Exception as e:
+            try:
+                cls._app.AutomationSecurity = 1  # always restore
+            except Exception:
+                pass
             if "already have the database open" in str(e).lower():
                 # After MCP reconnect, Access may already have this DB open
                 # from the previous server session — just sync our state
@@ -159,9 +261,13 @@ class _Session:
         if cls._app is not None:
             log.info("Cerrando Access...")
             try:
+                prev_path = cls._db_open
+                prev_form = cls._saved_startup_form
                 if cls._db_open:
                     cls._app.CloseCurrentDatabase()
                 cls._app.Quit()
+                # Restore StartupForm now that Access has fully released the file
+                _dao_restore_startup(prev_path, prev_form)
                 log.info("Access cerrado OK")
             except Exception as e:
                 log.warning("Error cerrando Access: %s", e)
