@@ -447,7 +447,7 @@ def _exec_single_replace(cm, app, object_type, object_name, start_line, count, n
         decoded = html_mod.unescape(new_code)
         normalized = decoded.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
         cm.InsertLines(start_line, normalized)
-        inserted = len(new_code.splitlines())
+        inserted = len(decoded.splitlines())
     end = start_line + count - 1 if count > 0 else start_line
     clamp_note = " (count adjusted)" if clamped else ""
     return {
@@ -962,7 +962,10 @@ def ac_vbe_patch_proc(
     # Invalidate cache
     _vbe_code_cache.pop(cache_key, None)
     new_total = cm.CountOfLines
-    new_count = cm.ProcCountLines(proc_name, kind) if applied > 0 else 0
+    try:
+        new_count = cm.ProcCountLines(proc_name, kind) if applied > 0 else 0
+    except Exception:
+        new_count = 0
     # Health check
     health = _check_module_health(cm, cache_key)
     result = (

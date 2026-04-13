@@ -317,8 +317,8 @@ def _inject_vba_after_import(app: Any, object_type: str, name: str, vba_code: st
 
     # Ensure Option Compare Database and Option Explicit at the top
     vba_lines = vba_code.split("\r\n")
-    has_compare = any(re.match(r'^\s*Option\s+Compare', l, re.I) for l in vba_lines[:5])
-    has_explicit = any(re.match(r'^\s*Option\s+Explicit', l, re.I) for l in vba_lines[:5])
+    has_compare = any(re.match(r'^\s*Option\s+Compare', l, re.I) for l in vba_lines)
+    has_explicit = any(re.match(r'^\s*Option\s+Explicit', l, re.I) for l in vba_lines)
     prepend = []
     if not has_compare:
         prepend.append("Option Compare Database")
@@ -400,9 +400,14 @@ def ac_set_code(db_path: str, object_type: str, name: str, code: str) -> str:
     fd, tmp = tempfile.mkstemp(suffix=".txt", prefix="access_mcp_")
     os.close(fd)
     try:
-        # VBA modules (.bas and class modules) expect ANSI/cp1252;
+        # VBA modules (.bas and class modules) expect the system ANSI codepage
+        # (cp1252 on Western Windows, cp1253 on Greek, etc.);
         # forms/reports/queries/macros expect UTF-16LE with BOM
-        enc = "cp1252" if object_type in ("module", "class_module") else "utf-16"
+        if object_type in ("module", "class_module"):
+            import locale
+            enc = locale.getpreferredencoding(False) or "cp1252"
+        else:
+            enc = "utf-16"
         write_tmp(tmp, code, encoding=enc)
         try:
             app.LoadFromText(_ac_type_code, name, tmp)

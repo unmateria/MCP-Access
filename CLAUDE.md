@@ -41,7 +41,7 @@ MCP server for reading and editing Microsoft Access databases (`.accdb`/`.mdb`) 
 ## Key Implementation Details
 
 ### Encoding in ac_set_code
-- **Modules** (`.bas`): written as `cp1252` (ANSI) — Access expects no BOM for VBA modules
+- **Modules** (`.bas`): written using the system ANSI codepage (`locale.getpreferredencoding()`, typically `cp1252` on Western Windows) — Access expects no BOM for VBA modules. The codepage is detected at runtime so non-Western systems (Greek cp1253, Cyrillic cp1251, etc.) work correctly.
 - **Forms, reports, queries, macros**: written as `utf-16` (UTF-16LE with BOM) — Access LoadFromText expects this
 
 ### Control parsing (_parse_controls)
@@ -344,7 +344,7 @@ The first implementation of this plan injected the VBE-style `VERSION 1.0 CLASS`
      Attribute VB_Exposed = False
      ```
    - normalises body endings to CRLF.
-2. Encoding: `cp1252` (ANSI, no BOM) — same as standard modules.
+2. Encoding: system ANSI codepage (no BOM) — same as standard modules.
 3. Backup: `class_module` is added to the `("form", "report", "module", "class_module")` tuple so existing objects are backed up before overwriting.
 4. **Cache invalidation aliasing**: after `invalidate_object_caches("class_module", name)` we also call `invalidate_object_caches("module", name)`. Reason: `access_get_code` and `_get_code_module` read VBE modules via the `"module"` key for all `.bas` modules, so the alias key must be cleared to avoid stale cache hits.
 

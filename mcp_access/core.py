@@ -226,9 +226,11 @@ class _Session:
         key_path = r"Software\Microsoft\Office\16.0\Access\Resiliency"
         try:
             key = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE)
-            winreg.SetValueEx(key, "DisableAllCallersWarning", 0, winreg.REG_DWORD, 1)
-            winreg.SetValueEx(key, "DoNotShowUI", 0, winreg.REG_DWORD, 1)
-            winreg.CloseKey(key)
+            try:
+                winreg.SetValueEx(key, "DisableAllCallersWarning", 0, winreg.REG_DWORD, 1)
+                winreg.SetValueEx(key, "DoNotShowUI", 0, winreg.REG_DWORD, 1)
+            finally:
+                winreg.CloseKey(key)
             log.info("Recovery dialog suppressed via registry")
         except Exception as e:
             log.warning("Could not suppress recovery dialog: %s", e)
@@ -289,7 +291,7 @@ class _Session:
                     try:
                         if _dismiss_access_dialogs(
                             access_hwnd,
-                            _dialog_screenshots if not _dialog_screenshots else None,
+                            _dialog_screenshots if len(_dialog_screenshots) == 0 else None,
                         ):
                             log.warning("Dialog dismissed during OpenCurrentDatabase")
                     except Exception as e_wd:

@@ -112,8 +112,15 @@ def ac_compact_repair(db_path: str) -> dict:
         os.rename(resolved, bak_path)
         try:
             os.rename(tmp_path, resolved)
-        except Exception:
-            os.rename(bak_path, resolved)  # rollback
+        except Exception as swap_exc:
+            try:
+                os.rename(bak_path, resolved)  # rollback
+            except Exception as rb_exc:
+                raise RuntimeError(
+                    f"CRITICAL: swap failed ({swap_exc}) and rollback also "
+                    f"failed ({rb_exc}). Original DB is at: {bak_path}, "
+                    f"compacted DB is at: {tmp_path}"
+                ) from swap_exc
             raise
 
         try:

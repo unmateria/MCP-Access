@@ -325,6 +325,16 @@ The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/s
 
 - **`AutomationSecurity = 3` defence-in-depth in `_switch()`**: Sets `msoAutomationSecurityForceDisable` before `OpenCurrentDatabase()` and restores to `msoAutomationSecurityLow` (1) in the `finally` block. Does not replace the Shift key bypass (Access ignores `AutomationSecurity` for AutoExec macro objects), but provides an extra safety layer for VBA auto-run code in edge cases where the Shift key doesn't register (remote desktop sessions, key events eaten by other processes).
 
+**Bug fixes**:
+
+- **`_exec_single_replace` counted inserted lines before HTML unescape**: `inserted = len(new_code.splitlines())` used the pre-unescape string; now uses `len(decoded.splitlines())` so the count matches what VBE actually received.
+- **`ProcCountLines` could crash after patch**: `ac_vbe_patch_proc` called `cm.ProcCountLines()` without protection after patching — if the patch corrupted the proc structure, this threw an unhandled COM error. Now wrapped in try/except.
+- **Registry key leak in `_suppress_recovery_dialog`**: If the second `SetValueEx` call failed, `CloseKey` was never reached. Now uses try/finally to guarantee key closure.
+- **Atomic swap in `ac_compact_repair` could lose DB on double failure**: If both the swap rename and the rollback rename failed, the error message didn't indicate where the files ended up. Now reports the exact paths of both the `.bak` original and the compacted temp file.
+- **`_eval_via_temp_module` warning could crash**: The error handler accessed `comp.Name` on a potentially dead COM object. Now uses the pre-captured `temp_name` variable.
+- **`_inject_vba_after_import` Option check too narrow**: Only searched the first 5 lines for existing `Option Compare`/`Option Explicit`, so code with these directives at line 6+ got duplicates. Now searches the entire code.
+- **Module encoding hardcoded to cp1252**: `ac_set_code` now uses `locale.getpreferredencoding()` (the system ANSI codepage) instead of hardcoded `cp1252`, so non-Western Windows systems (Greek, Cyrillic, etc.) work correctly.
+
 ### v0.7.23 — 2026-04-11
 
 **Bug fixes** — thanks to [@CaptainStormfield](https://github.com/CaptainStormfield):

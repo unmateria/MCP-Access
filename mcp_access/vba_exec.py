@@ -354,7 +354,7 @@ def _eval_via_temp_module(app, expression: str, original_exc: Exception):
             try:
                 proj.VBComponents.Remove(comp)
             except Exception:
-                log.warning("Could not remove temp module '%s'", comp.Name)
+                log.warning("Could not remove temp module '%s'", temp_name)
 
 
 def ac_eval_vba(db_path: str, expression: str) -> dict:
