@@ -279,7 +279,7 @@ This patch is local to this machine and will be lost on `pip install --upgrade m
 - Databases with `AutoExec` macros or startup forms (especially modal `acDialog` forms like login/welcome screens) block the `OpenCurrentDatabase` COM call indefinitely. The call doesn't return until the user manually closes the form.
 - Fix: `_switch()` holds the Shift key via `keybd_event(VK_SHIFT)` during `OpenCurrentDatabase`. This is the standard Access trick to bypass AutoExec and startup forms. After opening, any auto-opened forms are closed as a safety net.
 - `_Session.reopen(path)` — convenience method that clears `_db_open` and calls `_switch()`, for use after `CloseCurrentDatabase` + `CompactRepair` sequences. All reopens in `maintenance.py` use this method to ensure SHIFT bypass is always applied.
-- `AutomationSecurity = 3` (msoAutomationSecurityForceDisable) does NOT work — Access ignores it for database-level AutoExec macros.
+- `AutomationSecurity = 3` (msoAutomationSecurityForceDisable) does NOT suppress AutoExec macro objects (tested — Access ignores it). However, it is set as defence-in-depth before `OpenCurrentDatabase` because it may suppress VBA auto-run code in edge cases where Shift doesn't register. Restored to `1` in the `finally` block.
 - VK_ESCAPE to dismiss modal forms is unreliable (doesn't always reach the right window).
 
 ### Recovery dialog suppression (v0.7.19)

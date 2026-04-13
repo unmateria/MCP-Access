@@ -301,6 +301,14 @@ class _Session:
 
         # Call OpenCurrentDatabase in the current thread (COM worker — same
         # apartment that created _app).  The watchdog will dismiss any dialog.
+        # AutomationSecurity=3 as defence-in-depth.  Does NOT suppress Access
+        # AutoExec macro objects (tested — Access ignores it for those), but
+        # may prevent VBA auto-run code in edge cases where the Shift key
+        # doesn't register (remote desktop, key event eaten by another app).
+        try:
+            cls._app.AutomationSecurity = 3   # msoAutomationSecurityForceDisable
+        except Exception:
+            pass
         try:
             cls._app.OpenCurrentDatabase(path)
         except Exception as e:
@@ -310,6 +318,10 @@ class _Session:
                 raise
         finally:
             _open_done.set()  # signal watchdog to stop
+            try:
+                cls._app.AutomationSecurity = 1  # msoAutomationSecurityLow — restore
+            except Exception:
+                pass
             if shift_held:
                 try:
                     _kbd(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0)  # Release SHIFT

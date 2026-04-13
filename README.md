@@ -319,6 +319,12 @@ The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/s
 
 ## Changelog
 
+### v0.7.24 — 2026-04-13
+
+**Enhancement** — thanks to [@AccessWizard](https://github.com/AccessWizard) ([#23](https://github.com/unmateria/MCP-Access/pull/23)):
+
+- **`AutomationSecurity = 3` defence-in-depth in `_switch()`**: Sets `msoAutomationSecurityForceDisable` before `OpenCurrentDatabase()` and restores to `msoAutomationSecurityLow` (1) in the `finally` block. Does not replace the Shift key bypass (Access ignores `AutomationSecurity` for AutoExec macro objects), but provides an extra safety layer for VBA auto-run code in edge cases where the Shift key doesn't register (remote desktop sessions, key events eaten by other processes).
+
 ### v0.7.23 — 2026-04-11
 
 **Bug fixes** — thanks to [@CaptainStormfield](https://github.com/CaptainStormfield):
