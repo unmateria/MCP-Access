@@ -113,13 +113,30 @@ class _Session:
             raise RuntimeError(
                 "pywin32 not installed. Run: pip install pywin32"
             )
-        log.info("Launching Access.Application...")
-        cls._app = win32com.client.DispatchEx("Access.Application")
+        # Prefer attaching to an already-running Access instance so we don't
+        # spawn a second process when the user already has Access open (e.g.
+        # for interactive debugging). Fall back to DispatchEx only when none
+        # is running — DispatchEx remains required after /decompile kills to
+        # bypass stale ROT entries, but in that path no live instance exists.
+        try:
+            cls._app = win32com.client.GetActiveObject("Access.Application")
+            log.info("Attached to existing Access.Application instance")
+            try:
+                current_db = cls._app.CurrentDb()
+                db_name = current_db.Name if current_db is not None else None
+                cls._db_open = str(Path(db_name).resolve()) if db_name else None
+                if cls._db_open:
+                    log.info("Existing Access has DB open: %s", cls._db_open)
+            except Exception:
+                cls._db_open = None
+        except Exception:
+            log.info("Launching new Access.Application...")
+            cls._app = win32com.client.DispatchEx("Access.Application")
+            log.info("Access launched OK")
         try:
             cls._app.Visible = True   # required for VBE to be accessible via COM
         except Exception as e:
             log.warning("Could not set Visible=True: %s (continuing anyway)", e)
-        log.info("Access launched OK")
 
     @classmethod
     def reopen(cls, path: str) -> None:

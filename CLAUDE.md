@@ -139,7 +139,7 @@ Blocking COM calls (`OpenCurrentDatabase`, `CompactRepair`, `RunCommand`, `Appli
 
 ## Critical DO NOTs
 
-- **Do NOT use `Dispatch` instead of `DispatchEx`** in `_Session._launch()`. `DispatchEx` always creates a fresh COM instance, bypassing stale ROT entries after `/decompile` kills.
+- **Do NOT remove the `DispatchEx` fallback** in `_Session._launch()`. `_launch()` tries `GetActiveObject("Access.Application")` first to attach to a user's running Access (avoids spawning a second process); on failure it falls back to `DispatchEx`, which is required after `/decompile` kills to bypass stale ROT entries. Do NOT swap `DispatchEx` for `Dispatch` in the fallback — `Dispatch` latches onto the stale ROT entry.
 - **Do NOT use `EnsureDispatch`** — it changes binding for all 61 tools and adds `gen_py` cache dependency.
 - **Do NOT run `OpenCurrentDatabase` in a separate thread** — COM STA objects can only be used from the thread that created them.
 - **Do NOT call `CreateForm()` directly** — use `access_create_form` tool to avoid the "Save As" MsgBox.

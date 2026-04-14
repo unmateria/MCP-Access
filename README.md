@@ -319,6 +319,12 @@ The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/s
 
 ## Changelog
 
+### v0.7.25 — 2026-04-14
+
+**Bug fix** — thanks to [@TvanStiphout-Home](https://github.com/TvanStiphout-Home) ([#24](https://github.com/unmateria/MCP-Access/issues/24)):
+
+- **`_Session._launch()` always spawned a second Access process**: When the user already had Access open (common during interactive debugging), `win32com.client.DispatchEx("Access.Application")` unconditionally created a new COM instance instead of attaching to the running one. Fix: `_launch()` now tries `win32com.client.GetActiveObject("Access.Application")` first, syncs `cls._db_open` from the attached instance's `CurrentDb().Name` so `connect()` can skip an unnecessary `_switch()` when the target DB is already open, and falls back to `DispatchEx` only when no running instance exists. The `DispatchEx` fallback is still required after `/decompile` kills (stale ROT entries) — `GetActiveObject` will fail cleanly in that path since the process was taskkill'd.
+
 ### v0.7.24 — 2026-04-13
 
 **Enhancement** — thanks to [@AccessWizard](https://github.com/AccessWizard) ([#23](https://github.com/unmateria/MCP-Access/pull/23)):
