@@ -7,7 +7,7 @@ import threading
 import time
 from pathlib import Path
 
-from .core import _Session, _vbe_code_cache, _parsed_controls_cache, log
+from .core import _Session, _vbe_code_cache, _parsed_controls_cache, _list_msaccess_pids, log
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +162,9 @@ def ac_decompile_compact(db_path: str) -> dict:
 
     original_size = os.path.getsize(resolved)
 
-    # 1. Close COM session and release the file completely
+    # 1. Close COM session and release the file completely.  When attached to
+    # the user's Access, never call Quit(1) — just CloseCurrentDatabase and
+    # keep the instance alive so we don't spawn a second process on re-open.
     try:
         app = _Session.connect(resolved)
         try:
@@ -173,11 +175,12 @@ def ac_decompile_compact(db_path: str) -> dict:
         _Session._cm_cache.clear()
         _vbe_code_cache.clear()
         _parsed_controls_cache.clear()
-        try:
-            app.Quit(1)  # acQuitSaveNone=1
-        except Exception:
-            pass
-        _Session._app = None
+        if not _Session._attached:
+            try:
+                app.Quit(1)  # acQuitSaveNone=1
+            except Exception:
+                pass
+            _Session._app = None
     except Exception:
         pass  # si no habia sesion abierta, continuar igualmente
 
@@ -189,6 +192,10 @@ def ac_decompile_compact(db_path: str) -> dict:
     msaccess = next((p for p in msaccess_candidates if os.path.exists(p)), None)
     if not msaccess:
         raise RuntimeError("MSACCESS.EXE not found in known Office 16 paths")
+
+    # Snapshot msaccess.exe PIDs so we can kill any forked children that
+    # escape `taskkill /T /F`.  Preserves the user's attached PID (if any).
+    pids_before = _list_msaccess_pids()
 
     # Hold SHIFT during /decompile to bypass AutoExec/startup forms
     import ctypes
@@ -240,7 +247,29 @@ def ac_decompile_compact(db_path: str) -> dict:
         )
     except Exception:
         pass
-    time.sleep(1)  # let Windows evict the dead process's ROT entry
+
+    # Defence-in-depth: kill any msaccess.exe PIDs that appeared during the
+    # subprocess (forked children).  Preserves PIDs that were running before
+    # — including the user's attached Access, if any.
+    try:
+        pids_after = _list_msaccess_pids()
+        new_pids = pids_after - pids_before
+        for pid in new_pids:
+            log.warning("Killing leaked msaccess.exe PID %s from /decompile", pid)
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    capture_output=True, timeout=5,
+                )
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # ROT eviction only matters when we killed our own instance.  When
+    # attached we kept the user's Access alive, so nothing stale to evict.
+    if _Session._app is None:
+        time.sleep(1)  # let Windows evict the dead process's ROT entry
 
     decompile_size = os.path.getsize(resolved)
 

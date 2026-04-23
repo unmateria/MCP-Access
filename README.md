@@ -319,6 +319,12 @@ The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/s
 
 ## Changelog
 
+### v0.7.26 — 2026-04-23
+
+**Bug fix** — thanks to [@TvanStiphout-Home](https://github.com/TvanStiphout-Home) ([#25](https://github.com/unmateria/MCP-Access/issues/25)):
+
+- **`access_compile_vba` spawned a second Access instance when user had Access open**: Follow-up to v0.7.25. The `GetActiveObject` attach fix applied to `_Session._launch()`, but the auto-decompile path in `_Session._decompile()` (triggered on first compile per session) and `ac_decompile_compact()` still unconditionally called `cls._app.Quit(1)` and re-launched — killing the user's attached Access and spawning a fresh one via `DispatchEx`. Fix: new `_Session._attached` flag tracks whether we attached (`GetActiveObject`) or launched (`DispatchEx`). When attached, `/decompile` now releases the file lock via `CloseCurrentDatabase()` only, never calls `Quit()`, and reuses the same COM reference after the subprocess finishes. `atexit` handler also skips `Quit()` when attached so MCP shutdown doesn't kill the user's Access. Defence-in-depth PID-diff cleanup (`_list_msaccess_pids()` before vs. after the subprocess) kills any forked `msaccess.exe` children that escape `taskkill /T`. Refuses to decompile a path when the user has a **different** DB open, instead of silently closing their unsaved work.
+
 ### v0.7.25 — 2026-04-14
 
 **Bug fix** — thanks to [@TvanStiphout-Home](https://github.com/TvanStiphout-Home) ([#24](https://github.com/unmateria/MCP-Access/issues/24)):

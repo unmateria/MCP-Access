@@ -66,6 +66,31 @@ AC_TYPE: dict[str, int] = {
 _vbe_code_cache: dict = {}        # "type:name" -> full text of VBE module
 _parsed_controls_cache: dict = {} # "form:name" / "report:name" -> _parse_controls() result
 
+
+def _list_msaccess_pids() -> set[int]:
+    """Return PIDs of all running msaccess.exe processes.
+    Defensive helper used around the /decompile subprocess to catch forked
+    children that escape `taskkill /T /F`.  Returns an empty set on any error.
+    """
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq msaccess.exe", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=5,
+        )
+        pids: set[int] = set()
+        for line in (out.stdout or "").splitlines():
+            # CSV: "msaccess.exe","1234","Console","1","45,678 K"
+            parts = [p.strip().strip('"') for p in line.split(",")]
+            if len(parts) >= 2 and parts[0].lower() == "msaccess.exe":
+                try:
+                    pids.add(int(parts[1]))
+                except ValueError:
+                    pass
+        return pids
+    except Exception:
+        return set()
+
+
 # ---------------------------------------------------------------------------
 # COM Session -- singleton, keeps Access alive between calls
 # ---------------------------------------------------------------------------
@@ -78,6 +103,7 @@ class _Session:
     _db_open: Optional[str] = None
     _cm_cache: dict = {}   # "type:name" -> CodeModule COM object
     _decompiled_dbs: set = set()  # DBs already decompiled in this session
+    _attached: bool = False  # True if we attached via GetActiveObject; False if we spawned via DispatchEx
 
     @classmethod
     def connect(cls, db_path: str) -> Any:
@@ -100,6 +126,7 @@ class _Session:
         """Reset state without calling methods on a dead COM object."""
         cls._app = None
         cls._db_open = None
+        cls._attached = False
         cls._cm_cache.clear()
         cls._decompiled_dbs.clear()
         _vbe_code_cache.clear()
@@ -120,6 +147,7 @@ class _Session:
         # bypass stale ROT entries, but in that path no live instance exists.
         try:
             cls._app = win32com.client.GetActiveObject("Access.Application")
+            cls._attached = True
             log.info("Attached to existing Access.Application instance")
             try:
                 current_db = cls._app.CurrentDb()
@@ -132,7 +160,9 @@ class _Session:
         except Exception:
             log.info("Launching new Access.Application...")
             cls._app = win32com.client.DispatchEx("Access.Application")
+            cls._attached = False
             log.info("Access launched OK")
+        log.info("Decompile/compile strategy: attached=%s", cls._attached)
         try:
             cls._app.Visible = True   # required for VBE to be accessible via COM
         except Exception as e:
@@ -159,25 +189,51 @@ class _Session:
             cls._decompiled_dbs.add(path)  # don't retry
             return
 
-        # Close COM session completely so the file is unlocked
+        resolved_target = str(Path(path).resolve())
+
+        # Release the file lock so the /decompile subprocess can open it.
+        # When we attached to the user's Access, NEVER call Quit(1) — it would
+        # kill the user's session.  Only close the current DB if it matches
+        # our target; if a *different* DB is open we refuse, to avoid silently
+        # closing the user's unsaved work.
         if cls._app is not None:
-            log.info("Closing COM session for /decompile...")
-            try:
-                if cls._db_open:
+            log.info("Preparing COM session for /decompile (attached=%s)...", cls._attached)
+            if cls._db_open:
+                current_norm = str(Path(cls._db_open).resolve())
+                if current_norm != resolved_target:
+                    raise RuntimeError(
+                        f"Cannot run /decompile on {resolved_target}: a different "
+                        f"database is currently open ({current_norm}). Close it first."
+                    )
+                try:
                     cls._app.CloseCurrentDatabase()
-            except Exception:
-                pass
-            try:
-                cls._app.Quit(1)  # acQuitSaveNone
-            except Exception:
-                pass
-            cls._app = None
-            cls._db_open = None
-            cls._cm_cache.clear()
-            _vbe_code_cache.clear()
-            _parsed_controls_cache.clear()
+                except Exception:
+                    pass
+            if cls._attached:
+                # Keep the user's Access alive — just drop our references to
+                # caches/state that become invalid after the subprocess runs.
+                cls._db_open = None
+                cls._cm_cache.clear()
+                _vbe_code_cache.clear()
+                _parsed_controls_cache.clear()
+            else:
+                try:
+                    cls._app.Quit(1)  # acQuitSaveNone
+                except Exception:
+                    pass
+                cls._app = None
+                cls._db_open = None
+                cls._attached = False
+                cls._cm_cache.clear()
+                _vbe_code_cache.clear()
+                _parsed_controls_cache.clear()
 
         log.info("Decompiling %s ...", path)
+
+        # Snapshot msaccess.exe PIDs so we can kill any forked children that
+        # escape `taskkill /T /F`.  When attached, the user's PID is in this
+        # set and MUST be preserved.
+        pids_before = _list_msaccess_pids()
 
         # Hold SHIFT while launching /decompile
         VK_SHIFT = 0x10
@@ -229,13 +285,43 @@ class _Session:
             )
         except Exception:
             pass
-        time.sleep(1)  # let Windows evict the dead process's ROT entry
+
+        # Defence-in-depth: kill any msaccess.exe PIDs that appeared during
+        # the subprocess (forked children that escaped taskkill /T).  NEVER
+        # touch PIDs that were already running before we started.
+        try:
+            pids_after = _list_msaccess_pids()
+            new_pids = pids_after - pids_before
+            for pid in new_pids:
+                log.warning("Killing leaked msaccess.exe PID %s from /decompile", pid)
+                try:
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(pid)],
+                        capture_output=True, timeout=5,
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
         cls._decompiled_dbs.add(path)
         log.info("Decompile done for %s", path)
 
-        # Re-launch COM (was killed above)
-        cls._launch()
+        # Re-launch COM only when we actually killed it.  If we attached to
+        # the user's Access we kept _app alive; verify it's still responsive
+        # and only relaunch on failure.
+        if cls._app is None:
+            time.sleep(1)  # let Windows evict the dead process's ROT entry
+            cls._launch()
+        else:
+            try:
+                _ = cls._app.Visible
+            except Exception as e:
+                log.warning("Attached COM object died during /decompile (%s) — relaunching", e)
+                cls._app = None
+                cls._attached = False
+                time.sleep(1)
+                cls._launch()
 
     @staticmethod
     def _suppress_recovery_dialog() -> None:
@@ -375,6 +461,18 @@ class _Session:
     @classmethod
     def quit(cls) -> None:
         if cls._app is not None:
+            if cls._attached:
+                # User's own Access — don't kill it on MCP shutdown.  Just
+                # release our references and let the user keep working.
+                log.info("Releasing attached Access.Application (not quitting user's session)")
+                cls._app = None
+                cls._db_open = None
+                cls._attached = False
+                cls._cm_cache.clear()
+                cls._decompiled_dbs.clear()
+                _vbe_code_cache.clear()
+                _parsed_controls_cache.clear()
+                return
             log.info("Closing Access...")
             try:
                 if cls._db_open:
@@ -386,6 +484,7 @@ class _Session:
             finally:
                 cls._app = None
                 cls._db_open = None
+                cls._attached = False
                 cls._cm_cache.clear()
                 cls._decompiled_dbs.clear()
                 _vbe_code_cache.clear()
