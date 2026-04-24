@@ -319,6 +319,17 @@ The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/s
 
 ## Changelog
 
+### v0.7.28 — 2026-04-24
+
+**Polish of `access_find_definition`** (v0.7.27 follow-up):
+
+- **Const values were contaminated by trailing comments**: `Public Const MAX_ROWS = 100  ' default page size` returned `value = "100  ' default page size"` instead of `"100"`. The naive `split("'", 1)[0]` stripper also broke on string literals with apostrophes like `Public Const Name = "O'Brien"`, truncating the value at the inner `'`. Fix: new `_strip_trailing_vba_comment()` helper that respects `"..."` string literals (same state machine as `_split_top_level_commas`), applied at all value-extraction sites.
+- **`Default` property modifier not detected**: `Public Default Property Get Item(...)` — valid VBA on class modules with a default member — was invisible to the tool. `_FD_PROC_RE` only allowed `Static`. Fix: widened to `(?:(?:Static|Default)\s+)?`.
+- **Line continuations not joined**: `Public Const FOO As Long = _\n    &H1000` returned `value = "_"` (only the first physical line was parsed). `Public Declare PtrSafe Function SendMessage _\n    Lib "user32" …` had the same problem. Fix: new `_join_continuations()` helper folds trailing-`_` continuations into single logical statements before matching. The reported `line` still points at the first physical line of the statement.
+- **`scan_types` parameter**: optionally restrict the scan to any subset of `["module", "form", "report"]`. Passing `scan_types=["module"]` skips form/report code-behind and is **≈7× faster** on cold scans, because form/report scanning triggers a Design-view open/close round-trip per object when the VBComponent cache is empty. Useful when you know the target is a public declaration in a standard module — as Tom pointed out in his original request: *"All public enums are defined in modGlobal"*.
+- **`first_only` parameter**: stop at the first match. Good for unique names in big databases.
+- **`subkind` cleanup**: `subkind` is now only emitted when it carries information beyond `kind` — i.e. on `property` (Get/Let/Set) and `declare` (Sub vs Function). For `sub` and `function` it was redundant with `kind` and has been removed.
+
 ### v0.7.27 — 2026-04-24
 
 **New tool** — thanks to [@TvanStiphout-Home](https://github.com/TvanStiphout-Home):

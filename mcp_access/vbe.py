@@ -1041,7 +1041,8 @@ def ac_vbe_append(
 # ---------------------------------------------------------------------------
 
 _FD_PROC_RE = re.compile(
-    r'^\s*(?:(Public|Private|Friend|Global|Static)\s+)?(?:Static\s+)?'
+    r'^\s*(?:(Public|Private|Friend|Global|Static)\s+)?'
+    r'(?:(?:Static|Default)\s+)?'
     r'(Sub|Function|Property\s+Get|Property\s+Let|Property\s+Set)\s+(\w+)',
     re.IGNORECASE,
 )
@@ -1069,7 +1070,14 @@ _FD_TYPE_FIELD_RE = re.compile(
 
 
 def _split_top_level_commas(s: str) -> list[str]:
-    """Split string by commas that are not inside parens or double quotes."""
+    """Split string by commas that are not inside parens or double quotes.
+
+    Note on VBA's "" escape: an embedded double-quote inside a VBA string is
+    written as "". This naive in_quote toggle flip-flops twice on each "",
+    but the net state at the end of a well-formed string is correct, and
+    real commas only appear outside strings — so splits land in the right
+    place for any valid VBA source.
+    """
     parts: list[str] = []
     buf: list[str] = []
     depth = 0
@@ -1094,9 +1102,72 @@ def _split_top_level_commas(s: str) -> list[str]:
     return parts
 
 
+def _strip_trailing_vba_comment(line: str) -> str:
+    """Strip a trailing VBA comment (' ...) from a line, respecting string
+    literals. Returns the line without the comment and without trailing
+    whitespace.
+
+    VBA comments start with an apostrophe that is OUTSIDE any "..." string.
+    Same state machine as _split_top_level_commas.
+    """
+    in_quote = False
+    for i, ch in enumerate(line):
+        if ch == '"':
+            in_quote = not in_quote
+        elif ch == "'" and not in_quote:
+            return line[:i].rstrip()
+    return line.rstrip()
+
+
+def _join_continuations(lines: list[str]) -> list[tuple[int, str]]:
+    """Join VBA line continuations (` _` at end of a line) into single
+    logical lines.
+
+    Returns a list of ``(first_line_number, joined_text)`` tuples, where
+    ``first_line_number`` is the 1-based line number of the FIRST physical
+    line of the logical statement — so downstream reporting still points at
+    where the declaration starts.
+
+    A continuation is a line that, after stripping trailing whitespace and
+    ignoring a trailing VBA comment, ends with ``_`` preceded by whitespace
+    (or is exactly ``_``). Continuations can chain.
+    """
+    result: list[tuple[int, str]] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        first_idx = i
+        # Build the logical line. We keep going while the CURRENT physical
+        # line (after comment-strip) ends with whitespace + '_'.
+        accumulated_parts: list[str] = []
+        while True:
+            raw = lines[i].rstrip("\r")
+            no_comment = _strip_trailing_vba_comment(raw)
+            cont_match = re.search(r'(?:^|\s)_\s*$', no_comment)
+            if cont_match and i + 1 < n:
+                accumulated_parts.append(no_comment[:cont_match.start()].rstrip())
+                i += 1
+                continue
+            accumulated_parts.append(no_comment)
+            break
+        # First part keeps its leading indentation (regex patterns use ^\s*).
+        # Continuation parts get their leading whitespace trimmed — the join
+        # space takes its place — so "= _\n   &H1000" becomes "= &H1000".
+        pieces = [
+            p if idx == 0 else p.lstrip()
+            for idx, p in enumerate(accumulated_parts)
+        ]
+        joined = " ".join(p for p in pieces if p)
+        result.append((first_idx + 1, joined))
+        i += 1
+    return result
+
+
 def ac_find_definition(
     db_path: str, symbol: str, kinds: list | None = None,
     match_case: bool = False,
+    scan_types: list | None = None,
+    first_only: bool = False,
 ) -> dict:
     """
     "Go To Definition" for VBA symbols — the mirror of ac_find_usages.
@@ -1113,11 +1184,15 @@ def ac_find_definition(
       - type_field     lines inside a Type ... End Type block
       - sub            [Public|Private] Sub Name(...)
       - function       [Public|Private] Function Name(...) [As Type]
-      - property       Property Get/Let/Set Name(...)
+      - property       Property Get/Let/Set Name(...)   (incl. Default Property)
       - declare        [Public|Private] Declare [PtrSafe] Sub/Function Name Lib "..."
       - variable       module-level Dim/Public/Private/Global NAME [As ...]
                        (vars inside Sub/Function/Property are NOT reported —
                        those are locals, not definitions in the "go to" sense).
+
+    Line continuations (` _` at end of line) are joined into a single
+    logical statement before matching, so multi-line declarations resolve
+    correctly. ``line`` always points at the FIRST physical line.
 
     Args:
         db_path: path to .accdb/.mdb
@@ -1125,6 +1200,12 @@ def ac_find_definition(
         kinds:   optional whitelist, any subset of the 10 kinds above.
                  Default: all kinds.
         match_case: VBA is case-insensitive, so default False.
+        scan_types: which object types to scan. Default ["module", "form",
+                    "report"]. Pass ["module"] to skip forms/reports — much
+                    faster on large DBs, since form/report code-behind needs
+                    a Design-view open/close round-trip per object when the
+                    VBComponent cache is cold.
+        first_only: stop after the first match. Good for unique names.
 
     Returns:
         {"symbol", "total", "definitions": [ ... ]}
@@ -1146,6 +1227,17 @@ def ac_find_definition(
     else:
         kinds_filter = VALID_KINDS
 
+    VALID_SCAN_TYPES = ("module", "form", "report")
+    if scan_types:
+        bad_st = [t for t in scan_types if t not in VALID_SCAN_TYPES]
+        if bad_st:
+            raise ValueError(
+                f"Invalid scan_types {bad_st}. Valid: {list(VALID_SCAN_TYPES)}"
+            )
+        scan_order = tuple(t for t in VALID_SCAN_TYPES if t in scan_types)
+    else:
+        scan_order = VALID_SCAN_TYPES
+
     if match_case:
         def name_matches(n: str) -> bool:
             return n == symbol
@@ -1158,8 +1250,15 @@ def ac_find_definition(
     objects = ac_list_objects(db_path, "all")
     definitions: list[dict] = []
 
-    for obj_type in ("module", "form", "report"):
+    def _stop() -> bool:
+        return first_only and bool(definitions)
+
+    for obj_type in scan_order:
+        if _stop():
+            break
         for obj_name in objects.get(obj_type, []):
+            if _stop():
+                break
             try:
                 cm = _get_code_module(app, obj_type, obj_name)
                 cache_key = f"{obj_type}:{obj_name}"
@@ -1169,30 +1268,32 @@ def ac_find_definition(
             if not all_code:
                 continue
 
-            lines = all_code.splitlines()
+            # Fold line continuations; each tuple = (first_physical_line, clean_text).
+            # clean_text already has trailing VBA comments stripped, respecting
+            # "..." string literals — so value-extraction regex can be greedy-safe.
+            logical = _join_continuations(all_code.splitlines())
             in_proc = False
             in_enum = False
             in_type = False
             current_enum = ""
             current_type = ""
 
-            for i, raw in enumerate(lines, start=1):
-                stripped = raw.rstrip("\r")
-
+            for (i, stripped) in logical:
+                if _stop():
+                    break
                 # Inside proc — only watch for End, ignore everything else
                 if in_proc:
                     if _FD_END_PROC_RE.match(stripped):
                         in_proc = False
                     continue
 
-                # Inside enum — every non-comment line is a member
+                # Inside enum — every non-empty line is a member
                 if in_enum:
                     if _FD_END_ENUM_RE.match(stripped):
                         in_enum = False
                         current_enum = ""
                         continue
-                    body = stripped.split("'", 1)[0].strip()
-                    if not body or "enum_member" not in kinds_filter:
+                    if not stripped or "enum_member" not in kinds_filter:
                         continue
                     m = _FD_ENUM_MEMBER_RE.match(stripped)
                     if m and name_matches(m.group(1)):
@@ -1206,16 +1307,17 @@ def ac_find_definition(
                             "parent_enum": current_enum,
                             "value": value or None,
                         })
+                        if _stop():
+                            break
                     continue
 
-                # Inside type — every non-comment "Name As Type" line is a field
+                # Inside type — every non-empty "Name As Type" line is a field
                 if in_type:
                     if _FD_END_TYPE_RE.match(stripped):
                         in_type = False
                         current_type = ""
                         continue
-                    body = stripped.split("'", 1)[0].strip()
-                    if not body or "type_field" not in kinds_filter:
+                    if not stripped or "type_field" not in kinds_filter:
                         continue
                     m = _FD_TYPE_FIELD_RE.match(stripped)
                     if m and name_matches(m.group(1)):
@@ -1228,6 +1330,8 @@ def ac_find_definition(
                             "parent_type": current_type,
                             "as_type": m.group(2).strip(),
                         })
+                        if _stop():
+                            break
                     continue
 
                 # Module level — try patterns in order of specificity
@@ -1248,6 +1352,8 @@ def ac_find_definition(
                             "declaration": stripped.strip(),
                             "scope": scope,
                         })
+                        if _stop():
+                            break
                     continue
 
                 # Type decl
@@ -1266,6 +1372,8 @@ def ac_find_definition(
                             "declaration": stripped.strip(),
                             "scope": scope,
                         })
+                        if _stop():
+                            break
                     continue
 
                 # Const decl (possibly multi: Const A = 1, B = 2)
@@ -1296,6 +1404,8 @@ def ac_find_definition(
                                         "scope": scope,
                                         "value": sub_m.group(2).strip(),
                                     })
+                                    if _stop():
+                                        break
                     continue
 
                 # Declare decl (Win32 API)
@@ -1315,6 +1425,8 @@ def ac_find_definition(
                                 "declaration": stripped.strip(),
                                 "scope": scope,
                             })
+                            if _stop():
+                                break
                     continue
 
                 # Sub/Function/Property decl
@@ -1331,15 +1443,21 @@ def ac_find_definition(
                     else:
                         kind_cat = "function"
                     if kind_cat in kinds_filter and name_matches(proc_name):
-                        definitions.append({
+                        entry: dict = {
                             "kind": kind_cat,
-                            "subkind": proc_kw,
                             "object_type": obj_type,
                             "object_name": obj_name,
                             "line": i,
                             "declaration": stripped.strip(),
                             "scope": scope,
-                        })
+                        }
+                        # subkind only carries extra information for property
+                        # (Get/Let/Set) — for sub/function it's redundant with kind.
+                        if kind_cat == "property":
+                            entry["subkind"] = proc_kw
+                        definitions.append(entry)
+                        if _stop():
+                            break
                     continue
 
                 # Module-level variable decl
@@ -1361,6 +1479,8 @@ def ac_find_definition(
                                     "declaration": stripped.strip(),
                                     "scope": scope,
                                 })
+                                if _stop():
+                                    break
 
     return {
         "symbol": symbol,

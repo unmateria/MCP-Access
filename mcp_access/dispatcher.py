@@ -516,6 +516,8 @@ def call_tool_sync(name: str, arguments: dict) -> str:
                 arguments["symbol"],
                 kinds=arguments.get("kinds"),
                 match_case=bool(arguments.get("match_case", False)),
+                scan_types=arguments.get("scan_types"),
+                first_only=bool(arguments.get("first_only", False)),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 

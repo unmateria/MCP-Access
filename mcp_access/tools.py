@@ -947,7 +947,9 @@ TOOLS = [
             "for DECLARATIONS of `symbol` and returns where each lives "
             "(object_type, object_name, line, declaration, scope, value if constant). "
             "Detects: const, enum, enum_member, type, type_field, sub, function, "
-            "property (Get/Let/Set), declare (Win32 API), and module-level variable. "
+            "property (Get/Let/Set, incl. Default Property), declare (Win32 API), "
+            "and module-level variable. Handles multi-const lines (Const A=1, B=2) "
+            "and joins VBA line continuations (` _` at end of line). "
             "Use this when you need the value of a constant/enum member, or the source "
             "of a procedure, before deciding what to edit next. Case-insensitive by default."
         ),
@@ -976,6 +978,25 @@ TOOLS = [
                 "match_case": {
                     "type": "boolean", "default": False,
                     "description": "VBA is case-insensitive, so leave False unless you know otherwise.",
+                },
+                "scan_types": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": ["module", "form", "report"]},
+                    "description": (
+                        "Which object types to scan. Default: all three. "
+                        "Pass ['module'] when you know the symbol is a public "
+                        "declaration in a standard module — it's much faster "
+                        "on large DBs because scanning form/report code-behind "
+                        "triggers a Design-view open/close when the VBE cache "
+                        "is cold."
+                    ),
+                },
+                "first_only": {
+                    "type": "boolean", "default": False,
+                    "description": (
+                        "Stop after the first match. Useful for unique names "
+                        "in big databases."
+                    ),
                 },
             },
             "required": ["db_path", "symbol"],
