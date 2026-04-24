@@ -2,11 +2,51 @@
 SQL execution tools: ac_execute_sql, ac_execute_batch, ac_manage_query.
 """
 
+import re
 from typing import Any, Optional
 
 from .core import _Session, log
 from .constants import DESTRUCTIVE_PREFIXES, DB_SEE_CHANGES, QUERYDEF_TYPE
 from .helpers import serialize_value
+
+
+_SQL_LINE_COMMENT = re.compile(r'^--[^\n]*\n?', re.MULTILINE)
+_SQL_BLOCK_COMMENT = re.compile(r'^\s*/\*.*?\*/', re.DOTALL)
+
+
+def _sql_effective_prefix(sql: str) -> str:
+    """Return the leading keyword of a SQL statement after stripping leading
+    whitespace and any leading `--` / `/* ... */` comments.
+
+    Used by the destructive-statement guard so that
+    ``-- note\\nDELETE FROM t`` cannot sneak past a ``startswith("DELETE")``
+    check that only saw ``.strip().upper()`` applied.
+    """
+    s = sql
+    changed = True
+    while changed:
+        changed = False
+        stripped = s.lstrip()
+        if stripped != s:
+            s = stripped
+            changed = True
+        # Leading "-- ..." single-line comment
+        if s.startswith("--"):
+            newline = s.find("\n")
+            if newline == -1:
+                return ""
+            s = s[newline + 1:]
+            changed = True
+            continue
+        # Leading "/* ... */" block comment
+        if s.startswith("/*"):
+            end = s.find("*/")
+            if end == -1:
+                return ""
+            s = s[end + 2:]
+            changed = True
+            continue
+    return s.upper()
 
 
 def ac_execute_sql(
@@ -21,7 +61,9 @@ def ac_execute_sql(
     """
     app = _Session.connect(db_path)
     db = app.CurrentDb()
-    normalized = sql.strip().upper()
+    # Use an effective prefix that ignores leading comments — prevents a
+    # "--\nDELETE FROM t" attempt from slipping past the destructive guard.
+    normalized = _sql_effective_prefix(sql)
 
     if normalized.startswith("SELECT"):
         limit = max(1, min(limit, 10000))
@@ -88,10 +130,10 @@ def ac_execute_batch(
     app = _Session.connect(db_path)
     db = app.CurrentDb()
 
-    # Pre-scan: check destructive
+    # Pre-scan: check destructive (ignore leading SQL comments)
     if not confirm_destructive:
         for i, stmt in enumerate(statements):
-            sql_upper = stmt["sql"].strip().upper()
+            sql_upper = _sql_effective_prefix(stmt["sql"])
             if any(sql_upper.startswith(p) for p in DESTRUCTIVE_PREFIXES):
                 label = stmt.get("label", f"statement[{i}]")
                 return {
@@ -113,7 +155,7 @@ def ac_execute_batch(
             entry["label"] = label
 
         try:
-            sql_upper = sql.upper()
+            sql_upper = _sql_effective_prefix(sql)
             if sql_upper.startswith("SELECT"):
                 try:
                     rs = db.OpenRecordset(sql)

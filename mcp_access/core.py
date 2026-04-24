@@ -146,7 +146,12 @@ class _Session:
         # is running — DispatchEx remains required after /decompile kills to
         # bypass stale ROT entries, but in that path no live instance exists.
         try:
-            cls._app = win32com.client.GetActiveObject("Access.Application")
+            candidate = win32com.client.GetActiveObject("Access.Application")
+            # Sanity check: round-trip a cheap property to catch marshalled
+            # zombie references from a dying process. If this raises, we
+            # treat it as "no running instance" and fall through.
+            _ = candidate.Visible  # noqa: F841
+            cls._app = candidate
             cls._attached = True
             log.info("Attached to existing Access.Application instance")
             try:

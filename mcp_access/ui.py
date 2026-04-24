@@ -299,10 +299,19 @@ def ac_ui_type(
     result_desc = ""
 
     if text:
-        # Type each character using WM_CHAR
+        # Use WM_CHAR for ASCII, WM_UNICHAR for higher code points. WM_CHAR
+        # only reliably delivers bytes 0-127; above that the ANSI code page
+        # of the receiving window controls the mapping (so accented Spanish
+        # or CJK characters would arrive mojibake'd on an English locale).
+        # WM_UNICHAR delivers a UTF-32 code point regardless of window ANSI
+        # settings — but only if the target handles it (returns TRUE to the
+        # WM_UNICHAR check with UNICODE_NOCHAR=0xFFFF). Access controls do.
         WM_CHAR = 0x0102
+        WM_UNICHAR = 0x0109
         for ch in text:
-            win32api.SendMessage(hwnd, WM_CHAR, ord(ch), 0)
+            code = ord(ch)
+            msg = WM_UNICHAR if code > 127 else WM_CHAR
+            win32api.SendMessage(hwnd, msg, code, 0)
             time.sleep(0.01)
         result_desc = f"typed: {text}"
 

@@ -582,7 +582,9 @@ def ac_vbe_find(
     # Determine search range
     search_start = 1
     search_end = len(all_code.splitlines())
-    if proc_name:
+    # Treat whitespace-only / empty proc_name as "search the whole module"
+    # (callers that omit the arg send "" rather than None via MCP schema).
+    if proc_name and proc_name.strip():
         try:
             p_start, _p_body, p_count, _p_kind = _proc_bounds(cm, proc_name)
             search_start = p_start
@@ -961,6 +963,13 @@ def ac_vbe_patch_proc(
 
     # Invalidate cache
     _vbe_code_cache.pop(cache_key, None)
+    # Persist VBE changes to .accdb — without this, patches to form/report
+    # code-behind can be lost because the object's dirty flag is not set.
+    try:
+        obj_type_code = AC_TYPE.get(object_type, 5)
+        app.DoCmd.Save(obj_type_code, object_name)
+    except Exception:
+        pass
     new_total = cm.CountOfLines
     try:
         new_count = cm.ProcCountLines(proc_name, kind) if applied > 0 else 0

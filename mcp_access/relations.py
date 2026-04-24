@@ -159,8 +159,20 @@ def ac_create_relationship(
     }
 
 
-def ac_delete_relationship(db_path: str, name: str) -> dict:
-    """Deletes a relationship between tables by name."""
+def ac_delete_relationship(
+    db_path: str, name: str, confirm: bool = False,
+) -> dict:
+    """Deletes a relationship between tables by name.
+
+    Requires ``confirm=True`` — deleting a relationship is destructive and
+    cannot be undone without recreating the relationship manually, which
+    may involve fields that no longer exist in their original form.
+    """
+    if not confirm:
+        raise RuntimeError(
+            f"Refusing to delete relationship '{name}' without confirm=True. "
+            "Deleting a relationship is irreversible; pass confirm=true to proceed."
+        )
     app = _Session.connect(db_path)
     db = app.CurrentDb()
     try:

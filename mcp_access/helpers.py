@@ -220,3 +220,31 @@ def serialize_value(val: Any) -> Any:
     if isinstance(val, (bytes, memoryview)):
         return f"<binary {len(val)} bytes>"
     return val
+
+
+# ---------------------------------------------------------------------------
+# Form/report code-behind splitter (shared by code.py + controls.py)
+# ---------------------------------------------------------------------------
+
+def split_code_behind(code: str) -> tuple[str, str]:
+    """
+    Splits a form/report text into (form_text, vba_code).
+    If the code contains 'CodeBehindForm' or 'CodeBehindReport', it splits it.
+    Returns (form_text_without_vba, vba_code) where vba_code may be empty.
+    The form_text is cleaned of HasModule if there is VBA (it will be injected later).
+    """
+    for marker in ("CodeBehindForm", "CodeBehindReport"):
+        idx = code.find(marker)
+        if idx != -1:
+            form_part = code[:idx].rstrip() + "\n"
+            vba_part = code[idx:].split("\n", 1)
+            vba_code = vba_part[1] if len(vba_part) > 1 else ""
+            vba_lines = []
+            for line in vba_code.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("Attribute VB_"):
+                    continue
+                vba_lines.append(line)
+            vba_code = "\n".join(vba_lines).strip()
+            return form_part, vba_code
+    return code, ""

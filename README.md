@@ -319,6 +319,22 @@ The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/s
 
 ## Changelog
 
+### v0.7.29 — 2026-04-24
+
+**Audit pass** — bugs and UX rough edges found during a full-package review:
+
+- **`access_vbe_patch_proc` could silently drop patches on form/report code-behind**: the function invalidated the VBE text cache but never called `DoCmd.Save` after writing, unlike `access_vbe_replace_proc` / `access_vbe_replace_lines` / `access_vbe_append`. On forms/reports this meant the object's dirty flag was never raised, so the edits could be discarded on close. Fix: added the same `app.DoCmd.Save(obj_type_code, object_name)` block that the other three writers use.
+- **`access_delete_relationship` now requires `confirm=true`**: deleting a relationship is irreversible and was the only destructive operation in the package without a confirmation guard. Aligned with `access_execute_sql`'s `confirm_destructive` pattern.
+- **Destructive-SQL detection ignored leading comments**: `-- note\nDELETE FROM t` and `/* prefix */ DROP TABLE t` passed through the `startswith("DELETE"|"DROP"|...)` check. New `_sql_effective_prefix()` walks past leading `--` line comments and `/* ... */` block comments before prefix-matching, in both `ac_execute_sql` and `ac_execute_batch`.
+- **`access_output_report` now refuses to clobber existing files unless `overwrite=true`**: Access `DoCmd.OutputTo` silently overwrites, which can lose an earlier export if the same `output_path` is reused.
+- **`access_ui_type` now uses `WM_UNICHAR` for non-ASCII characters**: accented Spanish (á, é, ñ), Cyrillic, CJK, and other code points >127 were being sent via `WM_CHAR` with `ord(ch)`, which routes through the window's ANSI code page and produces mojibake on English locales. Characters ≤127 still use `WM_CHAR` so keyboard shortcuts work the same.
+- **`access_vbe_find` with `proc_name=""` no longer errors**: some MCP clients send `""` instead of omitting the argument when a procedure-scope filter is not wanted. Now treated as "search the whole module".
+- **Hardened `GetActiveObject` attach**: a round-trip property read now validates that the returned COM reference points at a live Access process before `_attached=True` is set. Zombie marshalled references from a dying process now fall through to `DispatchEx` cleanly.
+- **Deduplicated `_split_code_behind`**: was byte-identical in `code.py` and `controls.py`, now lives in `helpers.split_code_behind` with backwards-compatible re-exports at both old names.
+- **Minor**: `"Error en %s"` log message in dispatcher translated to English; removed an unused `DB_SEE_CHANGES` import in `database.py`.
+
+Tool count unchanged (62). Documented false positives from the review (type-name case mismatch in `ac_table_info`, silent-typo in `ac_set_control_props`) were verified against the code and turned out to be non-issues.
+
 ### v0.7.28 — 2026-04-24
 
 **Polish of `access_find_definition`** (v0.7.27 follow-up):

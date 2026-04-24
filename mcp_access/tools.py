@@ -680,7 +680,11 @@ TOOLS = [
     # -- Output report -------------------------------------------------------
     types.Tool(
         name="access_output_report",
-        description="Exports a report to PDF, XLSX, RTF or TXT. output_path auto-generated if omitted.",
+        description=(
+            "Exports a report to PDF, XLSX, RTF or TXT. output_path "
+            "auto-generated if omitted. Refuses to overwrite an existing "
+            "file unless overwrite=true."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
@@ -688,6 +692,10 @@ TOOLS = [
                 "report_name": {"type": "string", "description": "Report name"},
                 "output_path": {"type": "string", "description": "Output path (auto if omitted)"},
                 "format": {"type": "string", "default": "pdf", "description": "pdf, xlsx, rtf, txt"},
+                "overwrite": {
+                    "type": "boolean", "default": False,
+                    "description": "Replace existing file. Default false — prevents accidental clobber.",
+                },
             },
             "required": ["db_path", "report_name"],
         },
@@ -905,12 +913,19 @@ TOOLS = [
     # -- Delete relationship -------------------------------------------------
     types.Tool(
         name="access_delete_relationship",
-        description="Deletes a relationship between tables by name.",
+        description=(
+            "Deletes a relationship between tables by name. "
+            "Requires confirm=true — this is irreversible."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
                 "db_path": {"type": "string", "description": "Path to .accdb/.mdb file"},
                 "name": {"type": "string", "description": "Name of the relationship to delete"},
+                "confirm": {
+                    "type": "boolean", "default": False,
+                    "description": "Must be true to actually delete — safety guard.",
+                },
             },
             "required": ["db_path", "name"],
         },

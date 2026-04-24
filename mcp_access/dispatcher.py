@@ -314,6 +314,7 @@ def call_tool_sync(name: str, arguments: dict) -> str:
             result = ac_delete_relationship(
                 arguments["db_path"],
                 arguments["name"],
+                confirm=bool(arguments.get("confirm", False)),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -389,6 +390,7 @@ def call_tool_sync(name: str, arguments: dict) -> str:
                 arguments["report_name"],
                 output_path=arguments.get("output_path"),
                 fmt=arguments.get("format", "pdf"),
+                overwrite=bool(arguments.get("overwrite", False)),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -594,7 +596,7 @@ def call_tool_sync(name: str, arguments: dict) -> str:
             text = f"ERROR: unknown tool '{name}'"
 
     except Exception as exc:
-        log.error("Error en %s: %s", name, exc, exc_info=True)
+        log.error("Error in %s: %s", name, exc, exc_info=True)
 
         # Build detailed error message for the LLM
         tb_lines = traceback.format_exc().splitlines()

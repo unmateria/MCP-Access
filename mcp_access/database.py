@@ -10,7 +10,7 @@ from .core import (
     AC_TYPE, _Session, _vbe_code_cache, _parsed_controls_cache, log,
     invalidate_all_caches,
 )
-from .constants import FIELD_TYPE_MAP, DB_AUTO_INCR_FIELD, DAO_FIELD_TYPE, DB_SEE_CHANGES
+from .constants import FIELD_TYPE_MAP, DB_AUTO_INCR_FIELD, DAO_FIELD_TYPE
 
 
 # ---------------------------------------------------------------------------

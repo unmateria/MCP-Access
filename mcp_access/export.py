@@ -24,8 +24,14 @@ from .constants import (
 def ac_output_report(
     db_path: str, report_name: str,
     output_path: Optional[str] = None, fmt: str = "pdf",
+    overwrite: bool = False,
 ) -> dict:
-    """Exports a report to PDF, XLSX, RTF or TXT."""
+    """Exports a report to PDF, XLSX, RTF or TXT.
+
+    If ``overwrite`` is False (default) and ``output_path`` already exists,
+    the call is refused — Access ``OutputTo`` silently clobbers otherwise
+    and earlier exports can be lost by accident.
+    """
     app = _Session.connect(db_path)
     fmt_lower = fmt.lower()
     format_string = OUTPUT_FORMATS.get(fmt_lower)
@@ -39,6 +45,11 @@ def ac_output_report(
         output_path = os.path.join(db_dir, f"{report_name}{ext_map[fmt_lower]}")
 
     output_path = str(Path(output_path).resolve())
+    if os.path.exists(output_path) and not overwrite:
+        raise RuntimeError(
+            f"Output file already exists: {output_path}. "
+            "Pass overwrite=true to replace it."
+        )
     try:
         app.DoCmd.OutputTo(AC_OUTPUT_REPORT, report_name, format_string, output_path)
     except Exception as exc:

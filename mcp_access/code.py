@@ -155,34 +155,10 @@ def ac_get_code(db_path: str, object_type: str, name: str) -> str:
             pass
 
 
-# ---------------------------------------------------------------------------
-# Split CodeBehind from form/report text
-# ---------------------------------------------------------------------------
-
-def _split_code_behind(code: str) -> tuple[str, str]:
-    """
-    Splits a form/report text into (form_text, vba_code).
-    If the code contains 'CodeBehindForm' or 'CodeBehindReport', it splits it.
-    Returns (form_text_without_vba, vba_code) where vba_code may be empty.
-    The form_text is cleaned of HasModule if there is VBA (it will be injected later).
-    """
-    # Find the line that marks the start of VBA code
-    for marker in ("CodeBehindForm", "CodeBehindReport"):
-        idx = code.find(marker)
-        if idx != -1:
-            form_part = code[:idx].rstrip() + "\n"
-            vba_part = code[idx:].split("\n", 1)
-            vba_code = vba_part[1] if len(vba_part) > 1 else ""
-            # Remove Attribute VB_ lines from VBA (auto-generated)
-            vba_lines = []
-            for line in vba_code.splitlines():
-                stripped = line.strip()
-                if stripped.startswith("Attribute VB_"):
-                    continue
-                vba_lines.append(line)
-            vba_code = "\n".join(vba_lines).strip()
-            return form_part, vba_code
-    return code, ""
+# _split_code_behind has moved to helpers.split_code_behind — it was
+# duplicated byte-for-byte in code.py and controls.py. Re-exported here
+# under the old name for backwards compatibility within this module.
+from .helpers import split_code_behind as _split_code_behind  # noqa: E402,F401
 
 
 # ---------------------------------------------------------------------------
