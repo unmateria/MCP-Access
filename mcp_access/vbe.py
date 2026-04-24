@@ -1033,3 +1033,337 @@ def ac_vbe_append(
     if health:
         result += f"\n" + "\n".join(health)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Find definition — "Go To Definition" for VBA symbols
+# (requested by Tom — @TvanStiphout-Home, thanks!)
+# ---------------------------------------------------------------------------
+
+_FD_PROC_RE = re.compile(
+    r'^\s*(?:(Public|Private|Friend|Global|Static)\s+)?(?:Static\s+)?'
+    r'(Sub|Function|Property\s+Get|Property\s+Let|Property\s+Set)\s+(\w+)',
+    re.IGNORECASE,
+)
+_FD_END_PROC_RE = re.compile(r'^\s*End\s+(Sub|Function|Property)\b', re.IGNORECASE)
+_FD_CONST_RE = re.compile(r'^\s*(?:(?:Public|Private|Global)\s+)?Const\s+', re.IGNORECASE)
+_FD_ENUM_RE = re.compile(r'^\s*(?:(Public|Private)\s+)?Enum\s+(\w+)', re.IGNORECASE)
+_FD_END_ENUM_RE = re.compile(r'^\s*End\s+Enum\b', re.IGNORECASE)
+_FD_TYPE_RE = re.compile(r'^\s*(?:(Public|Private)\s+)?Type\s+(\w+)', re.IGNORECASE)
+_FD_END_TYPE_RE = re.compile(r'^\s*End\s+Type\b', re.IGNORECASE)
+_FD_DECLARE_RE = re.compile(
+    r'^\s*(?:(Public|Private)\s+)?Declare\s+(?:PtrSafe\s+)?(Sub|Function)\s+(\w+)',
+    re.IGNORECASE,
+)
+# Variable decl: starts with Public/Private/Global/Dim, followed by something
+# that is NOT Const/Enum/Type/Sub/Function/Property/Declare.
+_FD_VAR_RE = re.compile(
+    r'^\s*(Public|Private|Global|Dim)\s+'
+    r'(?!Const\b|Enum\b|Type\b|Sub\b|Function\b|Property\b|Declare\b)',
+    re.IGNORECASE,
+)
+_FD_ENUM_MEMBER_RE = re.compile(r'^\s*(\w+)(?:\s*=\s*([^\']+?))?\s*(?:\'.*)?$')
+_FD_TYPE_FIELD_RE = re.compile(
+    r'^\s*(\w+)(?:\([^)]*\))?\s+As\s+(.+?)(?:\s*\'.*)?$', re.IGNORECASE,
+)
+
+
+def _split_top_level_commas(s: str) -> list[str]:
+    """Split string by commas that are not inside parens or double quotes."""
+    parts: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    in_quote = False
+    for ch in s:
+        if ch == '"':
+            in_quote = not in_quote
+            buf.append(ch)
+        elif ch == '(' and not in_quote:
+            depth += 1
+            buf.append(ch)
+        elif ch == ')' and not in_quote:
+            depth -= 1
+            buf.append(ch)
+        elif ch == ',' and not in_quote and depth == 0:
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    if buf:
+        parts.append("".join(buf))
+    return parts
+
+
+def ac_find_definition(
+    db_path: str, symbol: str, kinds: list | None = None,
+    match_case: bool = False,
+) -> dict:
+    """
+    "Go To Definition" for VBA symbols — the mirror of ac_find_usages.
+
+    Scans every VBA code module (standard modules, form code-behind, report
+    code-behind) for DECLARATIONS of the given symbol and returns where each
+    one lives (object, line, declaration text, scope).
+
+    Detects:
+      - const          Public/Private/Global Const FOO = ...  (multi on one line OK)
+      - enum           Public/Private Enum MyEnum
+      - enum_member    lines inside an Enum ... End Enum block
+      - type           Public/Private Type MyStruct
+      - type_field     lines inside a Type ... End Type block
+      - sub            [Public|Private] Sub Name(...)
+      - function       [Public|Private] Function Name(...) [As Type]
+      - property       Property Get/Let/Set Name(...)
+      - declare        [Public|Private] Declare [PtrSafe] Sub/Function Name Lib "..."
+      - variable       module-level Dim/Public/Private/Global NAME [As ...]
+                       (vars inside Sub/Function/Property are NOT reported —
+                       those are locals, not definitions in the "go to" sense).
+
+    Args:
+        db_path: path to .accdb/.mdb
+        symbol:  name to resolve (e.g. "dbAccess", "modGlobal", "ccRed")
+        kinds:   optional whitelist, any subset of the 10 kinds above.
+                 Default: all kinds.
+        match_case: VBA is case-insensitive, so default False.
+
+    Returns:
+        {"symbol", "total", "definitions": [ ... ]}
+    """
+    # Lazy import to avoid circular dependency
+    from .code import ac_list_objects
+
+    VALID_KINDS = {
+        "const", "enum", "enum_member", "type", "type_field",
+        "sub", "function", "property", "declare", "variable",
+    }
+    if kinds:
+        bad = [k for k in kinds if k not in VALID_KINDS]
+        if bad:
+            raise ValueError(
+                f"Invalid kind(s) {bad}. Valid: {sorted(VALID_KINDS)}"
+            )
+        kinds_filter = set(kinds)
+    else:
+        kinds_filter = VALID_KINDS
+
+    if match_case:
+        def name_matches(n: str) -> bool:
+            return n == symbol
+    else:
+        symbol_lower = symbol.lower()
+        def name_matches(n: str) -> bool:
+            return n.lower() == symbol_lower
+
+    app = _Session.connect(db_path)
+    objects = ac_list_objects(db_path, "all")
+    definitions: list[dict] = []
+
+    for obj_type in ("module", "form", "report"):
+        for obj_name in objects.get(obj_type, []):
+            try:
+                cm = _get_code_module(app, obj_type, obj_name)
+                cache_key = f"{obj_type}:{obj_name}"
+                all_code = _cm_all_code(cm, cache_key)
+            except Exception:
+                continue  # skip modules we cannot access
+            if not all_code:
+                continue
+
+            lines = all_code.splitlines()
+            in_proc = False
+            in_enum = False
+            in_type = False
+            current_enum = ""
+            current_type = ""
+
+            for i, raw in enumerate(lines, start=1):
+                stripped = raw.rstrip("\r")
+
+                # Inside proc — only watch for End, ignore everything else
+                if in_proc:
+                    if _FD_END_PROC_RE.match(stripped):
+                        in_proc = False
+                    continue
+
+                # Inside enum — every non-comment line is a member
+                if in_enum:
+                    if _FD_END_ENUM_RE.match(stripped):
+                        in_enum = False
+                        current_enum = ""
+                        continue
+                    body = stripped.split("'", 1)[0].strip()
+                    if not body or "enum_member" not in kinds_filter:
+                        continue
+                    m = _FD_ENUM_MEMBER_RE.match(stripped)
+                    if m and name_matches(m.group(1)):
+                        value = (m.group(2) or "").strip()
+                        definitions.append({
+                            "kind": "enum_member",
+                            "object_type": obj_type,
+                            "object_name": obj_name,
+                            "line": i,
+                            "declaration": stripped.strip(),
+                            "parent_enum": current_enum,
+                            "value": value or None,
+                        })
+                    continue
+
+                # Inside type — every non-comment "Name As Type" line is a field
+                if in_type:
+                    if _FD_END_TYPE_RE.match(stripped):
+                        in_type = False
+                        current_type = ""
+                        continue
+                    body = stripped.split("'", 1)[0].strip()
+                    if not body or "type_field" not in kinds_filter:
+                        continue
+                    m = _FD_TYPE_FIELD_RE.match(stripped)
+                    if m and name_matches(m.group(1)):
+                        definitions.append({
+                            "kind": "type_field",
+                            "object_type": obj_type,
+                            "object_name": obj_name,
+                            "line": i,
+                            "declaration": stripped.strip(),
+                            "parent_type": current_type,
+                            "as_type": m.group(2).strip(),
+                        })
+                    continue
+
+                # Module level — try patterns in order of specificity
+
+                # Enum decl
+                m = _FD_ENUM_RE.match(stripped)
+                if m:
+                    enum_name = m.group(2)
+                    scope = (m.group(1) or "").strip() or None
+                    in_enum = True
+                    current_enum = enum_name
+                    if "enum" in kinds_filter and name_matches(enum_name):
+                        definitions.append({
+                            "kind": "enum",
+                            "object_type": obj_type,
+                            "object_name": obj_name,
+                            "line": i,
+                            "declaration": stripped.strip(),
+                            "scope": scope,
+                        })
+                    continue
+
+                # Type decl
+                m = _FD_TYPE_RE.match(stripped)
+                if m:
+                    type_name = m.group(2)
+                    scope = (m.group(1) or "").strip() or None
+                    in_type = True
+                    current_type = type_name
+                    if "type" in kinds_filter and name_matches(type_name):
+                        definitions.append({
+                            "kind": "type",
+                            "object_type": obj_type,
+                            "object_name": obj_name,
+                            "line": i,
+                            "declaration": stripped.strip(),
+                            "scope": scope,
+                        })
+                    continue
+
+                # Const decl (possibly multi: Const A = 1, B = 2)
+                if _FD_CONST_RE.match(stripped):
+                    if "const" in kinds_filter:
+                        scope_m = re.match(
+                            r'^\s*(Public|Private|Global)\s+Const',
+                            stripped, re.IGNORECASE,
+                        )
+                        scope = scope_m.group(1) if scope_m else None
+                        rest_m = re.match(
+                            r'^\s*(?:(?:Public|Private|Global)\s+)?Const\s+(.+)$',
+                            stripped, re.IGNORECASE,
+                        )
+                        if rest_m:
+                            for part in _split_top_level_commas(rest_m.group(1)):
+                                sub_m = re.match(
+                                    r'^\s*(\w+)\s*(?:As\s+[\w.]+)?\s*=\s*(.+?)\s*$',
+                                    part, re.IGNORECASE,
+                                )
+                                if sub_m and name_matches(sub_m.group(1)):
+                                    definitions.append({
+                                        "kind": "const",
+                                        "object_type": obj_type,
+                                        "object_name": obj_name,
+                                        "line": i,
+                                        "declaration": stripped.strip(),
+                                        "scope": scope,
+                                        "value": sub_m.group(2).strip(),
+                                    })
+                    continue
+
+                # Declare decl (Win32 API)
+                m = _FD_DECLARE_RE.match(stripped)
+                if m:
+                    if "declare" in kinds_filter:
+                        scope = (m.group(1) or "").strip() or None
+                        decl_kind = m.group(2)  # Sub or Function
+                        decl_name = m.group(3)
+                        if name_matches(decl_name):
+                            definitions.append({
+                                "kind": "declare",
+                                "subkind": decl_kind,
+                                "object_type": obj_type,
+                                "object_name": obj_name,
+                                "line": i,
+                                "declaration": stripped.strip(),
+                                "scope": scope,
+                            })
+                    continue
+
+                # Sub/Function/Property decl
+                m = _FD_PROC_RE.match(stripped)
+                if m:
+                    scope = (m.group(1) or "").strip() or None
+                    proc_kw = re.sub(r'\s+', ' ', m.group(2).strip())
+                    proc_name = m.group(3)
+                    in_proc = True
+                    if proc_kw.lower().startswith("property"):
+                        kind_cat = "property"
+                    elif proc_kw.lower() == "sub":
+                        kind_cat = "sub"
+                    else:
+                        kind_cat = "function"
+                    if kind_cat in kinds_filter and name_matches(proc_name):
+                        definitions.append({
+                            "kind": kind_cat,
+                            "subkind": proc_kw,
+                            "object_type": obj_type,
+                            "object_name": obj_name,
+                            "line": i,
+                            "declaration": stripped.strip(),
+                            "scope": scope,
+                        })
+                    continue
+
+                # Module-level variable decl
+                if "variable" in kinds_filter and _FD_VAR_RE.match(stripped):
+                    scope_m = re.match(
+                        r'^\s*(Public|Private|Global|Dim)\s+(?:WithEvents\s+)?(.+)$',
+                        stripped, re.IGNORECASE,
+                    )
+                    if scope_m:
+                        scope = scope_m.group(1)
+                        for part in _split_top_level_commas(scope_m.group(2)):
+                            name_m = re.match(r'^\s*(\w+)', part)
+                            if name_m and name_matches(name_m.group(1)):
+                                definitions.append({
+                                    "kind": "variable",
+                                    "object_type": obj_type,
+                                    "object_name": obj_name,
+                                    "line": i,
+                                    "declaration": stripped.strip(),
+                                    "scope": scope,
+                                })
+
+    return {
+        "symbol": symbol,
+        "total": len(definitions),
+        "definitions": definitions,
+    }

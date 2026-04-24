@@ -938,6 +938,49 @@ TOOLS = [
             "required": ["db_path", "search_text"],
         },
     ),
+    # -- Find definition (Go To Definition for VBA symbols) -----------------
+    types.Tool(
+        name="access_find_definition",
+        description=(
+            "Go-to-definition for a VBA symbol — the mirror of access_find_usages. "
+            "Scans every standard module, form code-behind and report code-behind "
+            "for DECLARATIONS of `symbol` and returns where each lives "
+            "(object_type, object_name, line, declaration, scope, value if constant). "
+            "Detects: const, enum, enum_member, type, type_field, sub, function, "
+            "property (Get/Let/Set), declare (Win32 API), and module-level variable. "
+            "Use this when you need the value of a constant/enum member, or the source "
+            "of a procedure, before deciding what to edit next. Case-insensitive by default."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Path to .accdb/.mdb file"},
+                "symbol": {
+                    "type": "string",
+                    "description": "Name to resolve (e.g. 'dbAccess', 'ccRed', 'ProcessInvoices')",
+                },
+                "kinds": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": [
+                            "const", "enum", "enum_member", "type", "type_field",
+                            "sub", "function", "property", "declare", "variable",
+                        ],
+                    },
+                    "description": (
+                        "Optional whitelist. Default: all kinds. "
+                        "E.g. ['const','enum_member'] to resolve only constant-like names."
+                    ),
+                },
+                "match_case": {
+                    "type": "boolean", "default": False,
+                    "description": "VBA is case-insensitive, so leave False unless you know otherwise.",
+                },
+            },
+            "required": ["db_path", "symbol"],
+        },
+    ),
     # -- Batch SQL -----------------------------------------------------------
     types.Tool(
         name="access_execute_batch",

@@ -11,7 +11,7 @@ MCP server for reading and editing Microsoft Access databases (`.accdb`/`.mdb`) 
 - **Caches**: `_vbe_code_cache` (VBE text), `_parsed_controls_cache` (control parsing), `_Session._cm_cache` (CodeModule COM objects). All invalidated on DB switch, object modification, and design operations.
 - **Binary section handling**: `ac_get_code` strips PrtMip/PrtDevMode from form/report exports; `ac_set_code` restores them automatically before import.
 
-## Tools (61 total)
+## Tools (62 total)
 
 | Category | Tools |
 |----------|-------|
@@ -35,7 +35,7 @@ MCP server for reading and editing Microsoft Access databases (`.accdb`/`.mdb`) 
 | **Data Transfer** | `access_transfer_data` |
 | **Field Properties** | `access_get_field_properties`, `access_set_field_property` |
 | **Startup Options** | `access_list_startup_options` |
-| **Cross-reference** | `access_find_usages` |
+| **Cross-reference** | `access_find_usages`, `access_find_definition` |
 | **Knowledge base** | `access_tips` |
 
 ## Key Implementation Details

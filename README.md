@@ -2,7 +2,7 @@
 
 **Give any AI assistant full control over Microsoft Access databases.**
 
-Create forms, write VBA, design tables, manage controls, run queries, build relationships, and edit every corner of an `.accdb` — all through natural language. 61 tools that turn Access into something you can *talk to*.
+Create forms, write VBA, design tables, manage controls, run queries, build relationships, and edit every corner of an `.accdb` — all through natural language. 62 tools that turn Access into something you can *talk to*.
 
 No Access expertise required. Just describe what you want.
 
@@ -318,6 +318,12 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/session.py` that swallows real errors and returns a generic `-32602` code with no detail. A local patch is applied to this machine that includes the actual exception and traceback in the error response. If you upgrade the `mcp` package, re-apply the patch — see `CLAUDE.md` for details.
 
 ## Changelog
+
+### v0.7.27 — 2026-04-24
+
+**New tool** — thanks to [@TvanStiphout-Home](https://github.com/TvanStiphout-Home):
+
+- **`access_find_definition`** — "Go To Definition" for VBA symbols, the mirror of `access_find_usages`. Scans every standard module, form code-behind and report code-behind for DECLARATIONS of a given name and returns where each one lives (object, line, full declaration, scope, and for constants the literal value). Detects `Const` (including multi-const lines like `Const A = 1, B = 2`), `Enum` + enum members, `Type` + type fields, `Sub`, `Function`, `Property Get/Let/Set`, `Declare` (Win32 API), and module-level `Dim/Public/Private/Global` variables. Locals inside a `Sub`/`Function`/`Property` are correctly skipped — they are not definitions in the "go to" sense. Case-insensitive by default (VBA is), with an optional `kinds` whitelist to narrow results (e.g. `["const","enum_member"]` when resolving a symbol used as a numeric literal like `dbAccess`). Previously the agent had to spawn throw-away VBA helpers with `MsgBox` just to discover the value of a named constant — this tool makes that unnecessary.
 
 ### v0.7.26 — 2026-04-23
 

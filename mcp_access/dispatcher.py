@@ -11,7 +11,7 @@ from .vbe import (
     ac_vbe_get_lines, ac_vbe_get_proc, ac_vbe_module_info,
     ac_vbe_replace_lines, ac_vbe_find, ac_vbe_search_all,
     ac_search_queries, ac_vbe_replace_proc, ac_vbe_patch_proc,
-    ac_vbe_append, ac_find_usages,
+    ac_vbe_append, ac_find_usages, ac_find_definition,
 )
 from .controls import (
     ac_list_controls, ac_get_control, ac_create_control,
@@ -506,6 +506,16 @@ def call_tool_sync(name: str, arguments: dict) -> str:
                 bool(arguments.get("match_case", False)),
                 int(arguments.get("max_results", 200)),
                 bool(arguments.get("use_regex", False)),
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        # -- Find definition (Go To Definition) ---------------------------
+        elif name == "access_find_definition":
+            result = ac_find_definition(
+                arguments["db_path"],
+                arguments["symbol"],
+                kinds=arguments.get("kinds"),
+                match_case=bool(arguments.get("match_case", False)),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
