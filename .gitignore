@@ -4,3 +4,5 @@ __pycache__/
 .env
 .mcp.json
 .claude/
+/nul
+*.modified_backup
