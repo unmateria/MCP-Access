@@ -13,7 +13,7 @@ import tempfile
 from typing import Any
 
 from .core import (
-    AC_TYPE, _Session, _vbe_code_cache, _parsed_controls_cache, log,
+    AC_TYPE, _Session, _parsed_controls_cache, log,
     invalidate_object_caches, _get_vb_project,
 )
 from .constants import (
@@ -164,14 +164,16 @@ def _force_vbe_init(app, object_type: str, object_name: str):
 
 def _cm_all_code(cm: Any, cache_key: str) -> str:
     """
-    Returns the full text of a CodeModule using _vbe_code_cache.
-    In a session with multiple tools on the same module, the full COM read
-    (cm.Lines) is done once; subsequent calls use the cache.
+    Returns the full text of a CodeModule by reading directly from COM.
+    Previously cached in _vbe_code_cache, but the cache could not detect
+    edits made outside the MCP (manual VBE edits, Ctrl+Z, add-ins) and
+    served stale text. See GitHub issue #26.
+
+    The ``cache_key`` parameter is kept for call-site compatibility and is
+    unused.
     """
-    if cache_key not in _vbe_code_cache:
-        total = cm.CountOfLines
-        _vbe_code_cache[cache_key] = cm.Lines(1, total) if total > 0 else ""
-    return _vbe_code_cache[cache_key]
+    total = cm.CountOfLines
+    return cm.Lines(1, total) if total > 0 else ""
 
 
 # ---------------------------------------------------------------------------
@@ -502,9 +504,8 @@ def ac_vbe_replace_lines(
                 int(op["start_line"]), int(op["count"]), op.get("new_code", ""),
             )
             results.append(r)
-        # Invalidar cache + persist
+        # Persist
         cache_key = f"{object_type}:{object_name}"
-        _vbe_code_cache.pop(cache_key, None)
         try:
             obj_type_code = AC_TYPE.get(object_type, 5)
             app.DoCmd.Save(obj_type_code, object_name)
@@ -530,9 +531,7 @@ def ac_vbe_replace_lines(
 
     # ── Single mode (backward compatible) ──
     r = _exec_single_replace(cm, app, object_type, object_name, start_line, count, new_code)
-    # Invalidate text cache (module changed)
     cache_key = f"{object_type}:{object_name}"
-    _vbe_code_cache.pop(cache_key, None)
     # Persist VBE changes to .accdb — without this, changes are only in memory
     try:
         obj_type_code = AC_TYPE.get(object_type, 5)  # acModule=5 default
@@ -570,7 +569,6 @@ def ac_vbe_find(
 ) -> dict:
     """
     Searches text (or regex) in a module and returns all matching lines.
-    Uses _vbe_code_cache to avoid re-reading the module if already read.
 
     If proc_name is passed, limits the search to that procedure's range.
     Always enriches each match with 'proc' (name of the owning procedure).
@@ -850,9 +848,7 @@ def ac_vbe_replace_proc(
         except Exception:
             pass  # best-effort restore
         raise
-    # Invalidate cache
     cache_key = f"{object_type}:{object_name}"
-    _vbe_code_cache.pop(cache_key, None)
     new_total = cm.CountOfLines
     # Health check
     health = _check_module_health(cm, cache_key)
@@ -965,8 +961,6 @@ def ac_vbe_patch_proc(
             pass
         raise
 
-    # Invalidate cache
-    _vbe_code_cache.pop(cache_key, None)
     # Persist VBE changes to .accdb — without this, patches to form/report
     # code-behind can be lost because the object's dirty flag is not set.
     try:
@@ -1030,7 +1024,6 @@ def ac_vbe_append(
     cm.InsertLines(total + 1, normalized)
     inserted = cm.CountOfLines - total
     cache_key = f"{object_type}:{object_name}"
-    _vbe_code_cache.pop(cache_key, None)
     # Persist VBE changes to .accdb
     try:
         obj_type_code = AC_TYPE.get(object_type, 5)

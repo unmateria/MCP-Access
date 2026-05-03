@@ -319,6 +319,20 @@ The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/s
 
 ## Changelog
 
+### v0.7.31 — 2026-05-03
+
+**Fix `_vbe_code_cache` returning stale text after external edits** — thanks to [@TvanStiphout-Home](https://github.com/TvanStiphout-Home) for reporting in [issue #26](https://github.com/unmateria/MCP-Access/issues/26):
+
+- **The bug**: `access_vbe_get_proc` (and other VBE read tools) could return a cached snapshot of a procedure that no longer matched what was in the VBE module. The cache was only invalidated when the MCP itself wrote to the module — manual edits in the VBE (including Ctrl+Z), add-ins, or any change made outside the MCP left the cache stale. Worse, the WRITE tools (`access_vbe_replace_proc` / `patch_proc` / `replace_lines` / `append`) also read through the same cache before writing, so they could overwrite the wrong baseline and corrupt code.
+- **The fix**: `_cm_all_code()` no longer caches; it reads directly from COM via `cm.Lines(1, total)` on every call. The `_vbe_code_cache` dictionary and all its `.pop` / `.clear` invalidation sites have been removed (`core.py`, `vbe.py`, `code.py`, `controls.py`, `compile.py`, `maintenance.py`, `relations.py`, plus stale imports in `database.py` and `helpers.py`). The `_Session._cm_cache` (CodeModule COM proxies) is kept — proxies are live, not snapshots, so they don't suffer the same problem and they save 2 COM calls per VBE tool. Tom's case (Claude wrote a buggy version with `replace_proc`, Tom reverted manually in VBE, the next `get_proc` still served the buggy cached version) now reads fresh from COM and matches the real module state.
+
+**`access_relink_table` no longer hangs the COM session on a bad ODBC connect string**:
+
+- **The bug**: passing an unreachable SQL Server (wrong host, firewalled named-instance, or simply not running) caused the ODBC driver to open a modal *"SQL Server Login"* dialog inside Access. There is no human at the keyboard in an MCP session, so the dialog was never dismissed and the entire COM session hung indefinitely.
+- **The fix**: `_ensure_login_timeout()` injects `LoginTimeout=8` into the connect string when missing, so DAO bails out instead of opening a dialog. Before touching DAO at all, `_odbc_preflight()` test-opens the connect string via ADODB; if that fails, `ac_relink_table` raises a clean `RuntimeError` with the underlying ODBC error. `_detect_named_instance()` adds a hint for the common case of a `SERVER=host\instance` named instance whose UDP 1434 (SQL Browser) is firewalled — the suggested fix is to switch to explicit TCP `SERVER=host,port`.
+
+Tool count unchanged (62).
+
 ### v0.7.30 — 2026-05-03
 
 **Bug fix** — thanks to [@CaptainStormfield](https://github.com/CaptainStormfield) ([#27](https://github.com/unmateria/MCP-Access/pull/27)):

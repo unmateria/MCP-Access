@@ -63,7 +63,6 @@ AC_TYPE: dict[str, int] = {
 # ---------------------------------------------------------------------------
 # Caches to reduce COM calls in long sessions
 # ---------------------------------------------------------------------------
-_vbe_code_cache: dict = {}        # "type:name" -> full text of VBE module
 _parsed_controls_cache: dict = {} # "form:name" / "report:name" -> _parse_controls() result
 
 
@@ -129,7 +128,6 @@ class _Session:
         cls._attached = False
         cls._cm_cache.clear()
         cls._decompiled_dbs.clear()
-        _vbe_code_cache.clear()
         _parsed_controls_cache.clear()
 
     @classmethod
@@ -219,7 +217,6 @@ class _Session:
                 # caches/state that become invalid after the subprocess runs.
                 cls._db_open = None
                 cls._cm_cache.clear()
-                _vbe_code_cache.clear()
                 _parsed_controls_cache.clear()
             else:
                 try:
@@ -230,7 +227,6 @@ class _Session:
                 cls._db_open = None
                 cls._attached = False
                 cls._cm_cache.clear()
-                _vbe_code_cache.clear()
                 _parsed_controls_cache.clear()
 
         log.info("Decompiling %s ...", path)
@@ -459,7 +455,6 @@ class _Session:
 
         # Clear caches on DB switch
         cls._cm_cache.clear()
-        _vbe_code_cache.clear()
         _parsed_controls_cache.clear()
         log.info("DB opened OK")
 
@@ -475,7 +470,6 @@ class _Session:
                 cls._attached = False
                 cls._cm_cache.clear()
                 cls._decompiled_dbs.clear()
-                _vbe_code_cache.clear()
                 _parsed_controls_cache.clear()
                 return
             log.info("Closing Access...")
@@ -492,7 +486,6 @@ class _Session:
                 cls._attached = False
                 cls._cm_cache.clear()
                 cls._decompiled_dbs.clear()
-                _vbe_code_cache.clear()
                 _parsed_controls_cache.clear()
 
 
@@ -529,8 +522,7 @@ def _get_vb_project(app):
 
 
 def invalidate_all_caches():
-    """Convenience: clear all 3 caches at once."""
-    _vbe_code_cache.clear()
+    """Convenience: clear all caches at once."""
     _parsed_controls_cache.clear()
     _Session._cm_cache.clear()
 
@@ -538,6 +530,5 @@ def invalidate_all_caches():
 def invalidate_object_caches(object_type: str, object_name: str):
     """Clear caches for a specific object."""
     cache_key = f"{object_type}:{object_name}"
-    _vbe_code_cache.pop(cache_key, None)
     _parsed_controls_cache.pop(cache_key, None)
     _Session._cm_cache.pop(cache_key, None)

@@ -7,7 +7,7 @@ import threading
 import time
 from typing import Optional
 
-from .core import _Session, _vbe_code_cache, log
+from .core import _Session, log
 from .constants import AC_CMD_COMPILE
 
 
@@ -623,7 +623,6 @@ def ac_compile_vba(db_path: str, timeout: Optional[int] = None) -> dict:
             except Exception:
                 pass
 
-    _vbe_code_cache.clear()
     _Session._cm_cache.clear()
 
     # 4. Check results: dialog dismissed = compile error caught.

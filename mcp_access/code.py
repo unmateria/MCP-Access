@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .core import (
-    AC_TYPE, _Session, _vbe_code_cache, _parsed_controls_cache, log,
+    AC_TYPE, _Session, _parsed_controls_cache, log,
     invalidate_all_caches, invalidate_object_caches,
 )
 from .constants import BINARY_SECTIONS, AC_FORM, AC_SAVE_NO
@@ -274,7 +274,6 @@ def _inject_vba_after_import(app: Any, object_type: str, name: str, vba_code: st
     # 2. Clear VBE cache (module was just created)
     cache_key = f"{object_type}:{name}"
     _Session._cm_cache.pop(cache_key, None)
-    _vbe_code_cache.pop(cache_key, None)
 
     # 3. Inject code via VBE (lazy import from .vbe)
     from .vbe import _get_code_module
@@ -306,7 +305,6 @@ def _inject_vba_after_import(app: Any, object_type: str, name: str, vba_code: st
     cm.InsertLines(1, vba_code)
 
     # Invalidate caches
-    _vbe_code_cache.pop(cache_key, None)
     _Session._cm_cache.pop(cache_key, None)
 
 

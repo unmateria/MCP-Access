@@ -84,7 +84,7 @@ _TIPS: dict[str, str] = {
         "Design view + VBE conflict:\n"
         "  After design operations, the form may remain open in Design view.\n"
         "  access_vbe_replace_proc closes the form (acSaveYes) before accessing VBE.\n"
-        "  All design operations invalidate all 3 caches (_vbe_code_cache, _parsed_controls_cache, _cm_cache).\n\n"
+        "  All design operations invalidate the cache pair (_parsed_controls_cache, _cm_cache).\n\n"
         "SaveAsText encoding:\n"
         "  Modules (.bas) — cp1252 (ANSI, no BOM)\n"
         "  Forms/reports/queries/macros — utf-16 (UTF-16LE with BOM)\n"

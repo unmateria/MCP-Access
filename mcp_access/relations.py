@@ -2,10 +2,71 @@
 Linked tables, relationships, VBA references, indexes.
 """
 
+import re
 from typing import Any, Optional
 
-from .core import _Session, _vbe_code_cache, log
+from .core import _Session, log
 from .constants import REL_ATTR, DB_ATTACH_SAVE_PWD
+
+
+_DEFAULT_LOGIN_TIMEOUT = 8
+
+
+def _ensure_login_timeout(connect: str, seconds: int = _DEFAULT_LOGIN_TIMEOUT) -> str:
+    """Adds LoginTimeout=N to an ODBC connect string if absent.
+
+    Without this, a failed connection makes the ODBC driver open a modal
+    "SQL Server Login" dialog that blocks the COM session indefinitely
+    (no human is there to dismiss it).
+    """
+    if not connect or not connect.upper().startswith("ODBC;"):
+        return connect
+    if re.search(r"(^|;)\s*LoginTimeout\s*=", connect, re.IGNORECASE):
+        return connect
+    body = connect.rstrip(";")
+    return f"{body};LoginTimeout={seconds};"
+
+
+def _detect_named_instance(connect: str) -> Optional[str]:
+    """Returns the named instance if SERVER=host\\instance, else None.
+
+    Named instances require SQL Browser (UDP 1434) to resolve the dynamic
+    TCP port. If UDP 1434 is firewalled the connection silently times out
+    and the ODBC driver opens a modal dialog. Callers should prefer
+    SERVER=host,port (explicit TCP).
+    """
+    m = re.search(r"SERVER\s*=\s*([^;]+)", connect, re.IGNORECASE)
+    if not m:
+        return None
+    server = m.group(1).strip()
+    if "\\" in server and "," not in server:
+        return server
+    return None
+
+
+def _odbc_preflight(connect: str, timeout_seconds: int = _DEFAULT_LOGIN_TIMEOUT) -> Optional[str]:
+    """Tests an ODBC connect string via ADODB before any DAO/DoCmd call.
+
+    Returns None on success, or an error message on failure. Failing fast
+    here avoids the modal "SQL Server Login" dialog that DAO/DoCmd can
+    trigger on a bad connect string.
+    """
+    if not connect or not connect.upper().startswith("ODBC;"):
+        return None
+    try:
+        import win32com.client
+    except ImportError:
+        return None  # cannot preflight without pywin32; let the real call try
+    # ADO connect strings drop the "ODBC;" prefix
+    ado_conn = connect[5:] if connect.upper().startswith("ODBC;") else connect
+    try:
+        cn = win32com.client.Dispatch("ADODB.Connection")
+        cn.ConnectionTimeout = max(2, int(timeout_seconds))
+        cn.Open(ado_conn)
+        cn.Close()
+        return None
+    except Exception as exc:
+        return str(exc)
 
 
 def ac_list_linked_tables(db_path: str) -> dict:
@@ -35,6 +96,27 @@ def ac_relink_table(
     relink_all: bool = False,
 ) -> dict:
     """Changes the connection string of a linked table and refreshes."""
+    # Inject LoginTimeout so a bad connect string fails fast instead of
+    # opening a modal "SQL Server Login" dialog (impossible to dismiss
+    # in a headless COM session and would hang the agent indefinitely).
+    new_connect = _ensure_login_timeout(new_connect)
+
+    # Probe with ADODB before touching DAO. If the server is unreachable,
+    # raise a clean error instead of letting Access pop up a dialog.
+    pf_err = _odbc_preflight(new_connect)
+    if pf_err:
+        named = _detect_named_instance(new_connect)
+        hint = ""
+        if named:
+            hint = (
+                f" Named instance '{named}' requires SQL Browser (UDP 1434). "
+                "If UDP 1434 is firewalled, switch to SERVER=host,port "
+                "(explicit TCP) — e.g. SERVER=10.0.0.5,1433."
+            )
+        raise RuntimeError(
+            f"ODBC preflight failed for '{table_name}': {pf_err}.{hint}"
+        )
+
     app = _Session.connect(db_path)
     db = app.CurrentDb()
     relinked: list[dict] = []
@@ -267,7 +349,6 @@ def ac_manage_reference(
         raise ValueError(f"action must be 'add' or 'remove', received: '{action}'")
 
     # References affect VBE compilation -- clear code caches
-    _vbe_code_cache.clear()
     _Session._cm_cache.clear()
     return result
 

@@ -7,7 +7,7 @@ import threading
 import time
 from pathlib import Path
 
-from .core import _Session, _vbe_code_cache, _parsed_controls_cache, _list_msaccess_pids, log
+from .core import _Session, _parsed_controls_cache, _list_msaccess_pids, log
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +83,6 @@ def ac_compact_repair(db_path: str) -> dict:
         raise RuntimeError(f"Could not close the database for compacting: {exc}")
     _Session._db_open = None
     _Session._cm_cache.clear()
-    _vbe_code_cache.clear()
     _parsed_controls_cache.clear()
 
     # Temp/bak paths in same directory (atomic rename)
@@ -173,7 +172,6 @@ def ac_decompile_compact(db_path: str) -> dict:
             pass
         _Session._db_open = None
         _Session._cm_cache.clear()
-        _vbe_code_cache.clear()
         _parsed_controls_cache.clear()
         if not _Session._attached:
             try:
@@ -296,7 +294,6 @@ def ac_decompile_compact(db_path: str) -> dict:
         pass
     _Session._db_open = None
     _Session._cm_cache.clear()
-    _vbe_code_cache.clear()
     _parsed_controls_cache.clear()
 
     # 4. Compact & Repair

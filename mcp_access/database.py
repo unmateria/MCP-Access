@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .core import (
-    AC_TYPE, _Session, _vbe_code_cache, _parsed_controls_cache, log,
+    AC_TYPE, _Session, _parsed_controls_cache, log,
     invalidate_all_caches,
 )
 from .constants import FIELD_TYPE_MAP, DB_AUTO_INCR_FIELD, DAO_FIELD_TYPE

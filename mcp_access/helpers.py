@@ -8,7 +8,7 @@ import tempfile
 from datetime import datetime
 from typing import Any
 
-from .core import AC_TYPE, _Session, _vbe_code_cache, _parsed_controls_cache, log
+from .core import AC_TYPE, _Session, _parsed_controls_cache, log
 from .constants import BINARY_SECTIONS
 
 
