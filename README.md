@@ -319,6 +319,15 @@ The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/s
 
 ## Changelog
 
+### v0.7.30 — 2026-05-03
+
+**Bug fix** — thanks to [@CaptainStormfield](https://github.com/CaptainStormfield) ([#27](https://github.com/unmateria/MCP-Access/pull/27)):
+
+- **`inserted` line count was off by one when `new_code` ended with `\r\n`**: `len(decoded.splitlines())` treats a trailing newline as a *terminator*, so it does not count the extra blank line that VBE's `InsertLines` does add when the input ends in `\r\n`. In `access_vbe_replace_lines` batch mode this triggered spurious `WARNING: Expected N lines after edit, but module has N+k` health-check warnings — one count off per operation whose `new_code` had a trailing newline (intentional blank-line separators between procedures). Fix: replace the `splitlines()` estimate with an exact measurement — read `cm.CountOfLines` after `InsertLines` and subtract the pre-insert total. Same off-by-N pattern was also present in `ac_vbe_replace_proc` and `ac_vbe_append`; both corrected the same way for consistency.
+- **`.gitignore`**: also added `.mcp.json` and `.claude/` so local Claude Code / MCP config doesn't leak into commits.
+
+Tool count unchanged (62).
+
 ### v0.7.29 — 2026-04-24
 
 **Audit pass** — bugs and UX rough edges found during a full-package review:

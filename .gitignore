@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 *.pyo
 .env
+.mcp.json
+.claude/

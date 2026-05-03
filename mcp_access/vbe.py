@@ -446,8 +446,11 @@ def _exec_single_replace(cm, app, object_type, object_name, start_line, count, n
     if new_code:
         decoded = html_mod.unescape(new_code)
         normalized = decoded.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+        pre_insert_total = total - count if count > 0 else total
         cm.InsertLines(start_line, normalized)
-        inserted = len(decoded.splitlines())
+        # Ask VBE directly: splitlines() drops a trailing blank line that
+        # InsertLines does count (when new_code ends with \r\n).
+        inserted = cm.CountOfLines - pre_insert_total
     end = start_line + count - 1 if count > 0 else start_line
     clamp_note = " (count adjusted)" if clamped else ""
     return {
@@ -837,8 +840,9 @@ def ac_vbe_replace_proc(
         inserted = 0
         if new_code:
             normalized = new_code.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+            pre_insert_total = total - count
             cm.InsertLines(start, normalized)
-            inserted = len(new_code.splitlines())
+            inserted = cm.CountOfLines - pre_insert_total
     except Exception:
         # Restore original code
         try:
@@ -1024,7 +1028,7 @@ def ac_vbe_append(
         return "NOOP: code contained only Option lines (stripped to prevent misplacement)"
     normalized = decoded.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
     cm.InsertLines(total + 1, normalized)
-    inserted = len(decoded.splitlines())
+    inserted = cm.CountOfLines - total
     cache_key = f"{object_type}:{object_name}"
     _vbe_code_cache.pop(cache_key, None)
     # Persist VBE changes to .accdb
