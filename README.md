@@ -321,7 +321,7 @@ The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/s
 
 ## Changelog
 
-### v0.7.32 — 2026-05-04
+### v0.7.33 — 2026-05-04
 
 **`access_create_form` silently dropped `record_source` and `default_view`**:
 
