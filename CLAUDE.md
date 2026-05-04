@@ -102,6 +102,7 @@ Blocking COM calls (`OpenCurrentDatabase`, `CompactRepair`, `RunCommand`, `Appli
 ### CreateForm via COM shows "Save As" MsgBox
 - **Do NOT** call `CreateForm()` directly followed by `_save_and_close()`.
 - Use `access_create_form` tool: `CreateForm()` -> `DoCmd.Save(acForm, autoName)` -> `DoCmd.Close(acForm, autoName, acSaveNo)` -> `DoCmd.Rename(desired, acForm, autoName)`.
+- Pass `record_source` to bind the form to a table/query and `default_view` (0=Single, 1=Continuous, 2=Datasheet, ...) to set the initial view — both are applied on the live `CreateForm()` object before `DoCmd.Save`. Without `record_source`, every bound `ControlSource` on the form will render as `#Name?`.
 - Alternative: export an existing form with `ac_get_code`, modify the text, reimport with `ac_set_code`.
 
 ### AutoExec / startup forms block OpenCurrentDatabase

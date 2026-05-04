@@ -844,8 +844,9 @@ TOOLS = [
         name="access_create_form",
         description=(
             "Creates a new form in the database. Avoids the 'Save As' MsgBox that blocks COM "
-            "when using CreateForm() directly. Option has_header to create with "
-            "header/footer section."
+            "when using CreateForm() directly. Optional has_header (header/footer section), "
+            "record_source (bind to table/query) and default_view (0=Single, 1=Continuous, "
+            "2=Datasheet, 3=PivotTable, 4=PivotChart, 5=Split, 6=Split datasheet)."
         ),
         inputSchema={
             "type": "object",
@@ -853,6 +854,8 @@ TOOLS = [
                 "db_path": {"type": "string", "description": "Path to .accdb/.mdb file"},
                 "form_name": {"type": "string", "description": "Name of the form to create"},
                 "has_header": {"type": "boolean", "default": False, "description": "Create with header/footer section"},
+                "record_source": {"type": "string", "description": "Optional: table/query name to bind the form to (sets RecordSource)"},
+                "default_view": {"type": "integer", "description": "Optional initial view: 0=Single, 1=Continuous, 2=Datasheet, 3=PivotTable, 4=PivotChart, 5=Split, 6=Split datasheet"},
             },
             "required": ["db_path", "form_name"],
         },

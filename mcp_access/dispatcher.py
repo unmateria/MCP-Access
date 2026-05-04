@@ -469,6 +469,8 @@ def call_tool_sync(name: str, arguments: dict) -> str:
                 arguments["db_path"],
                 arguments["form_name"],
                 has_header=bool(arguments.get("has_header", False)),
+                record_source=arguments.get("record_source"),
+                default_view=arguments.get("default_view"),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 

@@ -102,7 +102,7 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 | `access_set_code` | Import modified text back (creates or overwrites) |
 | `access_export_structure` | Generate a Markdown index of all modules, forms, reports, queries |
 | `access_delete_object` | Delete a module, form, report, query, or macro. Requires `confirm=true` |
-| `access_create_form` | Create a new form without triggering the "Save As" MsgBox that blocks COM. Optional `has_header` for header/footer section |
+| `access_create_form` | Create a new form without triggering the "Save As" MsgBox that blocks COM. Optional `has_header` for header/footer section, `record_source` (bind to table/query), `default_view` (0=Single, 1=Continuous, 2=Datasheet, ...) |
 
 ### SQL & tables
 
@@ -320,6 +320,16 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/session.py` that swallows real errors and returns a generic `-32602` code with no detail. A local patch is applied to this machine that includes the actual exception and traceback in the error response. If you upgrade the `mcp` package, re-apply the patch — see `CLAUDE.md` for details.
 
 ## Changelog
+
+### v0.7.32 — 2026-05-04
+
+**`access_create_form` silently dropped `record_source` and `default_view`**:
+
+- **The bug**: callers passing `record_source="myTable"` or `default_view=2` got back a form that was bound to nothing and rendered in Single view. The arguments were not in the input schema, not in the dispatcher, and not in `ac_create_form`'s signature, so the MCP transport accepted them and discarded them without warning. Symptom downstream: every bound TextBox on the form (or on a continuous subform built on top of it) showed `#Name?`, because the form had no recordset to resolve `ControlSource` against.
+- **The fix**: `ac_create_form(db_path, form_name, has_header=False, record_source=None, default_view=None)` now applies `RecordSource` and `DefaultView` on the live `CreateForm()` object before `DoCmd.Save`. Schema in `tools.py` and the `dispatcher.py` branch updated to forward the new arguments. Both fields are optional and back-compat (existing `access_create_form` calls without them keep working unchanged). Result dict now echoes back the applied values when set.
+- **Why it matters for subforms**: the typical use is `access_create_form("subf_lines", record_source="my_table", default_view=1)` so the new form is immediately a continuous subform bound to the table. Without this fix, you had to follow up with `access_set_form_property` to bind it manually — and the missing `RecordSource` was easy to miss until the parent form rendered and showed `#Name?` everywhere.
+
+Tool count unchanged (62).
 
 ### v0.7.31 — 2026-05-03
 

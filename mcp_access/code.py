@@ -425,13 +425,24 @@ def ac_set_code(db_path: str, object_type: str, name: str, code: str) -> str:
 # Create form
 # ---------------------------------------------------------------------------
 
-def ac_create_form(db_path: str, form_name: str, has_header: bool = False) -> dict:
+def ac_create_form(
+    db_path: str,
+    form_name: str,
+    has_header: bool = False,
+    record_source: str | None = None,
+    default_view: int | None = None,
+) -> dict:
     """Creates a new form avoiding the 'Save As' MsgBox that blocks COM.
 
     CreateForm() generates a form with an auto name (Form1, Form2...).
     DoCmd.Save saves with that name (no dialog).
     DoCmd.Close with acSaveNo closes (already saved, no dialog).
     DoCmd.Rename renames to the desired name.
+
+    Optional `record_source` binds the form to a table/query.
+    Optional `default_view` sets the initial view (0=Single, 1=Continuous, 2=Datasheet,
+    3=PivotTable, 4=PivotChart, 5=Split, 6=Split datasheet). For continuous/datasheet
+    subforms you typically want 1 or 2.
     """
     app = _Session.connect(db_path)
     auto_name = None
@@ -442,6 +453,22 @@ def ac_create_form(db_path: str, form_name: str, has_header: bool = False) -> di
         if has_header:
             app.RunCommand(36)  # acCmdFormHdrFtr — toggle header/footer
 
+        # Apply RecordSource / DefaultView while the form is still open in design.
+        if record_source is not None:
+            try:
+                form.RecordSource = record_source
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to set RecordSource='{record_source}': {exc}"
+                )
+        if default_view is not None:
+            try:
+                form.DefaultView = int(default_view)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to set DefaultView={default_view}: {exc}"
+                )
+
         # Save with auto-name — no dialog (DoCmd.Save uses current name)
         app.DoCmd.Save(AC_FORM, auto_name)
         # Close without prompt (already saved)
@@ -451,7 +478,12 @@ def ac_create_form(db_path: str, form_name: str, has_header: bool = False) -> di
         if auto_name != form_name:
             app.DoCmd.Rename(form_name, AC_FORM, auto_name)
 
-        return {"name": form_name, "created_from": auto_name, "has_header": has_header}
+        result: dict = {"name": form_name, "created_from": auto_name, "has_header": has_header}
+        if record_source is not None:
+            result["record_source"] = record_source
+        if default_view is not None:
+            result["default_view"] = int(default_view)
+        return result
     except Exception as exc:
         if auto_name:
             try:
