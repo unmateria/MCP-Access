@@ -9,3 +9,6 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+*.accdb
+*.mdb
+.pypirc
