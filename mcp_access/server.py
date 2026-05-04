@@ -109,3 +109,7 @@ async def main() -> None:
             write_stream,
             server.create_initialization_options(),
         )
+
+
+def cli() -> None:
+    asyncio.run(main())

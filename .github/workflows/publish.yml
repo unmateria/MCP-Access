@@ -1,0 +1,56 @@
+name: Publish to PyPI and MCP Registry
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Sync version from git tag into pyproject.toml and server.json
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          echo "Publishing version $VERSION"
+          python - <<PY
+          import json, re, pathlib
+          v = "$VERSION"
+          p = pathlib.Path("pyproject.toml")
+          p.write_text(re.sub(r'^version = ".*"', f'version = "{v}"', p.read_text(), count=1, flags=re.M))
+          s = pathlib.Path("server.json")
+          d = json.loads(s.read_text())
+          d["version"] = v
+          d["packages"][0]["version"] = v
+          s.write_text(json.dumps(d, indent=2) + "\n")
+          PY
+
+      - name: Build distribution
+        run: |
+          pip install --upgrade build twine
+          python -m build
+          twine check dist/*
+
+      - name: Publish to PyPI
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+        run: twine upload dist/*
+
+      - name: Install mcp-publisher
+        run: curl -sL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" | tar xz mcp-publisher
+
+      - name: Login to MCP Registry (GitHub OIDC)
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish to MCP Registry
+        run: ./mcp-publisher publish

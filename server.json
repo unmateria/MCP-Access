@@ -1,0 +1,21 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.unmateria/msaccess-database",
+  "title": "Microsoft Access Database",
+  "description": "Read and edit Microsoft Access databases (.accdb/.mdb) - forms, VBA, tables, queries. Windows.",
+  "repository": {
+    "url": "https://github.com/unmateria/MCP-Access",
+    "source": "github"
+  },
+  "version": "0.7.32",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "mcp-msaccess-database",
+      "version": "0.7.32",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

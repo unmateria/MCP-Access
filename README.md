@@ -1,5 +1,7 @@
 # mcp-access
 
+<!-- mcp-name: io.github.unmateria/msaccess-database -->
+
 **Give any AI assistant full control over Microsoft Access databases.**
 
 Create forms, write VBA, design tables, manage controls, run queries, build relationships, and edit every corner of an `.accdb` — all through natural language. 62 tools that turn Access into something you can *talk to*.

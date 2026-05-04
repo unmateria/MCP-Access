@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcp-msaccess-database"
+version = "0.7.31"
+description = "MCP server for reading and editing Microsoft Access databases (.accdb/.mdb) via COM automation. Forms, VBA, tables, controls, queries, relationships — 62 tools."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "unmateria" }]
+keywords = ["mcp", "access", "msaccess", "accdb", "vba", "com", "automation"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+    "Topic :: Software Development",
+]
+dependencies = [
+    "mcp>=1.0.0",
+    "pywin32>=306; sys_platform == 'win32'",
+    "pillow>=10.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/unmateria/MCP-Access"
+Repository = "https://github.com/unmateria/MCP-Access"
+Issues = "https://github.com/unmateria/MCP-Access/issues"
+
+[project.scripts]
+mcp-msaccess-database = "mcp_access.server:cli"
+
+[tool.setuptools]
+packages = ["mcp_access"]
+py-modules = ["access_mcp_server"]

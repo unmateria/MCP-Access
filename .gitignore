@@ -6,3 +6,6 @@ __pycache__/
 .claude/
 /nul
 *.modified_backup
+dist/
+build/
+*.egg-info/
