@@ -132,7 +132,12 @@ def _parse_controls(form_text: str) -> dict:
                     m_prop = re.match(r"^(\w+)\s*=(.*)", bl_s)
                     if m_prop:
                         props[m_prop.group(1)] = m_prop.group(2).strip().strip('"')
-                if re.match(r"^Begin\b", bl_s):
+                # Track depth — must include "Property = Begin" (GUID, NameMap,
+                # ConditionalFormat, etc.) which open multi-line blocks closed
+                # by their own End. Otherwise the control is closed prematurely
+                # at the first such End and any controls that follow inside a
+                # container Page/OptionGroup are never enumerated.
+                if re.match(r"^Begin\b", bl_s) or re.match(r"^\w+\s*=\s*Begin\s*$", bl_s):
                     blk_depth += 1
                 elif bl_s == "End":
                     blk_depth -= 1
