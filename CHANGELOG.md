@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.7.36 — 2026-05-25
+
+Five new capabilities. Net tool count 62 → 65 (3 new tools; macros and the Office-version autodetect refactor are non-additive). All changes are additive — no existing schema or function signature was modified.
+
+### Added
+- **`access_search_data`** — search any text string across Text/Memo fields of any local table in a single call. Skips system tables (`MSys*`, `~*`) and linked tables (querying remote SQL servers with `LIKE` per column is rarely what the caller wants). Per-table and total caps, `match_case`, optional `tables` whitelist. Returns matches grouped by table with an `_excerpt` around each hit. See `sql.py:ac_search_data`.
+- **`access_clone_object`** — duplicate a form, report, module, class_module, query or macro to a new name. Internally `SaveAsText` → `LoadFromText` with binary sections (PrtMip / PrtDevMode / NameMap / GUID) preserved by using a raw read path that bypasses `strip_binary_sections`. VBA code-behind comes along via the existing `ac_set_code` injection. Refuses to overwrite unless `overwrite=true`. See `code.py:ac_clone_object`.
+- **`access_manage_tab_order`** — get / set / auto_renumber the `TabIndex` of controls on a form or report. `get` returns controls grouped by section, sorted by TabIndex. `set` assigns 0..N-1 in the order of `tab_order` (two-phase write to avoid the unique-index collision Access enforces per section). `auto_renumber` re-sequences existing TabIndex values per section. Skips controls that don't support TabIndex (Label, Line, Rectangle, Image, PageBreak, Page). Optional `section` filter. See `controls.py:ac_manage_tab_order`.
+
+### Changed
+- **Macros: docs and tips upgrade only — no new tool**. Macros were already fully supported via `access_get_code` / `access_set_code` (UTF-16 encoding correctly applied for SaveAsText/LoadFromText), `access_list_objects`, `access_run_macro`, `access_delete_object`. Tool descriptions now call macros out explicitly, and `access_tips('macros')` documents the read → edit → write workflow.
+- **Office version autodetect**. The hardcoded `16.0` / `Office16` references in `_Session._suppress_recovery_dialog`, `_Session._decompile` and `maintenance.ac_decompile_compact` are now driven by a one-shot registry probe (`_Session._detect_office_install`). Detection enumerates `Software\Microsoft\Office\<ver>\Access\InstallRoot\Path` under HKLM, HKLM\\WOW6432Node and HKCU (per-user Click-to-Run) and picks the highest version with a working `MSACCESS.EXE`. Falls back to `App Paths\MSACCESS.EXE\(Default)` and finally to the previous hardcoded defaults — so machines with a normal Office install keep working unchanged, and machines with a different major version (15.0 / 14.0) or a non-default install root start working without manual edits. Schema of `access_decompile_compact` is unchanged.
+
+### Notes
+- Test passing the `access_clone_object` overwrite path on a class_module — the `_ensure_class_module_header` re-injection runs after the raw export.
+- `_detect_office_install` never raises; the worst case logs `Could not detect Office install via registry — using hardcoded defaults` and behaviour is identical to v0.7.35.
+
 ## 0.7.35 — 2026-05-25
 
 Preventive bug sweep across the codebase. No reported regressions, but several latent issues fixed.

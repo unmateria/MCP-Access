@@ -143,6 +143,11 @@ class _Session:
     _cm_cache: dict = {}   # "type:name" -> CodeModule COM object
     _decompiled_dbs: set = set()  # DBs already decompiled in this session
     _attached: bool = False  # True if we attached via GetActiveObject; False if we spawned via DispatchEx
+    # Detected Office install. Defaults are the hardcoded fallback used pre-0.7.36.
+    # _detect_office_install() runs once per process and updates these in place.
+    _office_version: str = "16.0"
+    _office_msaccess: Optional[str] = None
+    _office_detected: bool = False
 
     @classmethod
     def connect(cls, db_path: str) -> Any:
@@ -219,6 +224,11 @@ class _Session:
         # disable the taskkill fallback below.
         cls._pid = _get_com_pid(cls._app)
         log.info("Access PID captured: %s (attached=%s)", cls._pid, cls._attached)
+        # One-shot Office install detection — populates _office_version and
+        # _office_msaccess so /decompile and the Resiliency registry path
+        # match the real install. Never raises; logs a warning and keeps
+        # defaults if nothing matched.
+        cls._detect_office_install()
 
     @classmethod
     def reopen(cls, path: str) -> None:
@@ -231,11 +241,19 @@ class _Session:
     def _decompile(cls, path: str) -> None:
         """Run MSACCESS /decompile + SHIFT on the DB before opening via COM.
         Strips orphaned p-code so compile errors are real, not phantom."""
-        msaccess_candidates = [
-            r"C:\Program Files\Microsoft Office\root\Office16\MSACCESS.EXE",
-            r"C:\Program Files (x86)\Microsoft Office\root\Office16\MSACCESS.EXE",
-        ]
-        msaccess = next((p for p in msaccess_candidates if os.path.exists(p)), None)
+        # Prefer the detected MSACCESS.EXE; fall back to the hardcoded Office16
+        # paths if detection didn't run / fired blank. Keeps behavior identical
+        # on machines with a normal install.
+        cls._detect_office_install()  # idempotent
+        msaccess = cls._office_msaccess
+        if not msaccess or not os.path.exists(msaccess):
+            for p in (
+                r"C:\Program Files\Microsoft Office\root\Office16\MSACCESS.EXE",
+                r"C:\Program Files (x86)\Microsoft Office\root\Office16\MSACCESS.EXE",
+            ):
+                if os.path.exists(p):
+                    msaccess = p
+                    break
         if not msaccess:
             log.warning("MSACCESS.EXE not found — skipping /decompile")
             cls._decompiled_dbs.add(path)  # don't retry
@@ -373,10 +391,123 @@ class _Session:
                 time.sleep(1)
                 cls._launch()
 
-    @staticmethod
-    def _suppress_recovery_dialog() -> None:
+    @classmethod
+    def _detect_office_install(cls) -> None:
+        """Best-effort detection of the installed Office version and MSACCESS.EXE.
+
+        Populates `cls._office_version` (string like "16.0") and `cls._office_msaccess`
+        (absolute path to MSACCESS.EXE, or None).  ALWAYS leaves the class with
+        usable defaults — never raises. Called once per process at the end of
+        `_launch()`; later calls are no-ops thanks to `_office_detected`.
+
+        Detection order:
+          1. Enumerate `Software\Microsoft\Office\<ver>\Access\InstallRoot\Path`
+             under HKLM (64-bit), HKLM\WOW6432Node (32-bit on 64-bit) and HKCU
+             (per-user Click-to-Run).  Pick the highest <ver> with a real file.
+          2. App Paths\MSACCESS.EXE\(Default) — works even without per-version key.
+          3. Final fallback: keep the hardcoded defaults so existing behaviour
+             is preserved on machines with a broken or non-standard registry.
+        """
+        if cls._office_detected:
+            return
+        cls._office_detected = True  # set first so partial failures still terminate
+
+        def _try_install_root(root, sub_root: str) -> Optional[tuple[str, str]]:
+            """Enumerate version subkeys under *root\\sub_root* and return
+            (version, MSACCESS.EXE path) for the highest version with a
+            working Access\\InstallRoot\\Path. None if nothing found."""
+            try:
+                with winreg.OpenKey(root, sub_root) as office_key:
+                    versions: list[tuple[float, str]] = []
+                    i = 0
+                    while True:
+                        try:
+                            sub = winreg.EnumKey(office_key, i)
+                        except OSError:
+                            break
+                        i += 1
+                        # Versions look like "16.0", "15.0", "14.0"; ignore
+                        # "ClickToRun", "Common", "Outlook", etc.
+                        try:
+                            v_num = float(sub)
+                        except ValueError:
+                            continue
+                        versions.append((v_num, sub))
+                    versions.sort(reverse=True)  # highest first
+                    for v_num, v_str in versions:
+                        path_sub = f"{sub_root}\\{v_str}\\Access\\InstallRoot"
+                        try:
+                            with winreg.OpenKey(root, path_sub) as ir:
+                                install_dir, _ = winreg.QueryValueEx(ir, "Path")
+                                candidate = os.path.join(install_dir, "MSACCESS.EXE")
+                                if os.path.exists(candidate):
+                                    return v_str, candidate
+                        except FileNotFoundError:
+                            continue
+                        except OSError:
+                            continue
+            except FileNotFoundError:
+                return None
+            except OSError:
+                return None
+            return None
+
+        # Try every plausible hive/wow path
+        registry_candidates = [
+            (winreg.HKEY_LOCAL_MACHINE, r"Software\Microsoft\Office"),
+            (winreg.HKEY_LOCAL_MACHINE, r"Software\WOW6432Node\Microsoft\Office"),
+            (winreg.HKEY_CURRENT_USER,  r"Software\Microsoft\Office"),
+        ]
+        for root, sub in registry_candidates:
+            hit = _try_install_root(root, sub)
+            if hit:
+                ver, path = hit
+                cls._office_version = ver
+                cls._office_msaccess = path
+                log.info("Detected Office %s at %s", ver, path)
+                return
+
+        # Fallback 2: App Paths
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"Software\Microsoft\Windows\CurrentVersion\App Paths\MSACCESS.EXE",
+            ) as ap:
+                default_val, _ = winreg.QueryValueEx(ap, None)
+                if default_val and os.path.exists(default_val):
+                    cls._office_msaccess = default_val
+                    # Best-effort: parse Office<NN> from the path to set version
+                    low = default_val.lower()
+                    for v in ("16.0", "15.0", "14.0"):
+                        if f"office{v.split('.')[0]}" in low:
+                            cls._office_version = v
+                            break
+                    log.info(
+                        "Detected MSACCESS.EXE via App Paths: %s (version=%s)",
+                        default_val, cls._office_version,
+                    )
+                    return
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+        log.warning(
+            "Could not detect Office install via registry — using hardcoded "
+            "defaults (version=%s, MSACCESS=%s)",
+            cls._office_version, cls._office_msaccess,
+        )
+
+    @classmethod
+    def _suppress_recovery_dialog(cls) -> None:
         """Nuke the Resiliency keys that cause the 'serious error' dialog."""
-        base = r"Software\Microsoft\Office\16.0\Access\Resiliency"
+        # Detection is idempotent and uses only winreg / os.path — safe to run
+        # even on the very first call before any COM object exists. Without
+        # this, the Resiliency path would always target "16.0" no matter what
+        # version is installed.
+        cls._detect_office_install()
+        ver = cls._office_version  # detected (or default "16.0")
+        base = rf"Software\Microsoft\Office\{ver}\Access\Resiliency"
         # Delete subkeys that track crashed files (DisabledItems, StartupItems)
         for subkey_name in ("DisabledItems", "StartupItems"):
             try:

@@ -598,3 +598,129 @@ def ac_export_structure(db_path: str, output_path: str | None = None) -> str:
         f.write(content)
 
     return f"[Saved to `{output_path}`]\n\n{content}"
+
+
+# ---------------------------------------------------------------------------
+# Clone object (form/report/module/class_module/query/macro)
+# ---------------------------------------------------------------------------
+
+# Object types whose containers expose AllX collections for existence checks
+_CONTAINER_BY_TYPE = {
+    "table":  ("CurrentData",    "AllTables"),
+    "query":  ("CurrentData",    "AllQueries"),
+    "form":   ("CurrentProject", "AllForms"),
+    "report": ("CurrentProject", "AllReports"),
+    "macro":  ("CurrentProject", "AllMacros"),
+    "module": ("CurrentProject", "AllModules"),
+    # class_module shares the modules container (LoadFromText uses acModule)
+    "class_module": ("CurrentProject", "AllModules"),
+}
+
+
+def _object_exists(app: Any, object_type: str, name: str) -> bool:
+    """Best-effort existence check against the AllX collection for `object_type`."""
+    parent, attr = _CONTAINER_BY_TYPE.get(object_type, (None, None))
+    if not parent or not attr:
+        return False
+    try:
+        coll = getattr(getattr(app, parent), attr)
+        for i in range(coll.Count):
+            try:
+                if coll.Item(i).Name.lower() == name.lower():
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        return False
+    return False
+
+
+def ac_clone_object(
+    db_path: str,
+    object_type: str,
+    source_name: str,
+    target_name: str,
+    overwrite: bool = False,
+) -> dict:
+    """Clone an Access object to a new name.
+
+    Internally: SaveAsText (RAW — does NOT strip binary sections, unlike
+    ac_get_code) -> read text -> ac_set_code(target_name, text). Binary
+    sections (PrtMip / PrtDevMode / NameMap / GUID) ride along inside the
+    text, so ac_set_code's restore-from-current logic stays out of the way
+    (see code.py:348 — restoration only runs when binaries are missing).
+
+    For class_module we re-apply _ensure_class_module_header on the cloned
+    text so the implicit VB_Name / Attribute block stays consistent.
+    """
+    valid_types = set(AC_TYPE) | {"class_module"}
+    if object_type not in valid_types:
+        raise ValueError(
+            f"Invalid object_type '{object_type}'. Valid: {sorted(valid_types)}"
+        )
+    if not source_name or not target_name:
+        raise ValueError("source_name and target_name are required")
+    if source_name == target_name:
+        raise ValueError("source_name and target_name must differ")
+
+    app = _Session.connect(db_path)
+    _ac_type_code = AC_TYPE["module"] if object_type == "class_module" else AC_TYPE[object_type]
+
+    # Verify source exists; SaveAsText is the canonical sanity check (matches
+    # the way other tools test object presence indirectly).
+    if not _object_exists(app, object_type, source_name):
+        raise ValueError(
+            f"Source {object_type} '{source_name}' not found in {db_path}"
+        )
+
+    # Resolve overwrite policy BEFORE we read the source, so we don't waste
+    # work on a doomed clone.
+    target_existed = _object_exists(app, object_type, target_name)
+    if target_existed and not overwrite:
+        raise ValueError(
+            f"Target {object_type} '{target_name}' already exists. "
+            "Pass overwrite=true to replace it."
+        )
+
+    # Raw export — NO strip_binary_sections, so PrtMip / NameMap / GUID stay
+    # in the text and travel to the clone unchanged.
+    fd, tmp = tempfile.mkstemp(suffix=".txt", prefix="access_mcp_clone_")
+    os.close(fd)
+    try:
+        app.SaveAsText(_ac_type_code, source_name, tmp)
+        text, _enc = read_tmp(tmp)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+    if not text.strip():
+        raise RuntimeError(
+            f"SaveAsText returned empty text for '{source_name}' — refusing to clone"
+        )
+
+    if object_type == "class_module":
+        text = _ensure_class_module_header(text, target_name)
+
+    # Replace target via ac_delete_object when overwrite is requested.  Use
+    # the same _ac_type_code dance that ac_set_code uses for class_module.
+    if target_existed and overwrite:
+        try:
+            app.DoCmd.DeleteObject(_ac_type_code, target_name)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not delete existing {object_type} '{target_name}' "
+                f"before overwrite: {exc}"
+            )
+        invalidate_all_caches()
+
+    ac_set_code(db_path, object_type, target_name, text)
+
+    return {
+        "action": "cloned",
+        "object_type": object_type,
+        "source": source_name,
+        "target": target_name,
+        "overwritten": target_existed and overwrite,
+    }

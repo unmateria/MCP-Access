@@ -1,5 +1,5 @@
 """
-MCP Tool definitions (62 tools) and schema utilities.
+MCP Tool definitions (65 tools) and schema utilities.
 """
 
 import mcp.types as types
@@ -7,7 +7,7 @@ import mcp.types as types
 TOOLS = [
     types.Tool(
         name="access_list_objects",
-        description="Lists database objects by type (table, module, form, report, query, macro, all). System tables (MSys*, ~*) are filtered out.",
+        description="Lists database objects by type (table, module, form, report, query, macro, all). System tables (MSys*, ~*) are filtered out. Macros are fully supported as a regular object_type — combine with access_get_code / access_set_code / access_run_macro for end-to-end macro workflows.",
         inputSchema={
             "type": "object",
             "properties": {
@@ -26,6 +26,8 @@ TOOLS = [
         description=(
             "Reads code/definition of an Access object. "
             "Modules: .bas code. Forms/reports: internal format (props + VBA). "
+            "Macros: SaveAsText XML-like representation (Action/RunCommand blocks); pair with access_set_code to round-trip. "
+            "Queries: SQL + DAO properties. "
             "For reading specific VBA procedures, prefer access_vbe_get_proc (faster, smaller output)."
         ),
         inputSchema={
@@ -44,6 +46,7 @@ TOOLS = [
             "Imports code into the database. Overwrites if exists, creates if not. "
             "Call access_get_code first to read the original. "
             "For forms/reports: supports CodeBehindForm/CodeBehindReport (VBA is injected via VBE). "
+            "For object_type='macro': accepts the SaveAsText representation (round-trip with access_get_code). "
             "For object_type='class_module': creates a VBA class module "
             "(adds VERSION 1.0 CLASS header automatically if missing). "
             "Automatic backup and restore on import failure."
@@ -1192,6 +1195,91 @@ TOOLS = [
                 },
             },
             "required": ["db_path", "x", "y", "image_width"],
+        },
+    ),
+    # -- Search data (across tables) -----------------------------------------
+    types.Tool(
+        name="access_search_data",
+        description=(
+            "Searches a text string in any Text/Memo field of any LOCAL table. "
+            "Skips system tables (MSys*, ~*) and linked tables. "
+            "Returns matches grouped by table with an excerpt around each hit. "
+            "Use `tables` to restrict the scan to a list of table names. "
+            "Jet LIKE is case-insensitive by default; pass match_case=true to "
+            "filter the result set further. Results are capped per-table and total."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Path to .accdb/.mdb file"},
+                "search_text": {"type": "string", "description": "Text to find (substring match, case-insensitive by default)"},
+                "tables": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional. Restrict to these tables. Default: all local non-system tables.",
+                },
+                "max_results_per_table": {"type": "integer", "default": 50,
+                                          "description": "Cap matches per table (default: 50)"},
+                "max_results_total": {"type": "integer", "default": 500,
+                                      "description": "Cap matches across the whole search (default: 500)"},
+                "match_case": {"type": "boolean", "default": False,
+                               "description": "If true, filters out rows where Jet matched only by case-folding"},
+            },
+            "required": ["db_path", "search_text"],
+        },
+    ),
+    # -- Clone object --------------------------------------------------------
+    types.Tool(
+        name="access_clone_object",
+        description=(
+            "Clones a form, report, module, class_module, query or macro to a new name. "
+            "Internally uses SaveAsText → LoadFromText, preserving binary sections "
+            "(PrtMip, PrtDevMode, NameMap, GUID...) and VBA code-behind. "
+            "Refuses to overwrite an existing target unless overwrite=true."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Path to .accdb/.mdb file"},
+                "object_type": {"type": "string",
+                                "enum": ["form", "report", "module", "class_module", "query", "macro"]},
+                "source_name": {"type": "string", "description": "Existing object name"},
+                "target_name": {"type": "string", "description": "New object name"},
+                "overwrite": {"type": "boolean", "default": False,
+                              "description": "Delete target first if it already exists"},
+            },
+            "required": ["db_path", "object_type", "source_name", "target_name"],
+        },
+    ),
+    # -- Tab order management ------------------------------------------------
+    types.Tool(
+        name="access_manage_tab_order",
+        description=(
+            "Reads or sets the TabIndex of controls on a form/report. "
+            "Actions: 'get' (returns controls grouped by section, ordered by TabIndex), "
+            "'set' (assigns TabIndex 0..N-1 in the order of `tab_order`), "
+            "'auto_renumber' (re-sequences current TabIndex values to be contiguous "
+            "0..N-1 — useful after deleting controls). Skips controls that don't "
+            "support TabIndex (Label, Line, Rectangle, Image, PageBreak)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Path to .accdb/.mdb file"},
+                "object_type": {"type": "string", "enum": ["form", "report"]},
+                "object_name": {"type": "string", "description": "Form/report name"},
+                "action": {"type": "string", "enum": ["get", "set", "auto_renumber"]},
+                "tab_order": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "[set] Ordered list of control names — TabIndex assigned 0..N-1 in this order",
+                },
+                "section": {
+                    "type": "string",
+                    "description": "Optional. Restrict the operation to a single section name (e.g. 'Detail', 'FormHeader')",
+                },
+            },
+            "required": ["db_path", "object_type", "object_name", "action"],
         },
     ),
     types.Tool(

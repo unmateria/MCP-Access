@@ -281,3 +281,241 @@ def ac_manage_query(
 
     else:
         raise ValueError(f"action must be create/modify/delete/rename/get_sql, received: '{action}'")
+
+
+# ---------------------------------------------------------------------------
+# ac_search_data — search a text string across Text/Memo fields of all tables
+# ---------------------------------------------------------------------------
+
+# DAO field types considered text-searchable.  10=Text (dbText), 12=Memo (dbMemo).
+# We intentionally exclude Hyperlink (also stored as Memo type 12 but exposed as
+# Hyperlink via attributes) because LIKE on those is unreliable; tested 2026-05-25.
+_SEARCHABLE_TEXT_TYPES = (10, 12)
+
+
+def _escape_table_name(name: str) -> str:
+    """Mirror of the bracket-escaping used by database.ac_table_info — a `]`
+    inside a bracket-quoted identifier ends the identifier early, so double it.
+    """
+    return name.replace("]", "]]")
+
+
+def _excerpt_around(text: str, needle: str, ctx: int = 40) -> str:
+    """Return a small excerpt around the first case-insensitive match of *needle*."""
+    if not text or not needle:
+        return text or ""
+    idx = text.lower().find(needle.lower())
+    if idx < 0:
+        return text[: ctx * 2]
+    start = max(0, idx - ctx)
+    end = min(len(text), idx + len(needle) + ctx)
+    prefix = "…" if start > 0 else ""
+    suffix = "…" if end < len(text) else ""
+    return f"{prefix}{text[start:end]}{suffix}"
+
+
+def ac_search_data(
+    db_path: str,
+    search_text: str,
+    tables: Optional[list[str]] = None,
+    max_results_per_table: int = 50,
+    max_results_total: int = 500,
+    match_case: bool = False,
+) -> dict:
+    """Search a text string in any Text/Memo field of any local table.
+
+    Returns matches grouped by table.  Skips system tables (MSys*, ~temp*) and
+    linked tables (which could be slow / surprising — querying a remote SQL
+    server with `LIKE` over every text column on every linked table is rarely
+    what the caller wants).  Pass `tables=[...]` to restrict to specific local
+    tables.
+
+    Note: Jet `LIKE` is case-insensitive by default. When `match_case=True`
+    we filter Python-side after the SQL match, since Jet has no portable
+    way to flip collation at query time on a per-query basis.
+    """
+    if not search_text:
+        raise ValueError("search_text must be a non-empty string")
+
+    app = _Session.connect(db_path)
+    db = app.CurrentDb()
+
+    needle = str(search_text)
+    pattern = f"*{needle}*"  # Jet/Access LIKE uses * as wildcard (not %)
+
+    requested = None
+    if tables:
+        # Case-insensitive comparison; preserve original case for the response
+        requested = {str(t).lower() for t in tables}
+
+    results: list[dict] = []
+    total_matches = 0
+    truncated = False
+
+    # Iterate TableDefs — same pattern as ac_table_info / ac_list_linked_tables
+    tabledefs = db.TableDefs
+    for i in range(tabledefs.Count):
+        if total_matches >= max_results_total:
+            truncated = True
+            break
+
+        td = tabledefs(i)
+        tname = td.Name
+        if tname.startswith("MSys") or tname.startswith("~"):
+            continue
+        # Skip linked tables — Connect is non-empty for them
+        try:
+            if td.Connect:
+                continue
+        except Exception:
+            pass
+
+        if requested is not None and tname.lower() not in requested:
+            continue
+
+        # Collect Text/Memo fields
+        text_fields: list[str] = []
+        for j in range(td.Fields.Count):
+            try:
+                fld = td.Fields(j)
+                if int(fld.Type) in _SEARCHABLE_TEXT_TYPES:
+                    text_fields.append(fld.Name)
+            except Exception:
+                continue
+        if not text_fields:
+            continue
+
+        # Build the WHERE: one LIKE per text field, OR'd together.
+        # Field names quoted with brackets and `]` escaped by doubling.
+        where_parts = []
+        for fn in text_fields:
+            safe_fn = fn.replace("]", "]]")
+            where_parts.append(f"[{safe_fn}] LIKE ?")
+        where_clause = " OR ".join(where_parts)
+
+        safe_table = _escape_table_name(tname)
+        # TOP N+1 lets us mark `table_truncated` accurately
+        per_table_cap = max(1, int(max_results_per_table))
+        sql = (
+            f"SELECT TOP {per_table_cap + 1} * FROM [{safe_table}] "
+            f"WHERE {where_clause}"
+        )
+
+        # DAO with positional parameters: create a QueryDef and bind via Parameters
+        qd = None
+        rs = None
+        try:
+            qd = db.CreateQueryDef("", sql)
+            # Bind one parameter per OR-ed LIKE; all share the same pattern.
+            for p_idx in range(len(text_fields)):
+                qd.Parameters(p_idx).Value = pattern
+            rs = qd.OpenRecordset(2)  # dbOpenDynaset = 2
+        except Exception:
+            # Fallback for drivers that misbehave with positional `?` in DAO:
+            # inline the search pattern with quote-doubling (safe — pattern is
+            # bounded by `*needle*` and we double single-quotes).
+            safe_needle = needle.replace("'", "''")
+            inline_pattern = f"'*{safe_needle}*'"
+            where_inline = " OR ".join(
+                f"[{fn.replace(']', ']]')}] LIKE {inline_pattern}" for fn in text_fields
+            )
+            sql_inline = (
+                f"SELECT TOP {per_table_cap + 1} * FROM [{safe_table}] "
+                f"WHERE {where_inline}"
+            )
+            try:
+                rs = db.OpenRecordset(sql_inline)
+            except Exception as exc:
+                log.warning(
+                    "ac_search_data: skip table '%s' — query failed (%s)",
+                    tname, exc,
+                )
+                continue
+        finally:
+            # QueryDef without a name is implicit/temporary; nothing else to clean
+            qd = None
+
+        try:
+            field_names = [rs.Fields(k).Name for k in range(rs.Fields.Count)]
+        except Exception:
+            try:
+                rs.Close()
+            except Exception:
+                pass
+            continue
+
+        # Walk the recordset
+        rows_for_table: list[dict] = []
+        fields_matched: set = set()
+        table_truncated = False
+        try:
+            if not rs.EOF:
+                rs.MoveFirst()
+                while not rs.EOF:
+                    if len(rows_for_table) >= per_table_cap:
+                        table_truncated = True
+                        break
+                    if total_matches >= max_results_total:
+                        truncated = True
+                        break
+
+                    # Read this row into a plain dict
+                    row: dict = {}
+                    matched_in_this_row: list[str] = []
+                    for k, fn in enumerate(field_names):
+                        try:
+                            v = rs.Fields(k).Value
+                        except Exception:
+                            v = None
+                        row[fn] = serialize_value(v)
+                        # Record which Text/Memo fields actually contain the needle
+                        if fn in text_fields and isinstance(row[fn], str):
+                            haystack = row[fn]
+                            hit = (
+                                needle in haystack
+                                if match_case
+                                else needle.lower() in haystack.lower()
+                            )
+                            if hit:
+                                matched_in_this_row.append(fn)
+                                fields_matched.add(fn)
+
+                    if match_case and not matched_in_this_row:
+                        # Jet LIKE matched case-insensitively but the caller
+                        # asked for case-sensitive — drop this row.
+                        rs.MoveNext()
+                        continue
+
+                    # Excerpt around the first matched field for readability
+                    if matched_in_this_row:
+                        first_match_field = matched_in_this_row[0]
+                        excerpt_text = row.get(first_match_field, "") or ""
+                        row["_excerpt"] = _excerpt_around(excerpt_text, needle)
+                        row["_matched_fields"] = matched_in_this_row
+
+                    rows_for_table.append(row)
+                    total_matches += 1
+                    rs.MoveNext()
+        finally:
+            try:
+                rs.Close()
+            except Exception:
+                pass
+
+        if rows_for_table:
+            results.append({
+                "table": tname,
+                "match_count": len(rows_for_table),
+                "fields_matched": sorted(fields_matched),
+                "rows": rows_for_table,
+                "truncated": table_truncated,
+            })
+
+    return {
+        "search_text": needle,
+        "match_case": bool(match_case),
+        "total_matches": total_matches,
+        "tables_with_hits": len(results),
+        "truncated": truncated,
+        "results": results,
+    }

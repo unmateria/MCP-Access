@@ -90,6 +90,26 @@ _TIPS: dict[str, str] = {
         "  Forms/reports/queries/macros — utf-16 (UTF-16LE with BOM)\n"
         "  access_set_code handles this automatically."
     ),
+    "macros": (
+        "Working with Access macro objects:\n"
+        "  Macros are first-class — no dedicated tool, they reuse the regular code/object tools.\n"
+        "  List:    access_list_objects(object_type='macro')\n"
+        "  Read:    access_get_code(object_type='macro', name='myMacro') → SaveAsText UTF-16 text\n"
+        "  Write:   access_set_code(object_type='macro', name='myMacro', code=...) — writes utf-16 encoded\n"
+        "           If 'myMacro' exists it is overwritten; otherwise created.\n"
+        "  Run:     access_run_macro(macro_name='myMacro')\n"
+        "  Delete:  access_delete_object(object_type='macro', object_name='myMacro', confirm=true)\n\n"
+        "Typical edit workflow:\n"
+        "  1. text = access_get_code('macro', 'myMacro')\n"
+        "  2. modify the text (e.g. swap a RunCommand value, add an Action)\n"
+        "  3. access_set_code('macro', 'myMacro', new_text)\n\n"
+        "Notes:\n"
+        "  - The SaveAsText format for macros is a structured Action / SubMacro / Argument tree.\n"
+        "    Hand-editing is feasible but easy to corrupt — start from a SaveAsText export.\n"
+        "  - Binary section handling (PrtMip / PrtDevMode) does NOT apply to macros — they have none.\n"
+        "  - Data macros attached to tables (BeforeChange/AfterUpdate triggers) are NOT exposed here;\n"
+        "    use access_execute_sql with DDL or open the table in design view manually."
+    ),
     "subform_tabcontrol": (
         "SubForm inside TabControl Page — BROKEN LAYOUT workaround:\n"
         "  Access recalculates TabControl positions when a SubForm exists inside a Page,\n"

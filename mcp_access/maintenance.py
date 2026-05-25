@@ -192,14 +192,25 @@ def ac_decompile_compact(db_path: str) -> dict:
     except Exception:
         pass  # si no habia sesion abierta, continuar igualmente
 
-    # 2. Lanzar MSACCESS /decompile
-    msaccess_candidates = [
-        r"C:\Program Files\Microsoft Office\root\Office16\MSACCESS.EXE",
-        r"C:\Program Files (x86)\Microsoft Office\root\Office16\MSACCESS.EXE",
-    ]
-    msaccess = next((p for p in msaccess_candidates if os.path.exists(p)), None)
+    # 2. Lanzar MSACCESS /decompile — prefer the detected install, fall back
+    # to the hardcoded Office16 paths (defence in depth for machines with a
+    # broken registry). The detection runs in _launch() but is cheap and
+    # idempotent — call it directly here in case the session was set up via
+    # a code path that bypassed _launch().
+    _Session._detect_office_install()
+    msaccess = _Session._office_msaccess
+    if not msaccess or not os.path.exists(msaccess):
+        for p in (
+            r"C:\Program Files\Microsoft Office\root\Office16\MSACCESS.EXE",
+            r"C:\Program Files (x86)\Microsoft Office\root\Office16\MSACCESS.EXE",
+        ):
+            if os.path.exists(p):
+                msaccess = p
+                break
     if not msaccess:
-        raise RuntimeError("MSACCESS.EXE not found in known Office 16 paths")
+        raise RuntimeError(
+            "MSACCESS.EXE not found via registry detection or known Office paths"
+        )
 
     # Snapshot msaccess.exe PIDs so we can kill any forked children that
     # escape `taskkill /T /F`.  Preserves the user's attached PID (if any).

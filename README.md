@@ -4,7 +4,7 @@
 
 **Give any AI assistant full control over Microsoft Access databases.**
 
-Create forms, write VBA, design tables, manage controls, run queries, build relationships, and edit every corner of an `.accdb` — all through natural language. 62 tools that turn Access into something you can *talk to*.
+Create forms, write VBA, design tables, manage controls, run queries, build relationships, and edit every corner of an `.accdb` — all through natural language. 65 tools that turn Access into something you can *talk to*.
 
 No Access expertise required. Just describe what you want.
 
@@ -320,6 +320,19 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/session.py` that swallows real errors and returns a generic `-32602` code with no detail. A local patch is applied to this machine that includes the actual exception and traceback in the error response. If you upgrade the `mcp` package, re-apply the patch — see `CLAUDE.md` for details.
 
 ## Changelog
+
+### v0.7.36 — 2026-05-25
+
+Five new capabilities — three new tools, one docs-only upgrade for macros, one transparent refactor for Office-version autodetect. **62 → 65 tools.** All changes additive; no existing schema or signature changed.
+
+**Added**:
+- **`access_search_data`** — search a text string across every Text/Memo field of every local table. Skips system tables (`MSys*`, `~*`) and linked tables (querying remote SQL servers per text column rarely ends well). Per-table and total caps; optional `tables` whitelist; `match_case`. Returns matches grouped by table with an `_excerpt` around each hit and `_matched_fields` per row.
+- **`access_clone_object`** — duplicate a `form` / `report` / `module` / `class_module` / `query` / `macro` to a new name. Uses `SaveAsText` → `LoadFromText` with binary sections (PrtMip / PrtDevMode / NameMap / GUID) preserved by reading the raw export (bypasses `strip_binary_sections`). VBA code-behind rides along via the existing `ac_set_code` injection. Refuses to overwrite unless `overwrite=true`.
+- **`access_manage_tab_order`** — `get` / `set` / `auto_renumber` the `TabIndex` of controls on a form/report. `set` does a two-phase reassignment (park at high indices, then assign 0..N-1) so it doesn't trip Access's per-section uniqueness constraint mid-loop. Skips controls that don't support TabIndex (Label, Line, Rectangle, Image, PageBreak, Page). Optional `section` filter.
+
+**Changed**:
+- **Macros docs**. Macros were already fully usable via `access_get_code` / `access_set_code` (UTF-16 encoding) plus `access_list_objects`, `access_run_macro`, `access_delete_object`. Tool descriptions now name macros explicitly and `access_tips('macros')` documents the read → edit → write workflow.
+- **Office version autodetect**. The hardcoded `16.0` / `Office16` strings used by `_Session._suppress_recovery_dialog`, `_Session._decompile` and `ac_decompile_compact` now come from a one-shot registry probe (`_Session._detect_office_install`). Detection walks `Software\Microsoft\Office\<ver>\Access\InstallRoot\Path` under HKLM, HKLM\\WOW6432Node and HKCU (per-user C2R), picks the highest matching version with a working `MSACCESS.EXE`, falls back to `App Paths\MSACCESS.EXE\(Default)`, and finally to the previous hardcoded paths. Schema of `access_decompile_compact` is unchanged; behaviour on machines with a normal Office install is identical to v0.7.35.
 
 ### v0.7.35 — 2026-05-25
 

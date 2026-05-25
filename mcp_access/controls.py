@@ -725,6 +725,223 @@ def ac_get_form_property(
 # ac_set_multiple_controls
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# ac_manage_tab_order — read / set / auto_renumber TabIndex on a form/report
+# ---------------------------------------------------------------------------
+
+# Section name lookup: section value (0..8) -> friendly name
+_SECTION_NAME = {
+    0: "Detail",
+    1: "FormHeader",
+    2: "FormFooter",
+    3: "PageHeader",
+    4: "PageFooter",
+    5: "GroupLevel1Header",
+    6: "GroupLevel1Footer",
+    7: "GroupLevel2Header",
+    8: "GroupLevel2Footer",
+}
+
+# Control types that DO NOT support TabIndex.  Mirrors CTRL_TYPE numbers from
+# .constants: 100=Label, 101=Rectangle, 102=Line, 103=Image, 114=PageBreak.
+# Page (118) is excluded too — TabIndex on a Page is meaningless; tab pages are
+# navigated via the parent TabControl.
+_NON_TABBABLE_TYPES = frozenset({100, 101, 102, 103, 114, 118})
+
+
+def _ctrl_section(ctrl: Any) -> Optional[int]:
+    """Return Section value (0..8) for a control, or None if not exposed."""
+    try:
+        return int(ctrl.Section)
+    except Exception:
+        return None
+
+
+def ac_manage_tab_order(
+    db_path: str,
+    object_type: str,
+    object_name: str,
+    action: str,
+    tab_order: Optional[list[str]] = None,
+    section: Optional[str] = None,
+) -> dict:
+    """Read / set / auto-renumber control TabIndex on a form or report.
+
+    Actions:
+      - get: returns {section_name: [{name, tab_index, tab_stop, control_type}]}
+        ordered by TabIndex within each section.
+      - set: assigns TabIndex 0..N-1 in the order of `tab_order` (list of
+        control names). Existing TabStop is preserved.
+      - auto_renumber: reads current order by TabIndex and reassigns to a
+        contiguous 0..N-1 sequence per section. Useful after deleting controls.
+
+    If `section` is provided (e.g. 'Detail', 'FormHeader'), the operation is
+    restricted to controls in that section.
+
+    Controls that don't support TabIndex (Label, Line, Rectangle, Image,
+    PageBreak, Page) are skipped silently.
+    """
+    if object_type not in ("form", "report"):
+        raise ValueError("Only 'form' or 'report'")
+    if action not in ("get", "set", "auto_renumber"):
+        raise ValueError(
+            f"action must be one of get/set/auto_renumber, got: {action!r}"
+        )
+    if action == "set":
+        if not tab_order or not isinstance(tab_order, list):
+            raise ValueError(
+                "action='set' requires `tab_order` (list of control names)"
+            )
+
+    # Normalise the section filter to its int value for fast comparison
+    section_filter: Optional[int] = None
+    if section:
+        key = str(section).lower().replace(" ", "").replace("_", "")
+        if key in SECTION_MAP:
+            section_filter = SECTION_MAP[key]
+        else:
+            try:
+                section_filter = int(key)
+            except ValueError:
+                raise ValueError(
+                    f"Unknown section '{section}'. "
+                    f"Valid names: {sorted(set(SECTION_MAP.keys()))}"
+                )
+
+    app = _Session.connect(db_path)
+    _open_in_design(app, object_type, object_name)
+    try:
+        obj = _get_design_obj(app, object_type, object_name)
+
+        # Gather tabbable controls
+        # Each entry: (ctrl_com, name, ctrl_type, section_int, current_tab_index, tab_stop)
+        ctrls: list[tuple] = []
+        for i in range(obj.Controls.Count):
+            try:
+                c = obj.Controls(i)
+            except Exception:
+                continue
+            try:
+                ctype = int(c.ControlType)
+            except Exception:
+                ctype = -1
+            if ctype in _NON_TABBABLE_TYPES:
+                continue
+            sec = _ctrl_section(c)
+            if section_filter is not None and sec != section_filter:
+                continue
+            # Probe TabIndex — if the control truly doesn't expose it, skip
+            try:
+                cur_idx = int(c.TabIndex)
+            except Exception:
+                continue
+            try:
+                tab_stop = bool(c.TabStop)
+            except Exception:
+                tab_stop = True
+            try:
+                cname = c.Name
+            except Exception:
+                continue
+            ctrls.append((c, cname, ctype, sec if sec is not None else -1,
+                          cur_idx, tab_stop))
+
+        if action == "get":
+            # Group by section, sort by TabIndex
+            grouped: dict[str, list[dict]] = {}
+            for _c, name, ctype, sec, idx, tstop in ctrls:
+                sec_name = _SECTION_NAME.get(sec, f"Section{sec}")
+                grouped.setdefault(sec_name, []).append({
+                    "name": name,
+                    "tab_index": idx,
+                    "tab_stop": tstop,
+                    "control_type": ctype,
+                    "type_name": CTRL_TYPE.get(ctype, f"Type{ctype}"),
+                })
+            for sec_name in grouped:
+                grouped[sec_name].sort(key=lambda d: d["tab_index"])
+            return {
+                "object_type": object_type,
+                "object_name": object_name,
+                "action": "get",
+                "section_filter": section,
+                "total_controls": sum(len(v) for v in grouped.values()),
+                "sections": grouped,
+            }
+
+        elif action == "set":
+            # Validate all names exist among the gathered tabbable controls
+            ctrl_by_name = {name.lower(): tup for tup in ctrls for name in (tup[1],)}
+            missing = [n for n in tab_order if n.lower() not in ctrl_by_name]
+            if missing:
+                available = sorted(t[1] for t in ctrls)
+                raise ValueError(
+                    f"Unknown control(s) in tab_order: {missing}. "
+                    f"Available tabbable controls: {available}"
+                )
+
+            # Access enforces TabIndex to be in the range 0..(N-1) within a
+            # section AND unique. When you assign a TabIndex to a control,
+            # Access automatically renumbers the other controls in that
+            # section to preserve uniqueness — this is documented and is the
+            # idiomatic way to reorder. So we just set the target index in
+            # the requested order; Access handles the cascading internally.
+            applied: list[dict] = []
+            for new_idx, ctrl_name in enumerate(tab_order):
+                tup = ctrl_by_name[ctrl_name.lower()]
+                ctrl_com = tup[0]
+                try:
+                    ctrl_com.TabIndex = new_idx
+                    applied.append({"name": ctrl_name, "tab_index": new_idx})
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Could not set TabIndex={new_idx} on '{ctrl_name}': {exc}"
+                    )
+
+            return {
+                "object_type": object_type,
+                "object_name": object_name,
+                "action": "set",
+                "section_filter": section,
+                "applied": applied,
+                "count": len(applied),
+            }
+
+        else:  # auto_renumber
+            # Group by section, sort by current TabIndex, reassign 0..N-1.
+            # Same idiom as 'set' — single-pass, in target order; Access
+            # auto-renumbers the rest to preserve uniqueness.
+            by_section: dict[int, list[tuple]] = {}
+            for tup in ctrls:
+                by_section.setdefault(tup[3], []).append(tup)
+            applied_per_section: dict[str, list[dict]] = {}
+            for sec, lst in by_section.items():
+                lst.sort(key=lambda t: t[4])  # stable sort by current index
+                sec_name = _SECTION_NAME.get(sec, f"Section{sec}")
+                done: list[dict] = []
+                for new_idx, tup in enumerate(lst):
+                    try:
+                        tup[0].TabIndex = new_idx
+                        done.append({"name": tup[1], "tab_index": new_idx})
+                    except Exception as exc:
+                        log.warning(
+                            "auto_renumber: failed on '%s' (%s)", tup[1], exc
+                        )
+                applied_per_section[sec_name] = done
+
+            return {
+                "object_type": object_type,
+                "object_name": object_name,
+                "action": "auto_renumber",
+                "section_filter": section,
+                "sections": applied_per_section,
+                "count": sum(len(v) for v in applied_per_section.values()),
+            }
+    finally:
+        _save_and_close(app, object_type, object_name)
+        invalidate_object_caches(object_type, object_name)
+
+
 def ac_set_multiple_controls(
     db_path: str, object_type: str, object_name: str,
     controls: list[dict],

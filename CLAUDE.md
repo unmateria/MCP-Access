@@ -2,7 +2,7 @@
 
 ## Overview
 
-MCP server for reading and editing Microsoft Access databases (`.accdb`/`.mdb`) via COM automation (pywin32). Runs as stdio MCP server. Entry point: `access_mcp_server.py`. Implementation: `mcp_access/` package (~7000 lines across 20 modules).
+MCP server for reading and editing Microsoft Access databases (`.accdb`/`.mdb`) via COM automation (pywin32). Runs as stdio MCP server. Entry point: `access_mcp_server.py`. Implementation: `mcp_access/` package (~7500 lines across 20 modules).
 
 ## Architecture
 
@@ -11,15 +11,15 @@ MCP server for reading and editing Microsoft Access databases (`.accdb`/`.mdb`) 
 - **Caches**: `_parsed_controls_cache` (control parsing) and `_Session._cm_cache` (CodeModule COM objects — live COM proxies). Both invalidated on DB switch, object modification, and design operations. There is **no** Python-side cache of VBE text: `_cm_all_code()` always reads via `cm.Lines(1, total)` so external edits (manual VBE edits, Ctrl+Z, add-ins) are picked up immediately. See issue #26 for the reason this cache was removed.
 - **Binary section handling**: `ac_get_code` strips PrtMip/PrtDevMode from form/report exports; `ac_set_code` restores them automatically before import.
 
-## Tools (62 total)
+## Tools (65 total)
 
 | Category | Tools |
 |----------|-------|
 | **Database** | `access_create_database`, `access_close` |
-| **Objects** | `access_list_objects`, `access_get_code`, `access_set_code`, `access_export_structure`, `access_delete_object`, `access_create_form` |
-| **SQL/Tables** | `access_execute_sql`, `access_execute_batch`, `access_table_info`, `access_search_queries`, `access_create_table`, `access_alter_table` |
+| **Objects** | `access_list_objects`, `access_get_code`, `access_set_code`, `access_export_structure`, `access_delete_object`, `access_create_form`, `access_clone_object` |
+| **SQL/Tables** | `access_execute_sql`, `access_execute_batch`, `access_table_info`, `access_search_queries`, `access_search_data`, `access_create_table`, `access_alter_table` |
 | **VBE line-level** | `access_vbe_get_lines`, `access_vbe_get_proc`, `access_vbe_module_info`, `access_vbe_replace_lines`, `access_vbe_find`, `access_vbe_search_all`, `access_vbe_replace_proc`, `access_vbe_patch_proc`, `access_vbe_append` |
-| **Controls** | `access_list_controls`, `access_get_control`, `access_create_control`, `access_delete_control`, `access_set_control_props`, `access_set_multiple_controls` |
+| **Controls** | `access_list_controls`, `access_get_control`, `access_create_control`, `access_delete_control`, `access_set_control_props`, `access_set_multiple_controls`, `access_manage_tab_order` |
 | **DB Properties** | `access_get_db_property`, `access_set_db_property`, `access_get_form_property`, `access_set_form_property` |
 | **Text Export/Import** | `access_export_text`, `access_import_text` |
 | **Linked Tables** | `access_list_linked_tables`, `access_relink_table` |
@@ -93,6 +93,34 @@ Blocking COM calls (`OpenCurrentDatabase`, `CompactRepair`, `RunCommand`, `Appli
 2. Add a `types.Tool(...)` entry to the `TOOLS` list
 3. Add an `elif name == "access_new_tool":` branch in `call_tool()`
 4. Update the tool count in this CLAUDE.md and README.md
+
+## Office version autodetect (v0.7.36+)
+
+`_Session._office_version` / `_Session._office_msaccess` are populated by `_Session._detect_office_install()` — a one-shot probe that enumerates `Software\Microsoft\Office\<ver>\Access\InstallRoot\Path` under HKLM, HKLM\\WOW6432Node and HKCU (per-user C2R), picks the highest matching version with a working `MSACCESS.EXE`, falls back to `App Paths\MSACCESS.EXE\(Default)`, and finally to the previous hardcoded `16.0` / `Office16` defaults. Used by:
+- `_Session._suppress_recovery_dialog` — Resiliency registry key path
+- `_Session._decompile` — MSACCESS.EXE path for `/decompile` subprocess
+- `maintenance.ac_decompile_compact` — same
+
+Detection is idempotent (`_office_detected` flag) and never raises. Schema of `access_decompile_compact` is unchanged.
+
+## Macros (v0.7.36 docs upgrade)
+
+Macros have always been fully supported via the regular code tools — no dedicated tool exists. The workflow is:
+- List: `access_list_objects(object_type="macro")`
+- Read: `access_get_code(object_type="macro", name=...)`
+- Write: `access_set_code(object_type="macro", name=..., code=...)` — UTF-16 encoded
+- Run: `access_run_macro(macro_name=...)`
+- Delete: `access_delete_object(object_type="macro", object_name=..., confirm=true)`
+
+`restore_binary_sections` does NOT apply to macros (they have no PrtMip/PrtDevMode). `access_tips('macros')` shows the workflow.
+
+## Clone object (v0.7.36)
+
+`access_clone_object` duplicates an object by raw `SaveAsText` → `LoadFromText`. Critical detail: it does its own `app.SaveAsText` + `read_tmp` directly (≈10 lines duplicated from `code.py:ac_get_code`) — explicitly NOT going through `strip_binary_sections`, so PrtMip / PrtDevMode / NameMap / GUID ride along inside the text. `ac_set_code` then sees the binaries are present and skips restoration (`code.py:348` — only restores when absent). For `class_module`, `_ensure_class_module_header(text, target_name)` re-runs so the implicit VB_Name stays consistent.
+
+## Tab order (v0.7.36)
+
+`access_manage_tab_order` uses **single-pass assignment** in target order — Access enforces TabIndex to be in `0..(N-1)` per section and auto-renumbers the rest to preserve uniqueness when you set one. Do NOT try to "park" controls at indices >= N (Access rejects with "The value you used for the TabIndex property isn't valid. The correct values are from 0 through N-1."). Skips non-tabbable types (100=Label, 101=Rectangle, 102=Line, 103=Image, 114=PageBreak, 118=Page). Optional `section` filter; defaults to all sections.
 
 ## Common Gotchas
 

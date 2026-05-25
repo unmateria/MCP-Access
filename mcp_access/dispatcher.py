@@ -17,16 +17,16 @@ from .controls import (
     ac_list_controls, ac_get_control, ac_create_control,
     ac_delete_control, ac_set_control_props, ac_set_form_property,
     ac_get_form_property, ac_set_multiple_controls,
-    ac_export_text, ac_import_text,
+    ac_export_text, ac_import_text, ac_manage_tab_order,
 )
 from .code import (
     ac_list_objects, ac_get_code, ac_set_code, ac_delete_object,
-    ac_create_form, ac_export_structure,
+    ac_create_form, ac_export_structure, ac_clone_object,
 )
 from .database import (
     ac_create_database, ac_create_table, ac_alter_table, ac_table_info,
 )
-from .sql import ac_execute_sql, ac_execute_batch, ac_manage_query
+from .sql import ac_execute_sql, ac_execute_batch, ac_manage_query, ac_search_data
 from .properties import (
     ac_get_db_property, ac_set_db_property,
     ac_get_field_properties, ac_set_field_property,
@@ -581,6 +581,41 @@ def call_tool_sync(name: str, arguments: dict) -> str:
                 image_width=int(arguments["image_width"]),
                 click_type=arguments.get("click_type", "left"),
                 wait_after_ms=int(arguments.get("wait_after_ms", 200)),
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        # -- Search data --------------------------------------------------
+        elif name == "access_search_data":
+            result = ac_search_data(
+                arguments["db_path"],
+                arguments["search_text"],
+                tables=arguments.get("tables"),
+                max_results_per_table=int(arguments.get("max_results_per_table", 50)),
+                max_results_total=int(arguments.get("max_results_total", 500)),
+                match_case=bool(arguments.get("match_case", False)),
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        # -- Clone object -------------------------------------------------
+        elif name == "access_clone_object":
+            result = ac_clone_object(
+                arguments["db_path"],
+                arguments["object_type"],
+                arguments["source_name"],
+                arguments["target_name"],
+                overwrite=bool(arguments.get("overwrite", False)),
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        # -- Tab order ----------------------------------------------------
+        elif name == "access_manage_tab_order":
+            result = ac_manage_tab_order(
+                arguments["db_path"],
+                arguments["object_type"],
+                arguments["object_name"],
+                arguments["action"],
+                tab_order=arguments.get("tab_order"),
+                section=arguments.get("section"),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
