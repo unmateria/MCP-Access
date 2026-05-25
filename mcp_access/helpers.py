@@ -20,14 +20,19 @@ def read_tmp(path: str) -> tuple[str, str]:
     """
     Reads a file exported by Access.
     Returns (content, encoding_used).
-    Detects UTF-16 with BOM before trying cp1252.
+    Detects UTF-16 with BOM before trying utf-8/cp1252.
+
+    UTF-8 is tried before cp1252 because cp1252 is single-byte and
+    almost never raises UnicodeDecodeError, which means files that
+    are actually UTF-8 would be silently mis-decoded as cp1252 with
+    garbled multi-byte sequences (mojibake).
     """
     with open(path, "rb") as f:
         bom = f.read(2)
     if bom in (b"\xff\xfe", b"\xfe\xff"):
         with open(path, encoding="utf-16") as f:
             return f.read(), "utf-16"
-    for enc in ("utf-8-sig", "cp1252", "utf-8"):
+    for enc in ("utf-8-sig", "utf-8", "cp1252"):
         try:
             with open(path, encoding=enc) as f:
                 return f.read(), enc
@@ -41,9 +46,30 @@ def write_tmp(path: str, content: str, encoding: str = "utf-16") -> None:
     """
     Writes content for Access to read with LoadFromText.
     Default utf-16 (Access .accdb expects UTF-16LE with BOM).
+
+    Uses errors="strict" so that non-encodable characters (e.g. emoji or
+    Asian characters in a cp1252-targeted .bas module) surface as a clear
+    UnicodeEncodeError instead of being silently replaced with `?` —
+    silent corruption used to be possible because we wrote with
+    errors="replace".
     """
-    with open(path, "w", encoding=encoding, errors="replace") as f:
-        f.write(content)
+    try:
+        with open(path, "w", encoding=encoding, errors="strict") as f:
+            f.write(content)
+    except UnicodeEncodeError as e:
+        # Surface a single, actionable message: what failed, where, and
+        # the offending substring.  The dispatcher wraps this into the
+        # tool error and the caller can decide to recode in UTF-16.
+        snippet = content[max(0, e.start - 20):e.start] + \
+                  "[" + content[e.start:e.end] + "]" + \
+                  content[e.end:min(len(content), e.end + 20)]
+        raise UnicodeEncodeError(
+            e.encoding, e.object, e.start, e.end,
+            f"cannot encode character(s) at offset {e.start}-{e.end} "
+            f"with {encoding!r}: ...{snippet!r}... "
+            f"(VBA modules must be in the system ANSI codepage; "
+            f"use only ASCII or codepage-compatible characters)"
+        ) from None
 
 
 # ---------------------------------------------------------------------------
@@ -144,26 +170,45 @@ def restore_binary_sections(app: Any, object_type: str, name: str, new_code: str
     if not blocks:
         return new_code
 
-    _end_re = re.compile(r"^\s*End\s+(?:Form|Report)\s*$")
-    _begin_re = re.compile(r"^\s*Begin\s+(?:Form|Report)\s*$")
+    # Inject binary blocks before the OUTER closing `End` of the top-level
+    # Form/Report.  Subforms have their own nested Begin Form...End that
+    # would confuse a simple "first End after Begin Form" approach, so we
+    # track full block depth (Begin <Type> AND `prop = Begin` multi-line
+    # values like `NameMap = Begin`).  When depth returns to the level the
+    # outer Form was opened at, that End is the one we want.
+    _top_begin_re = re.compile(r"^Begin\s+(?:Form|Report)\s*$", re.IGNORECASE)
+    _begin_any_re = re.compile(r"^Begin\b")
+    _begin_prop_re = re.compile(r"^\w+\s*=\s*Begin\s*$")
     lines = new_code.splitlines(keepends=True)
     result: list[str] = []
-    in_top_form = False
+    depth = 0
+    top_depth = -1   # depth at which the outermost Form/Report was opened
     injected = False
 
     for line in lines:
         stripped = line.strip()
 
-        if _begin_re.match(stripped):
-            in_top_form = True
-
-        if in_top_form and not injected and _end_re.match(stripped):
-            for block_text in blocks.values():
-                result.append(block_text)
-                if not block_text.endswith("\n"):
-                    result.append("\n")
-            injected = True
-            in_top_form = False
+        if not injected and top_depth == -1 and _top_begin_re.match(stripped):
+            top_depth = depth
+            depth += 1
+            result.append(line)
+            continue
+        if _begin_any_re.match(stripped) or _begin_prop_re.match(stripped):
+            depth += 1
+            result.append(line)
+            continue
+        if stripped == "End":
+            depth -= 1
+            # The End that brings us back to top_depth closes the outermost
+            # Form/Report — inject the binary blocks right before it.
+            if not injected and top_depth != -1 and depth == top_depth:
+                for block_text in blocks.values():
+                    result.append(block_text)
+                    if not block_text.endswith("\n"):
+                        result.append("\n")
+                injected = True
+            result.append(line)
+            continue
 
         result.append(line)
 
@@ -232,10 +277,15 @@ def split_code_behind(code: str) -> tuple[str, str]:
     If the code contains 'CodeBehindForm' or 'CodeBehindReport', it splits it.
     Returns (form_text_without_vba, vba_code) where vba_code may be empty.
     The form_text is cleaned of HasModule if there is VBA (it will be injected later).
+
+    Matches only on its own line — Access export emits the marker as a
+    bare header, so this guards against false positives where the literal
+    string happens to appear inside a property value (e.g. a Caption).
     """
     for marker in ("CodeBehindForm", "CodeBehindReport"):
-        idx = code.find(marker)
-        if idx != -1:
+        m = re.search(r"(?m)^\s*" + re.escape(marker) + r"\s*$", code)
+        if m:
+            idx = m.start()
             form_part = code[:idx].rstrip() + "\n"
             vba_part = code[idx:].split("\n", 1)
             vba_code = vba_part[1] if len(vba_part) > 1 else ""

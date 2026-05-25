@@ -510,7 +510,12 @@ def _read_dialog_text(hwnd_access: int) -> Optional[str]:
 def _compile_dialog_watchdog(hwnd_access: int, stop_event: threading.Event,
                               dismissed: list, dialog_texts: list,
                               screenshot_holder: list, interval: float = 1.0):
-    """Poll for compile error dialogs. Reads text BEFORE dismissing."""
+    """Poll for compile error dialogs. Reads text BEFORE dismissing.
+
+    Captures up to 3 dialog screenshots so the caller can pick the most
+    informative one — capturing only the FIRST loses the real-error
+    screenshot when a benign "Save changes?" prompt comes first.
+    """
     from .vba_exec import _dismiss_access_dialogs
 
     while not stop_event.is_set():
@@ -518,9 +523,9 @@ def _compile_dialog_watchdog(hwnd_access: int, stop_event: threading.Event,
         text = _read_dialog_text(hwnd_access)
         if text:
             dialog_texts.append(text)
-        # Then dismiss (captures screenshot + clicks OK)
-        if _dismiss_access_dialogs(hwnd_access,
-                                   screenshot_holder if not dismissed else None):
+        # Then dismiss (captures screenshot + clicks OK).
+        capture_into = screenshot_holder if len(screenshot_holder) < 3 else None
+        if _dismiss_access_dialogs(hwnd_access, capture_into):
             dismissed.append(True)
         stop_event.wait(interval)
 
@@ -599,13 +604,17 @@ def ac_compile_vba(db_path: str, timeout: Optional[int] = None) -> dict:
     )
     watchdog.start()
 
+    # Watchdog grace period: clamp to [1, 30] so a misconfigured caller
+    # can't hang the tool indefinitely or cut the watchdog before it sees
+    # the dialog.
+    grace = 2 if timeout is None else max(1, min(int(timeout), 30))
     try:
         if compile_item:
             compile_item.Execute()
         else:
             app.RunCommand(AC_CMD_COMPILE)
         # Give watchdog time to catch any late async dialog.
-        time.sleep(2)
+        time.sleep(grace)
     except Exception as exc:
         err_loc = _get_vbe_error_location(app)
         result = {
@@ -628,7 +637,9 @@ def ac_compile_vba(db_path: str, timeout: Optional[int] = None) -> dict:
     # 4. Check results: dialog dismissed = compile error caught.
     if dismissed:
         err_loc = _get_vbe_error_location(app)
-        error_msg = dialog_texts[0] if dialog_texts else "Compile error (dialog auto-dismissed)"
+        # Pick the LAST dialog text — earlier ones are often benign
+        # ("Save changes?") and the real compile error comes last.
+        error_msg = dialog_texts[-1] if dialog_texts else "Compile error (dialog auto-dismissed)"
         result = {
             "status": "error",
             "error_detail": error_msg,
@@ -636,7 +647,8 @@ def ac_compile_vba(db_path: str, timeout: Optional[int] = None) -> dict:
         if err_loc:
             result["error_location"] = err_loc
         if dialog_screenshots:
-            result["dialog_screenshot"] = dialog_screenshots[0]
+            # Same reasoning — last screenshot usually has the actual error.
+            result["dialog_screenshot"] = dialog_screenshots[-1]
         return result
 
     # 5. Verify IsCompiled — safety net for edge cases.

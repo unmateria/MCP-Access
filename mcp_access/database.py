@@ -35,6 +35,15 @@ def _set_field_prop(db: Any, table_name: str, field_name: str,
 def ac_create_database(db_path: str) -> dict:
     """Creates an empty Access database (.accdb). Error if it already exists."""
     resolved = str(Path(db_path).resolve())
+    # Guard against an accidentally extension-less path — without one
+    # Access infers the format from the runtime engine and the user may
+    # end up with a .mdb when they wanted .accdb.
+    ext = os.path.splitext(resolved)[1].lower()
+    if ext not in (".accdb", ".mdb"):
+        raise ValueError(
+            f"db_path must end in .accdb or .mdb (got {ext or '<no extension>'!r}). "
+            f"Path received: {resolved}"
+        )
     if os.path.exists(resolved):
         raise FileExistsError(
             f"'{resolved}' already exists. Use access_execute_sql to modify it."
@@ -279,8 +288,12 @@ def ac_table_info(db_path: str, table_name: str) -> dict:
     try:
         record_count = td.RecordCount
         if record_count == -1:
-            # For linked tables, open recordset to count
-            rs = db.OpenRecordset(f"SELECT COUNT(*) AS cnt FROM [{table_name}]")
+            # For linked tables, open recordset to count.  Escape any `]`
+            # in the name by doubling it — the bracket-quoted identifier
+            # ends at the first single `]`, so an unescaped one in the
+            # table name would corrupt the query.
+            safe = table_name.replace("]", "]]")
+            rs = db.OpenRecordset(f"SELECT COUNT(*) AS cnt FROM [{safe}]")
             record_count = rs.Fields(0).Value
             rs.Close()
     except Exception:

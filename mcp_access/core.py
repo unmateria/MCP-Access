@@ -66,6 +66,45 @@ AC_TYPE: dict[str, int] = {
 _parsed_controls_cache: dict = {} # "form:name" / "report:name" -> _parse_controls() result
 
 
+# ---------------------------------------------------------------------------
+# SHIFT key safety net — always release simulated SHIFT on exit/cleanup
+# ---------------------------------------------------------------------------
+_VK_SHIFT = 0x10
+_KEYEVENTF_KEYUP = 0x0002
+
+def _release_shift():
+    """Release SHIFT key at OS level.  Idempotent — safe to call even if not pressed."""
+    try:
+        ctypes.windll.user32.keybd_event(_VK_SHIFT, 0, _KEYEVENTF_KEYUP, 0)
+    except Exception:
+        pass
+
+atexit.register(_release_shift)
+
+
+def _get_com_pid(app) -> Optional[int]:
+    """Get the PID of the Access process behind a COM object via its window handle."""
+    try:
+        hwnd = app.hWndAccessApp()
+        if not hwnd:
+            return None
+        pid = ctypes.c_ulong()
+        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return pid.value if pid.value else None
+    except Exception:
+        return None
+
+
+def _wait_pid_gone(pid: int, timeout: float = 10.0) -> bool:
+    """Poll until a PID no longer appears in the process list.  Returns True if gone."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pid not in _list_msaccess_pids():
+            return True
+        time.sleep(0.3)
+    return pid not in _list_msaccess_pids()
+
+
 def _list_msaccess_pids() -> set[int]:
     """Return PIDs of all running msaccess.exe processes.
     Defensive helper used around the /decompile subprocess to catch forked
@@ -100,6 +139,7 @@ class _Session:
     """
     _app: Optional[Any] = None
     _db_open: Optional[str] = None
+    _pid: Optional[int] = None  # captured in _launch() on the COM worker thread (atexit can't query COM)
     _cm_cache: dict = {}   # "type:name" -> CodeModule COM object
     _decompiled_dbs: set = set()  # DBs already decompiled in this session
     _attached: bool = False  # True if we attached via GetActiveObject; False if we spawned via DispatchEx
@@ -123,8 +163,10 @@ class _Session:
     @classmethod
     def _force_cleanup(cls):
         """Reset state without calling methods on a dead COM object."""
+        _release_shift()
         cls._app = None
         cls._db_open = None
+        cls._pid = None
         cls._attached = False
         cls._cm_cache.clear()
         cls._decompiled_dbs.clear()
@@ -132,6 +174,7 @@ class _Session:
 
     @classmethod
     def _launch(cls) -> None:
+        cls._suppress_recovery_dialog()
         try:
             import win32com.client
         except ImportError:
@@ -170,6 +213,12 @@ class _Session:
             cls._app.Visible = True   # required for VBE to be accessible via COM
         except Exception as e:
             log.warning("Could not set Visible=True: %s (continuing anyway)", e)
+        # Capture PID HERE on the COM worker thread.  quit() runs in the atexit
+        # main thread where cross-thread COM calls return RPC_E_WRONG_THREAD,
+        # so re-querying the proxy from quit() would silently return None and
+        # disable the taskkill fallback below.
+        cls._pid = _get_com_pid(cls._app)
+        log.info("Access PID captured: %s (attached=%s)", cls._pid, cls._attached)
 
     @classmethod
     def reopen(cls, path: str) -> None:
@@ -326,10 +375,20 @@ class _Session:
 
     @staticmethod
     def _suppress_recovery_dialog() -> None:
-        """Disable the 'last time you opened this file it caused a serious error' dialog."""
-        key_path = r"Software\Microsoft\Office\16.0\Access\Resiliency"
+        """Nuke the Resiliency keys that cause the 'serious error' dialog."""
+        base = r"Software\Microsoft\Office\16.0\Access\Resiliency"
+        # Delete subkeys that track crashed files (DisabledItems, StartupItems)
+        for subkey_name in ("DisabledItems", "StartupItems"):
+            try:
+                winreg.DeleteKey(winreg.HKEY_CURRENT_USER, base + "\\" + subkey_name)
+                log.info("Deleted Resiliency\\%s", subkey_name)
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                log.warning("Could not delete Resiliency\\%s: %s", subkey_name, e)
+        # Also set the suppression flags as belt-and-suspenders
         try:
-            key = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE)
+            key = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, base, 0, winreg.KEY_SET_VALUE)
             try:
                 winreg.SetValueEx(key, "DisableAllCallersWarning", 0, winreg.REG_DWORD, 1)
                 winreg.SetValueEx(key, "DoNotShowUI", 0, winreg.REG_DWORD, 1)
@@ -337,7 +396,7 @@ class _Session:
                 winreg.CloseKey(key)
             log.info("Recovery dialog suppressed via registry")
         except Exception as e:
-            log.warning("Could not suppress recovery dialog: %s", e)
+            log.warning("Could not set Resiliency flags: %s", e)
 
     @classmethod
     def _switch(cls, path: str) -> None:
@@ -462,31 +521,50 @@ class _Session:
     def quit(cls) -> None:
         if cls._app is not None:
             if cls._attached:
-                # User's own Access — don't kill it on MCP shutdown.  Just
-                # release our references and let the user keep working.
                 log.info("Releasing attached Access.Application (not quitting user's session)")
                 cls._app = None
                 cls._db_open = None
+                cls._pid = None
                 cls._attached = False
                 cls._cm_cache.clear()
                 cls._decompiled_dbs.clear()
                 _parsed_controls_cache.clear()
                 return
-            log.info("Closing Access...")
+            _release_shift()
+            pid = cls._pid  # captured in _launch() on the COM worker; safe across threads
+            log.info("Closing Access (PID %s)...", pid)
             try:
                 if cls._db_open:
                     cls._app.CloseCurrentDatabase()
                 cls._app.Quit()
-                log.info("Access closed OK")
             except Exception as e:
-                log.warning("Error closing Access: %s", e)
+                log.warning("Error during Access Quit(): %s", e)
             finally:
                 cls._app = None
                 cls._db_open = None
+                cls._pid = None
                 cls._attached = False
                 cls._cm_cache.clear()
                 cls._decompiled_dbs.clear()
                 _parsed_controls_cache.clear()
+            if pid:
+                if _wait_pid_gone(pid, timeout=10.0):
+                    log.info("Access PID %s exited cleanly", pid)
+                else:
+                    log.warning("Access PID %s still alive after 10s — killing", pid)
+                    try:
+                        subprocess.run(
+                            ["taskkill", "/F", "/T", "/PID", str(pid)],
+                            capture_output=True, timeout=5,
+                        )
+                        _wait_pid_gone(pid, timeout=3.0)
+                    except Exception as e:
+                        log.warning("taskkill failed for PID %s: %s", pid, e)
+                # Let Windows release file locks
+                time.sleep(0.5)
+            else:
+                time.sleep(1.0)
+            log.info("Access closed OK")
 
 
 atexit.register(_Session.quit)

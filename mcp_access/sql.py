@@ -10,10 +10,6 @@ from .constants import DESTRUCTIVE_PREFIXES, DB_SEE_CHANGES, QUERYDEF_TYPE
 from .helpers import serialize_value
 
 
-_SQL_LINE_COMMENT = re.compile(r'^--[^\n]*\n?', re.MULTILINE)
-_SQL_BLOCK_COMMENT = re.compile(r'^\s*/\*.*?\*/', re.DOTALL)
-
-
 def _sql_effective_prefix(sql: str) -> str:
     """Return the leading keyword of a SQL statement after stripping leading
     whitespace and any leading `--` / `/* ... */` comments.
@@ -47,6 +43,21 @@ def _sql_effective_prefix(sql: str) -> str:
             changed = True
             continue
     return s.upper()
+
+
+# Pattern for SELECT ... INTO (make-table query). Treated as destructive
+# because it can overwrite an existing table without warning.
+_SELECT_INTO_RE = re.compile(r'^\s*SELECT\b.*?\bINTO\b', re.IGNORECASE | re.DOTALL)
+
+
+def _is_destructive(sql: str) -> bool:
+    """Return True if *sql* is destructive (DELETE/DROP/TRUNCATE/ALTER)
+    or a SELECT ... INTO make-table that could overwrite an existing table."""
+    prefix = _sql_effective_prefix(sql)
+    if any(prefix.startswith(p) for p in DESTRUCTIVE_PREFIXES):
+        return True
+    # SELECT ... INTO target FROM source — make-table query.
+    return bool(_SELECT_INTO_RE.match(prefix))
 
 
 def ac_execute_sql(
@@ -92,15 +103,14 @@ def ac_execute_sql(
             result["truncated"] = True
         return result
     else:
-        if any(normalized.startswith(p) for p in DESTRUCTIVE_PREFIXES):
-            if not confirm_destructive:
-                return {
-                    "error": (
-                        "Destructive SQL detected. "
-                        "Use confirm_destructive=true to execute: "
-                        + sql[:100]
-                    )
-                }
+        if _is_destructive(sql) and not confirm_destructive:
+            return {
+                "error": (
+                    "Destructive SQL detected. "
+                    "Use confirm_destructive=true to execute: "
+                    + sql[:100]
+                )
+            }
         try:
             db.Execute(sql)
         except Exception as first_err:
@@ -133,8 +143,7 @@ def ac_execute_batch(
     # Pre-scan: check destructive (ignore leading SQL comments)
     if not confirm_destructive:
         for i, stmt in enumerate(statements):
-            sql_upper = _sql_effective_prefix(stmt["sql"])
-            if any(sql_upper.startswith(p) for p in DESTRUCTIVE_PREFIXES):
+            if _is_destructive(stmt["sql"]):
                 label = stmt.get("label", f"statement[{i}]")
                 return {
                     "error": (

@@ -51,15 +51,33 @@ _KEYWORD_TO_KIND: dict[str, int] = {
 }
 
 
+_KIND_LABEL = {0: "Sub/Function", 1: "Property Let", 2: "Property Set", 3: "Property Get"}
+
+
 def _proc_kind(cm, name: str) -> int:
-    """Return the first VBE ``kind`` constant (0–3) for which *name* exists."""
+    """Return the VBE ``kind`` constant (0–3) for which *name* exists.
+
+    Raises if *name* matches MULTIPLE kinds — a class with both
+    ``Property Get Foo`` and ``Property Let Foo`` is normal VBA, and the
+    caller has to disambiguate (e.g. by using ``ac_vbe_module_info`` first
+    and then editing via line numbers with ``ac_vbe_replace_lines``)."""
+    found = []
     for kind in _ALL_PROC_KINDS:
         try:
             cm.ProcStartLine(name, kind)
-            return kind
+            found.append(kind)
         except Exception:
             continue
-    raise RuntimeError(f"Procedure '{name}' not found with any VBE kind (0–3)")
+    if not found:
+        raise RuntimeError(f"Procedure '{name}' not found with any VBE kind (0-3)")
+    if len(found) > 1:
+        labels = ", ".join(f"{_KIND_LABEL[k]} (kind={k})" for k in found)
+        raise RuntimeError(
+            f"Procedure '{name}' is ambiguous — exists as: {labels}. "
+            f"Use ac_vbe_module_info to inspect them and edit via "
+            f"ac_vbe_replace_lines with explicit line numbers."
+        )
+    return found[0]
 
 
 def _proc_bounds(cm, name: str, kind: int = None):
@@ -162,6 +180,23 @@ def _force_vbe_init(app, object_type: str, object_name: str):
             log.warning("_force_vbe_init: VBE toggle failed: %s", e)
 
 
+def _close_form_design_view(app: Any, object_type: str, object_name: str) -> None:
+    """If the form/report is open in Design view, close it (saving changes).
+
+    Required before ANY VBE CodeModule access — including reads — because
+    Access can raise "Catastrophic failure" (-2147418113) when the Design
+    view holds the same object the VBE proxy is being queried for.
+    No-op for object_type='module' (standard modules have no Design view).
+    """
+    if object_type not in ("form", "report"):
+        return
+    ac_obj_type = AC_FORM if object_type == "form" else AC_REPORT
+    try:
+        app.DoCmd.Close(ac_obj_type, object_name, AC_SAVE_YES)
+    except Exception:
+        pass  # not open in Design view — that's the common case
+
+
 def _cm_all_code(cm: Any, cache_key: str) -> str:
     """
     Returns the full text of a CodeModule by reading directly from COM.
@@ -218,9 +253,11 @@ def _check_module_health(cm: Any, cache_key: str, expected_total: int = 0) -> li
                 f"WARNING: '{line.strip()}' found at line {i + 1} (expected in first 5 lines)"
             )
 
-    # Check 2 — Duplicate labels (scoped per procedure)
+    # Check 2 — Duplicate labels (scoped per procedure).
+    # VBA accepts combinations like "Public Static Sub Foo" — allow scope
+    # modifier AND optional Static.
     label_re = re.compile(r'^(\w+):\s*$')
-    proc_re = re.compile(r'^(?:Public|Private|Friend|Static)?\s*(?:Sub|Function|Property\s+\w+)\s+', re.IGNORECASE)
+    proc_re = re.compile(r'^(?:(?:Public|Private|Friend)\s+)?(?:Static\s+)?(?:Sub|Function|Property\s+\w+)\s+', re.IGNORECASE)
     end_proc_re = re.compile(r'^End\s+(?:Sub|Function|Property)\b', re.IGNORECASE)
     label_positions: dict[tuple[str, str], list[int]] = {}
     current_proc = ""
@@ -333,6 +370,7 @@ def ac_vbe_get_lines(
     if count < 1:
         raise ValueError(f"count must be >= 1 (got {count})")
     app = _Session.connect(db_path)
+    _close_form_design_view(app, object_type, object_name)
     cm = _get_code_module(app, object_type, object_name)
     cache_key = f"{object_type}:{object_name}"
     all_code = _cm_all_code(cm, cache_key)
@@ -341,6 +379,11 @@ def ac_vbe_get_lines(
     if start_line < 1 or start_line > total:
         raise ValueError(f"start_line {start_line} out of range (1-{total})")
     actual = min(count, total - start_line + 1)
+    if actual < count:
+        log.info(
+            "ac_vbe_get_lines: requested %d but only %d available from line %d",
+            count, actual, start_line,
+        )
     return "\n".join(all_lines[start_line - 1 : start_line - 1 + actual])
 
 
@@ -353,6 +396,7 @@ def ac_vbe_get_proc(
     Returns: start_line, body_line, count, code.
     """
     app = _Session.connect(db_path)
+    _close_form_design_view(app, object_type, object_name)
     cm = _get_code_module(app, object_type, object_name)
     try:
         start, body, count, _kind = _proc_bounds(cm, proc_name)
@@ -381,6 +425,7 @@ def ac_vbe_module_info(
     Useful as a quick index before editing, without downloading the full code.
     """
     app = _Session.connect(db_path)
+    _close_form_design_view(app, object_type, object_name)
     cm = _get_code_module(app, object_type, object_name)
     cache_key = f"{object_type}:{object_name}"
     all_code = _cm_all_code(cm, cache_key)
@@ -391,7 +436,7 @@ def ac_vbe_module_info(
         seen: set[tuple[str, str]] = set()  # (name_lower, keyword_lower)
         for i, raw_line in enumerate(all_lines, start=1):
             m = re.match(
-                r'^(?:Public\s+|Private\s+|Friend\s+)?'
+                r'^(?:(?:Public|Private|Friend)\s+)?(?:Static\s+)?'
                 r'(Function|Sub|Property\s+(?:Get|Let|Set))\s+(\w+)',
                 raw_line.strip(), re.IGNORECASE,
             )
@@ -430,12 +475,16 @@ def ac_vbe_module_info(
 # VBE replace / edit operations
 # ---------------------------------------------------------------------------
 
-def _exec_single_replace(cm, app, object_type, object_name, start_line, count, new_code):
+def _exec_single_replace(cm, object_type, object_name, start_line, count, new_code):
     """Executes a single replace_lines operation. Returns dict with result."""
     total = cm.CountOfLines
+    # Allow start_line == total + 1 for "append at end" semantics, but make
+    # the error message reflect that the inclusive upper bound is total + 1
+    # for inserts (count == 0) and total for deletes / replaces.
     if start_line < 1 or start_line > total + 1:
         raise ValueError(
-            f"start_line {start_line} out of range (1–{total})"
+            f"start_line {start_line} out of range "
+            f"(1-{total} for replace/delete, 1-{total + 1} for pure insert)"
         )
     clamped = False
     if count > 0:
@@ -443,7 +492,11 @@ def _exec_single_replace(cm, app, object_type, object_name, start_line, count, n
         if count > max_count:
             count = max_count
             clamped = True
-        cm.DeleteLines(start_line, count)
+        # After clamp, count may become 0 when start_line == total + 1.
+        # DeleteLines(line, 0) raises in VBE, so only call it when we
+        # actually have lines to delete.
+        if count > 0:
+            cm.DeleteLines(start_line, count)
     inserted = 0
     if new_code:
         decoded = html_mod.unescape(new_code)
@@ -479,14 +532,7 @@ def ac_vbe_replace_lines(
     Returns the status + preview of inserted code to avoid an extra get_proc call.
     """
     app = _Session.connect(db_path)
-
-    # Close form/report in Design view if open (prevents "Catastrophic failure")
-    if object_type in ("form", "report"):
-        ac_obj_type = AC_FORM if object_type == "form" else AC_REPORT
-        try:
-            app.DoCmd.Close(ac_obj_type, object_name, AC_SAVE_YES)
-        except Exception:
-            pass
+    _close_form_design_view(app, object_type, object_name)
 
     cache_key_pre = f"{object_type}:{object_name}"
     _Session._cm_cache.pop(cache_key_pre, None)
@@ -500,7 +546,7 @@ def ac_vbe_replace_lines(
         results = []
         for op in sorted_ops:
             r = _exec_single_replace(
-                cm, app, object_type, object_name,
+                cm, object_type, object_name,
                 int(op["start_line"]), int(op["count"]), op.get("new_code", ""),
             )
             results.append(r)
@@ -530,7 +576,7 @@ def ac_vbe_replace_lines(
         return status
 
     # ── Single mode (backward compatible) ──
-    r = _exec_single_replace(cm, app, object_type, object_name, start_line, count, new_code)
+    r = _exec_single_replace(cm, object_type, object_name, start_line, count, new_code)
     cache_key = f"{object_type}:{object_name}"
     # Persist VBE changes to .accdb — without this, changes are only in memory
     try:
@@ -574,6 +620,7 @@ def ac_vbe_find(
     Always enriches each match with 'proc' (name of the owning procedure).
     """
     app = _Session.connect(db_path)
+    _close_form_design_view(app, object_type, object_name)
     cm = _get_code_module(app, object_type, object_name)
     cache_key = f"{object_type}:{object_name}"
     all_code = _cm_all_code(cm, cache_key)
@@ -633,6 +680,7 @@ def ac_vbe_search_all(
             if truncated:
                 break
             try:
+                _close_form_design_view(app, obj_type, obj_name)
                 cm = _get_code_module(app, obj_type, obj_name)
                 cache_key = f"{obj_type}:{obj_name}"
                 all_code = _cm_all_code(cm, cache_key)
@@ -801,16 +849,7 @@ def ac_vbe_replace_proc(
     If new_code is empty, deletes the procedure.
     """
     app = _Session.connect(db_path)
-
-    # If the form/report is open in Design view (after ac_set_control_props etc.),
-    # close it first to avoid COM conflicts with the VBE ("Catastrophic error")
-    if object_type in ("form", "report"):
-        ac_obj_type = AC_FORM if object_type == "form" else AC_REPORT
-        try:
-            app.DoCmd.Close(ac_obj_type, object_name, AC_SAVE_YES)
-            log.info("ac_vbe_replace_proc: closed '%s' in Design view before accessing VBE", object_name)
-        except Exception:
-            pass  # was not open — OK
+    _close_form_design_view(app, object_type, object_name)
 
     # Invalidate cm_cache in case CodeModule went stale after design operation
     cache_key = f"{object_type}:{object_name}"
@@ -884,13 +923,7 @@ def ac_vbe_patch_proc(
     """
     app = _Session.connect(db_path)
 
-    # Close form/report in Design view if open
-    if object_type in ("form", "report"):
-        ac_obj_type = AC_FORM if object_type == "form" else AC_REPORT
-        try:
-            app.DoCmd.Close(ac_obj_type, object_name, AC_SAVE_YES)
-        except Exception:
-            pass
+    _close_form_design_view(app, object_type, object_name)
 
     cache_key = f"{object_type}:{object_name}"
     _Session._cm_cache.pop(cache_key, None)
@@ -913,13 +946,29 @@ def ac_vbe_patch_proc(
     applied = 0
     not_found = []
     ws_fallback_notes = []
+    ambiguous_notes = []
     for i, patch in enumerate(patches):
         find_text = patch["find"]
         replace_text = patch.get("replace", "")
         # Decode HTML entities
         find_text = html_mod.unescape(find_text)
         replace_text = html_mod.unescape(replace_text)
+        # Normalize line endings to CRLF (proc_code from VBE is always CRLF;
+        # callers commonly send LF — without this the exact match below
+        # always falls through to the ws-normalized fallback).
+        if "\n" in find_text:
+            find_text = find_text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+        if "\n" in replace_text:
+            replace_text = replace_text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
         if find_text in proc_code:
+            # Warn if the find string is ambiguous — only the FIRST occurrence
+            # is replaced (replace(count=1)), so multiple matches silently
+            # leaving the others alone is a common source of confusion.
+            occurrences = proc_code.count(find_text)
+            if occurrences > 1:
+                ambiguous_notes.append(
+                    f"patch[{i}]: find_text matched {occurrences} times — only first occurrence replaced"
+                )
             proc_code = proc_code.replace(find_text, replace_text, 1)
             applied += 1
         else:
@@ -981,6 +1030,8 @@ def ac_vbe_patch_proc(
     )
     if ws_fallback_notes:
         result += f"\nWS-fallback: {'; '.join(ws_fallback_notes)}"
+    if ambiguous_notes:
+        result += f"\nAmbiguous matches: {'; '.join(ambiguous_notes)}"
     if option_warnings:
         result += f"\n" + "\n".join(option_warnings)
     if health:
@@ -1000,14 +1051,7 @@ def ac_vbe_append(
     without needing to calculate line numbers.
     """
     app = _Session.connect(db_path)
-
-    # Close form/report in Design view if open (prevents "Catastrophic failure")
-    if object_type in ("form", "report"):
-        ac_obj_type = AC_FORM if object_type == "form" else AC_REPORT
-        try:
-            app.DoCmd.Close(ac_obj_type, object_name, AC_SAVE_YES)
-        except Exception:
-            pass
+    _close_form_design_view(app, object_type, object_name)
 
     cache_key_pre = f"{object_type}:{object_name}"
     _Session._cm_cache.pop(cache_key_pre, None)

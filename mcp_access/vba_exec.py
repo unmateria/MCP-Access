@@ -40,8 +40,14 @@ def _invoke_app_run(app, procedure: str, call_args: list):
     #   Arg1..Arg30: VT_VARIANT(12), PARAMFLAG_FIN|PARAMFLAG_FOPT(17)
     arg_types = tuple([(8, 1)] + [(12, 17)] * 30)
 
-    # Fill: procedure + user args + padding with Missing
+    # Fill: procedure + user args + padding with Missing.
+    # Defence-in-depth: ac_run_vba already validates n <= 30, but other
+    # callers (eval temp module fallback, future entry points) might not.
+    # Negative multipliers from `30 - n` would silently drop padding and
+    # surface as a confusing InvokeTypes error.
     n = len(call_args)
+    if n > 30:
+        raise ValueError(f"Application.Run supports max 30 arguments (got {n}).")
     all_args = [procedure] + list(call_args) + [pythoncom.Missing] * (30 - n)
 
     return app._oleobj_.InvokeTypes(
@@ -324,6 +330,7 @@ def _eval_via_temp_module(app, expression: str, original_exc: Exception):
     """Fallback: create temp standard module with wrapper function, run it, clean up."""
     proj = _get_vb_project(app)
     comp = None
+    temp_name = "<unnamed temp module>"  # pre-bind for the finally log
     try:
         # Create temp standard module (type 1 = vbext_ct_StdModule)
         comp = proj.VBComponents.Add(1)

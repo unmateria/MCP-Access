@@ -2,11 +2,41 @@
 Database, field, form properties and startup options.
 """
 
+from datetime import date, datetime
 from typing import Any, Optional
 
 from .core import _Session, log
 from .constants import STARTUP_PROPS
 from .helpers import coerce_prop, serialize_value
+
+
+# DAO property type constants.  bool must be tested BEFORE int because
+# isinstance(True, int) is True in Python.
+_DB_BOOLEAN = 1
+_DB_LONG = 4
+_DB_SINGLE = 6
+_DB_DOUBLE = 7
+_DB_DATE = 8
+_DB_TEXT = 10
+_DB_MEMO = 12
+
+
+def _infer_db_type(value: Any) -> int:
+    """Pick a DAO property type code matching the Python value.
+    Used when CreateProperty is asked to create a property that doesn't
+    yet exist on the DB / field — wrong type was the cause of float and
+    datetime properties being stored as text."""
+    if isinstance(value, bool):
+        return _DB_BOOLEAN
+    if isinstance(value, int):
+        return _DB_LONG
+    if isinstance(value, float):
+        return _DB_DOUBLE
+    if isinstance(value, (datetime, date)):
+        return _DB_DATE
+    if isinstance(value, str) and len(value) > 255:
+        return _DB_MEMO
+    return _DB_TEXT
 
 
 def ac_get_db_property(db_path: str, name: str) -> dict:
@@ -53,12 +83,7 @@ def ac_set_db_property(
 
     # Property doesn't exist -- create it
     if prop_type is None:
-        if isinstance(coerced, bool):
-            prop_type = 1   # dbBoolean
-        elif isinstance(coerced, int):
-            prop_type = 4   # dbLong
-        else:
-            prop_type = 10  # dbText
+        prop_type = _infer_db_type(coerced)
     try:
         prop = db.CreateProperty(name, prop_type, coerced)
         db.Properties.Append(prop)
@@ -66,7 +91,8 @@ def ac_set_db_property(
     except Exception as exc:
         raise RuntimeError(
             f"Could not create property '{name}'. "
-            f"prop_type: 1=Boolean, 4=Long, 10=Text. Error: {exc}"
+            f"prop_type: 1=Boolean, 4=Long, 6=Single, 7=Double, 8=Date, "
+            f"10=Text, 12=Memo. Error: {exc}"
         )
 
 
@@ -125,12 +151,7 @@ def ac_set_field_property(
         pass
 
     # Create property
-    if isinstance(coerced, bool):
-        prop_type = 1   # dbBoolean
-    elif isinstance(coerced, int):
-        prop_type = 4   # dbLong
-    else:
-        prop_type = 10  # dbText
+    prop_type = _infer_db_type(coerced)
     try:
         prop = fld.CreateProperty(property_name, prop_type, coerced)
         fld.Properties.Append(prop)

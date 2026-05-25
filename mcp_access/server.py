@@ -88,10 +88,10 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     from .dispatcher import call_tool_sync
 
     coerce_arguments(name, arguments)
-    # Safe logging
+    # Safe logging — guard against non-string `code` (clients sometimes send int/None)
     safe_args = {}
     for k, v in arguments.items():
-        if k == "code":
+        if k == "code" and isinstance(v, str):
             safe_args[k] = f"<VBA code: {len(v)} chars>"
         else:
             safe_args[k] = v

@@ -603,10 +603,12 @@ def call_tool_sync(name: str, arguments: dict) -> str:
         # Build detailed error message for the LLM
         tb_lines = traceback.format_exc().splitlines()
 
-        # Create safe representation of arguments (hide full code)
+        # Create safe representation of arguments (hide full code).  Guard
+        # against non-string `code` so we don't TypeError inside the except
+        # handler and lose the original exception.
         safe_args_display = {}
         for k, v in arguments.items():
-            if k == "code":
+            if k == "code" and isinstance(v, str):
                 safe_args_display[k] = f"<VBA code provided: length {len(v)} chars>"
             else:
                 safe_args_display[k] = v

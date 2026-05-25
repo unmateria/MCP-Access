@@ -120,6 +120,14 @@ def ac_compact_repair(db_path: str) -> dict:
                     f"failed ({rb_exc}). Original DB is at: {bak_path}, "
                     f"compacted DB is at: {tmp_path}"
                 ) from swap_exc
+            # Rollback succeeded — but the compacted tmp file may still be
+            # on disk (rename failed before consuming it).  Clean it up so
+            # we don't leave a stray *_compact_tmp.accdb file behind.
+            try:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            except OSError:
+                pass
             raise
 
         try:
@@ -179,6 +187,8 @@ def ac_decompile_compact(db_path: str) -> dict:
             except Exception:
                 pass
             _Session._app = None
+            _Session._pid = None
+            _Session._attached = False
     except Exception:
         pass  # si no habia sesion abierta, continuar igualmente
 

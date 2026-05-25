@@ -1,5 +1,5 @@
 """
-MCP Tool definitions (58 tools) and schema utilities.
+MCP Tool definitions (62 tools) and schema utilities.
 """
 
 import mcp.types as types
@@ -654,12 +654,12 @@ TOOLS = [
     # -- Compile VBA ---------------------------------------------------------
     types.Tool(
         name="access_compile_vba",
-        description="Compiles and saves all VBA modules. Returns status or compilation error. With timeout, automatically dismisses compilation error MsgBox.",
+        description="Compiles and saves all VBA modules. A dialog watchdog always runs and dismisses any error MsgBox; the watchdog is given `timeout` seconds (default 2) of grace after the compile call returns before being stopped.",
         inputSchema={
             "type": "object",
             "properties": {
                 "db_path": {"type": "string", "description": "Path to .accdb/.mdb file"},
-                "timeout": {"type": "integer", "description": "Timeout in seconds. If exceeded, automatically dismisses compilation error MsgBox"},
+                "timeout": {"type": "integer", "description": "Seconds to keep the dialog watchdog alive after triggering compile (default 2). Increase if compile errors surface late on slow machines.", "default": 2},
             },
             "required": ["db_path"],
         },
@@ -1229,8 +1229,10 @@ TOOLS = [
 # ---------------------------------------------------------------------------
 
 def _fixup_schema(schema: dict) -> None:
-    """Recursively change {"type":"integer"} -> {"type":["integer","string"]}
-    and {"type":"boolean"} -> {"type":["boolean","string"]} in a JSON Schema."""
+    """Recursively widen scalar/structured types in a JSON Schema to also
+    accept strings.  Some MCP clients serialize every argument as a string
+    (numbers, booleans, even arrays/objects as JSON-encoded strings), so the
+    schema must tolerate string input that coerce_arguments() then parses."""
     if not isinstance(schema, dict):
         return
     t = schema.get("type")
@@ -1238,6 +1240,12 @@ def _fixup_schema(schema: dict) -> None:
         schema["type"] = ["integer", "string"]
     elif t == "boolean":
         schema["type"] = ["boolean", "string"]
+    elif t == "number":
+        schema["type"] = ["number", "string"]
+    elif t == "array":
+        schema["type"] = ["array", "string"]
+    elif t == "object":
+        schema["type"] = ["object", "string"]
     for key in ("properties", "patternProperties"):
         block = schema.get(key)
         if isinstance(block, dict):
@@ -1256,7 +1264,10 @@ _TOOL_SCHEMA_INDEX: dict[str, dict] = {t.name: t.inputSchema for t in TOOLS}
 
 
 def coerce_arguments(name: str, arguments: dict) -> dict:
-    """Convert string arguments to the expected type based on the tool schema."""
+    """Convert string arguments to the expected type based on the tool schema.
+
+    Handles clients that serialize every argument as a string — including
+    arrays and objects, which arrive as JSON-encoded strings."""
     schema = _TOOL_SCHEMA_INDEX.get(name)
     if not schema:
         return arguments
@@ -1266,12 +1277,33 @@ def coerce_arguments(name: str, arguments: dict) -> dict:
             continue
         pdef = props.get(key, {})
         ptypes = pdef.get("type")
-        if isinstance(ptypes, list):
-            if "integer" in ptypes:
+        if not isinstance(ptypes, list):
+            continue
+        if "integer" in ptypes:
+            try:
+                arguments[key] = int(val)
+            except (ValueError, TypeError):
+                pass
+        elif "number" in ptypes:
+            try:
+                arguments[key] = float(val)
+            except (ValueError, TypeError):
+                pass
+        elif "boolean" in ptypes:
+            arguments[key] = val.strip().lower() in ("true", "1", "yes", "y", "on", "si", "sí")
+        elif "array" in ptypes or "object" in ptypes:
+            stripped = val.strip()
+            if not stripped:
+                continue
+            # Only attempt JSON parse if it looks like JSON — avoids turning
+            # accidental string "[INFO]" or "{name}" into a parse error.
+            first = stripped[0]
+            expect_array = "array" in ptypes
+            expect_object = "object" in ptypes
+            if (expect_array and first == "[") or (expect_object and first == "{"):
                 try:
-                    arguments[key] = int(val)
+                    import json
+                    arguments[key] = json.loads(stripped)
                 except (ValueError, TypeError):
                     pass
-            elif "boolean" in ptypes:
-                arguments[key] = val.lower() in ("true", "1", "yes")
     return arguments

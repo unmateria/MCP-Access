@@ -128,8 +128,13 @@ def ac_relink_table(
     if not ref_td.Connect:
         raise ValueError(f"'{table_name}' is not a linked table")
 
-    # Auto-detect if connect string has UID/PWD -> set dbAttachSavePWD
-    _needs_save_pwd = ("UID=" in new_connect.upper() or "PWD=" in new_connect.upper())
+    # Auto-detect if connect string has UID/PWD -> set dbAttachSavePWD.
+    # Match only at parameter boundary (`;UID=` or leading `UID=`) so that
+    # an unrelated param value containing the literal text "UID" — e.g.
+    # `APP=MyTool UID Manager;` — doesn't falsely trigger StoreLogin.
+    _needs_save_pwd = bool(
+        re.search(r'(?i)(?:^|;)\s*(?:UID|PWD)\s*=', new_connect)
+    )
 
     def _relink_one(td_name: str, old_conn: str):
         """Relink a single table. If dbAttachSavePWD needed, use TransferDatabase."""
@@ -218,12 +223,40 @@ def ac_create_relationship(
     """Creates a relationship between two tables via DAO."""
     app = _Session.connect(db_path)
     db = app.CurrentDb()
-    rel = db.CreateRelation(name, table, foreign_table, attributes)
+    # Pre-validate tables and fields so the user gets a clear error
+    # instead of a cryptic DAO exception ("Item not found in this collection")
+    try:
+        local_td = db.TableDefs(table)
+    except Exception as exc:
+        raise ValueError(f"Table '{table}' not found: {exc}")
+    try:
+        foreign_td = db.TableDefs(foreign_table)
+    except Exception as exc:
+        raise ValueError(f"Foreign table '{foreign_table}' not found: {exc}")
+    local_field_names = {local_td.Fields(i).Name.lower()
+                         for i in range(local_td.Fields.Count)}
+    foreign_field_names = {foreign_td.Fields(i).Name.lower()
+                           for i in range(foreign_td.Fields.Count)}
     for fmap in fields:
         local_name = fmap.get("local")
         foreign_name = fmap.get("foreign")
         if not local_name or not foreign_name:
             raise ValueError(f"Each field must have 'local' and 'foreign'. Received: {fmap}")
+        if local_name.lower() not in local_field_names:
+            raise ValueError(
+                f"Field '{local_name}' does not exist in '{table}'. "
+                f"Available: {sorted(local_field_names)}"
+            )
+        if foreign_name.lower() not in foreign_field_names:
+            raise ValueError(
+                f"Field '{foreign_name}' does not exist in '{foreign_table}'. "
+                f"Available: {sorted(foreign_field_names)}"
+            )
+
+    rel = db.CreateRelation(name, table, foreign_table, attributes)
+    for fmap in fields:
+        local_name = fmap["local"]
+        foreign_name = fmap["foreign"]
         fld = rel.CreateField(local_name)
         fld.ForeignName = foreign_name
         rel.Fields.Append(fld)
