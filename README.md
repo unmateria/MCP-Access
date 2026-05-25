@@ -19,12 +19,12 @@ The AI handles the COM automation, design view, VBA modules, binary sections, ca
 
 ### What it can do
 
-- **Forms & Reports** — create, export, import, screenshot, click, type. Full UI automation loop
+- **Forms & Reports** — create, clone, export, import, screenshot, click, type. Full UI automation loop
 - **VBA** — read, write, replace, compile, and *run* procedures. Line-level or full-proc editing
-- **Controls** — create, delete, modify, list. Finds controls nested inside TabControl pages
-- **Tables & SQL** — create via DAO, alter, query, batch execute. Linked ODBC tables supported
-- **Relationships, indexes, references, queries, macros** — full CRUD
-- **Maintenance** — compact & repair, decompile bloated databases, export structure docs
+- **Controls** — create, delete, modify, list, set tab order. Finds controls nested inside TabControl pages
+- **Tables & SQL** — create via DAO, alter, query, batch execute, full-text search across every Text/Memo field. Linked ODBC tables supported
+- **Relationships, indexes, references, queries, macros** — full CRUD. Clone any object (form / report / module / class / query / macro) preserving VBA and binary sections
+- **Maintenance** — compact & repair, decompile bloated databases, export structure docs. Office install autodetected (no more hardcoded Office 16 paths)
 
 Works with Claude Code, Cursor, Windsurf, Continue, or any MCP-compatible client.
 
