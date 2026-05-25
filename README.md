@@ -321,6 +321,47 @@ The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/s
 
 ## Changelog
 
+### v0.7.35 — 2026-05-25
+
+Preventive bug sweep across the codebase. No reported regressions; the issues below were caught by a full-package review while everything in production was working.
+
+**Critical**:
+- **`_Session.quit()` PID capture was a cross-thread COM call**: the new `taskkill` fallback added in the previous diff captured the Access PID by calling `app.hWndAccessApp()` inside `quit()`, but `quit()` runs from the `atexit` main thread while the COM proxy was created on the dedicated COM worker. Cross-thread STA calls return `RPC_E_WRONG_THREAD` silently, the result was `pid=None`, and the `taskkill` fallback was effectively a no-op exactly when it was needed (Access hung on Quit). PID is now captured at the end of `_launch()` — same thread that created the proxy — and stored as `cls._pid`.
+- **`coerce_arguments` did not handle arrays/objects sent as JSON strings**: some MCP clients serialize every argument as a string, including arrays and objects. The schema fixup widened scalar types but not `array` / `object`, so batch tools (`execute_batch`, `create_table`, `manage_index`, `set_multiple_controls`, `vbe_patch_proc`, `vbe_replace_lines`, `find_definition`, `run_vba`, etc.) failed for those clients. Now both schemas and the coercer accept JSON-encoded strings for arrays and objects, plus `number` widening and additional truthy literals (`on`, `y`, `si`, `sí`).
+- **`restore_binary_sections` injected binary blocks at the wrong `End` on forms with subforms**: the re-injector matched the first `End` after `Begin Form`, but a subform has its own nested `Begin Form ... End` — the injection landed inside the subform and corrupted the result on `ac_set_code`. Now tracks full block depth (same approach as the v0.7.34 control parser fix) and injects only at the outermost `End`.
+- **`write_tmp` silently lost characters outside cp1252**: ANSI-encoded module writes used `errors="replace"`, which substituted `?` for any character the codepage couldn't represent (emoji, asian characters, `✓` in a comment). Switched to `errors="strict"` and the resulting `UnicodeEncodeError` now carries a snippet of the offending substring with an actionable hint.
+- **`access_compile_vba` accepted `timeout` but never used it**: parameter was in the schema and signature, the body had a hardcoded `time.sleep(2)`. Now the parameter controls the watchdog grace window (default 2, clamped to 1-30).
+
+**Medium**:
+- VBE read tools (`get_lines`, `get_proc`, `module_info`, `find`, `search_all`) now close the form/report Design view before touching the CodeModule — same protection write tools already had. Skipping this could surface as `Catastrophic failure` (-2147418113) when the same object was open in design mode.
+- `ac_vbe_replace_lines` no longer calls `cm.DeleteLines(line, 0)` (which raises in VBE) when count clamps to zero at end of module. Error message now lists separate upper bounds for replace/delete vs pure insert (was: misleading single range).
+- `ac_vbe_patch_proc` normalizes `find_text` / `replace_text` line endings to CRLF before the exact-match check — callers commonly send LF and the exact match always fell through to the ws-normalized fallback. Also warns when `find_text` matches more than once (only the first occurrence is replaced via `.replace(..., 1)`).
+- `_proc_kind` raises a descriptive error when a procedure name resolves to multiple kinds (a class with both `Property Get Foo` and `Property Let Foo` — normal VBA). Previously the first kind found was silently picked and write operations acted on it regardless of which the caller meant.
+- `set_db_property` / `set_field_property` infer `dbDouble` (7), `dbDate` (8), `dbSingle` (6), `dbMemo` (12) when creating properties from `float` / `datetime` / `long-string` values. Previously these fell to `dbText` (10) and were stored as string.
+- `_eval_via_temp_module` pre-binds `temp_name` so the cleanup `finally` can log a sensible name if `proj.VBComponents.Add(1)` succeeded but the subsequent `comp.Name` access failed (was: `UnboundLocalError` in the cleanup masking the real failure).
+- Compile dialog watchdog captures up to 3 dialog screenshots/texts and picks the last one — the first dialog is often a benign "Save changes?" while the real compile error came last and used to be discarded.
+- `ac_create_relationship` validates that the named tables exist and that each `local` / `foreign` field exists on its respective table before `Append`. Replaces a cryptic DAO error ("Item not found in this collection") with a message that names the missing item.
+- `_check_module_health` / `ac_vbe_module_info` regexes recognize `Public Static Sub | Function | Property` (was: at most one modifier — VBA accepts both scope and `Static`).
+- `decompile_compact` resets `_Session._pid` and `_attached` after killing the spawned Access, keeping the new `quit()` fallback consistent.
+
+**Hardening**:
+- `read_tmp` tries `utf-8` before `cp1252` — cp1252 is single-byte and almost never raises, so genuine UTF-8 files were being mis-decoded as mojibake.
+- `_invoke_app_run` validates `len(args) <= 30` explicitly instead of producing a confusing `InvokeTypes` failure via a negative-multiplier padding (`[Missing] * -1` is just `[]`).
+- `_split_code_behind` matches `CodeBehindForm` / `CodeBehindReport` only at start of a line, so a property value that happens to contain the literal can't trick the splitter.
+- `SELECT … INTO` (make-table query) is flagged as destructive in `execute_sql` / `execute_batch`. Dead `_SQL_LINE_COMMENT` / `_SQL_BLOCK_COMMENT` regexes removed (the destructive guard already used `_sql_effective_prefix`).
+- `ac_create_database` requires the path to end in `.accdb` or `.mdb`.
+- `relink_table` UID/PWD detection uses a parameter-boundary regex (`(?:^|;)\s*(UID|PWD)\s*=`) instead of a substring check that would false-positive on values like `APP=My UID Manager`.
+- Linked-table count query in `ac_table_info` escapes `]` in table names by doubling.
+- `compact_repair` cleans up the orphaned `_compact_tmp.accdb` on the rolled-back swap path.
+- Safe-args logging in `server.py` / `dispatcher.py` guards against non-string `code` to avoid `TypeError` inside the error handler.
+- `tools.py` module docstring updated 58 → 62 tools.
+
+### v0.7.34 — 2026-05-05
+
+**`access_list_controls` silently lost controls inside `Page` / `OptionGroup`**: when any earlier control in the same Page had a multi-line property block (`GUID = Begin … End`, `NameMap = Begin … End`, `ConditionalFormat = Begin … End`, etc.) the depth counter inside the control's body matched plain `Begin <Type>` but not `Property = Begin`. The property's closing `End` was decremented without ever being incremented — the enclosing control closed prematurely, and every control that came after it inside the Page was never enumerated. The form-level loop in `_parse_controls` already handled this; the per-control loop now mirrors it (`r"^\w+\s*=\s*Begin\s*$"`).
+
+Visible symptom: `access_list_controls` reported a TabControl Page as a 15-line empty stub even though the Page actually contained dozens of controls. Fixed in `mcp_access/controls.py:_parse_controls`. Tool count unchanged (62).
+
 ### v0.7.33 — 2026-05-04
 
 **`access_create_form` silently dropped `record_source` and `default_view`**:
