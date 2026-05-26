@@ -1316,24 +1316,31 @@ TOOLS = [
 # Schema fixup: accept "integer" and "boolean" as strings too
 # ---------------------------------------------------------------------------
 
-def _fixup_schema(schema: dict) -> None:
+def _fixup_schema(schema: dict, is_root: bool = False) -> None:
     """Recursively widen scalar/structured types in a JSON Schema to also
     accept strings.  Some MCP clients serialize every argument as a string
     (numbers, booleans, even arrays/objects as JSON-encoded strings), so the
-    schema must tolerate string input that coerce_arguments() then parses."""
+    schema must tolerate string input that coerce_arguments() then parses.
+
+    The root inputSchema MUST keep ``type == "object"`` as a string — MCP
+    clients (Claude Code in particular) validate that exact literal and
+    reject ``["object", "string"]`` with 'invalid_value' on every tool.
+    Pass is_root=True for the inputSchema container; widening still applies
+    to nested property schemas."""
     if not isinstance(schema, dict):
         return
     t = schema.get("type")
-    if t == "integer":
-        schema["type"] = ["integer", "string"]
-    elif t == "boolean":
-        schema["type"] = ["boolean", "string"]
-    elif t == "number":
-        schema["type"] = ["number", "string"]
-    elif t == "array":
-        schema["type"] = ["array", "string"]
-    elif t == "object":
-        schema["type"] = ["object", "string"]
+    if not is_root:
+        if t == "integer":
+            schema["type"] = ["integer", "string"]
+        elif t == "boolean":
+            schema["type"] = ["boolean", "string"]
+        elif t == "number":
+            schema["type"] = ["number", "string"]
+        elif t == "array":
+            schema["type"] = ["array", "string"]
+        elif t == "object":
+            schema["type"] = ["object", "string"]
     for key in ("properties", "patternProperties"):
         block = schema.get(key)
         if isinstance(block, dict):
@@ -1345,7 +1352,7 @@ def _fixup_schema(schema: dict) -> None:
             _fixup_schema(sub)
 
 for _tool in TOOLS:
-    _fixup_schema(_tool.inputSchema)
+    _fixup_schema(_tool.inputSchema, is_root=True)
 
 # Build schema index for argument coercion at call time
 _TOOL_SCHEMA_INDEX: dict[str, dict] = {t.name: t.inputSchema for t in TOOLS}

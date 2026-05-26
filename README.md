@@ -321,6 +321,15 @@ The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/s
 
 ## Changelog
 
+### v0.7.37 — 2026-05-26
+
+**Critical hotfix for v0.7.35 / v0.7.36** — strict MCP clients (Claude Code in particular) refused every tool with `Invalid input: expected "object"` on `tools.0.inputSchema.type` … through `tools.64.inputSchema.type`, leaving the server visibly *connected* but with **0 tools available**. If you upgraded to v0.7.35 or v0.7.36 and your client started reporting "tools fetch failed" for all 65 tools, this release fixes it.
+
+**Fixed**:
+- **`_fixup_schema` widened the root `inputSchema.type` from `"object"` to `["object", "string"]`**. The widening introduced in v0.7.35 — letting clients pass arrays/objects as JSON-encoded strings — was applied recursively without distinguishing the schema *container* from its property schemas. The MCP spec mandates `inputSchema.type === "object"` (literal string), and clients that validate the protocol envelope (Claude Code, anything backed by Zod with strict literals) reject the array form on every single tool. Other clients that only check tool input at call time (e.g. some IDE integrations) silently accepted it, which is why the regression went unnoticed in v0.7.35/v0.7.36 CI. Fix: `_fixup_schema` now takes `is_root` and skips type-widening at the top level; nested property widening for `integer` / `boolean` / `number` / `array` / `object` is preserved, so the v0.7.35 fix for string-typed batch arguments still works.
+
+**Why this matters**: anyone on Claude Code (or any strict MCP client) who upgraded to v0.7.35 or v0.7.36 saw mcp-access turn into a black box — the server *connected* fine, but no tools were exposed and no error message in the client made the root cause obvious. The breakage was 100% on the server side and affected 100% of tools.
+
 ### v0.7.36 — 2026-05-25
 
 Five new capabilities — three new tools, one docs-only upgrade for macros, one transparent refactor for Office-version autodetect. **62 → 65 tools.** All changes additive; no existing schema or signature changed.
