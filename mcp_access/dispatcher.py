@@ -218,6 +218,7 @@ def call_tool_sync(name: str, arguments: dict) -> str:
                 arguments["control_type"],
                 dict(arguments.get("props", {})),
                 class_name=arguments.get("class_name"),
+                control_name=arguments.get("control_name"),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 

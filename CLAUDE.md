@@ -122,6 +122,72 @@ Macros have always been fully supported via the regular code tools — no dedica
 
 `access_manage_tab_order` uses **single-pass assignment** in target order — Access enforces TabIndex to be in `0..(N-1)` per section and auto-renumbers the rest to preserve uniqueness when you set one. Do NOT try to "park" controls at indices >= N (Access rejects with "The value you used for the TabIndex property isn't valid. The correct values are from 0 through N-1."). Skips non-tabbable types (100=Label, 101=Rectangle, 102=Line, 103=Image, 114=PageBreak, 118=Page). Optional `section` filter; defaults to all sections.
 
+## Build-a-form-from-scratch recipes (v0.7.38)
+
+### Add VBA to a form you just created with ac_create_form
+
+Before v0.7.38, calling `ac_set_code(form, "Option Compare Database\n...")`
+on a freshly-created form failed with `errors while importing` — `LoadFromText`
+was always invoked and `restore_binary_sections` had nothing to restore from.
+Now `ac_set_code` detects VBA-only input (`_looks_like_vba_only`: no
+`Version =` / `Begin Form`, but Option/Sub/Function/etc.) and routes through
+`_inject_vba_after_import` (Design view → `HasModule=True` → VBE write). No
+`LoadFromText` round-trip, layout preserved.
+
+```
+ac_create_form(db, "frmFoo")
+ac_create_control(db, "form", "frmFoo", "CommandButton",
+                  {"left": 100, "top": 100, "width": 1500, "height": 400},
+                  control_name="btCerrar")  # NEW: top-level control_name
+ac_set_code(db, "form", "frmFoo",
+            "Option Compare Database\nOption Explicit\n"
+            "Private Sub btCerrar_Click()\n"
+            "    DoCmd.Close acForm, Me.Name\n"
+            "End Sub\n")  # routes via VBE, not LoadFromText
+```
+
+If you need to write a full form export (e.g. cloning the binary sections of
+another form), include `Version =NN` / `Begin Form` and the original
+`LoadFromText` path runs. The two paths are mutually exclusive — the
+detection in `_looks_like_vba_only` is the discriminator.
+
+### Drop a control inside a TabControl Page
+
+`ac_create_control` accepts `parent` (or `Parent` — case-insensitive since
+v0.7.38) as a special key that maps to the 4th positional arg of
+`CreateControl(form, type, section, parent, column, l, t, w, h)`. Passing
+`Parent` with capital P used to fall through to `setattr(ctrl, "Parent", ...)`
+which Access rejects with `"Property 'CreateControl.Parent' can not be set"`
+— misleading because Parent IS available, just not via setattr.
+
+```
+ac_create_control(db, "form", "frmFoo", "CommandButton",
+                  {"Parent": "tabGestion",    # case-insensitive special key
+                   "Left": 100, "Top": 100, "Width": 2000, "Height": 500,
+                   "Caption": "Acción", "OnClick": "[Event Procedure]"},
+                  control_name="btMiAccion")
+```
+
+If `Parent` doesn't refer to an existing TabControl Page (or other container
+like OptionGroup), the control lands in Detail at the requested coordinates
+and `Parent` is silently ignored by CreateControl — same behaviour as VBA.
+
+### Read VBE from a brand-new form
+
+Before v0.7.38: `ac_vbe_module_info(form, "frmFoo")` on a form just made by
+`ac_create_form` raised `Subscript out of range`. The error message blamed
+the Trust Center, but the actual cause was `HasModule=False` — VBComponents
+had nothing to return because the code module had not been created yet.
+Now `_force_vbe_init` activates `HasModule` when opening the form in Design
+view during the retry, so this works out of the box.
+
+If you want to *be explicit*, the original workaround is still valid:
+
+```
+ac_set_form_property(db, "form", "frmFoo", {"HasModule": True})
+ac_vbe_module_info(db, "form", "frmFoo")  # then this works too
+```
+
 ## Common Gotchas
 
 - VBE line numbers are **1-based**

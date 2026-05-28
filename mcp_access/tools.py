@@ -348,9 +348,13 @@ TOOLS = [
         description=(
             "Creates a control on a form/report via COM. "
             "control_type: name or number (e.g.: 119=acCustomControl for ActiveX, 128=acWebBrowser native). "
-            "Special props: section (0=Detail,1=Header,2=Footer,3=PageHeader,4=PageFooter "
+            "Special props (case-insensitive): section (0=Detail,1=Header,2=Footer,3=PageHeader,4=PageFooter "
             "or name: 'detail','header','footer','reportheader','pageheader'...), "
-            "parent, column_name, left, top, width, height. "
+            "parent (name of TabControl Page or OptionGroup), column_name, left, top, width, height. "
+            "Pass parent='myTabPage' to drop the control inside a TabControl Page. "
+            "Use control_name to rename the control after creation (or 'Name' in props). "
+            "Other props that setattr() refuses are retried via the COM Properties collection "
+            "before being recorded in property_errors. "
             "For ActiveX (type 119), use class_name with the ProgID (e.g.: 'Shell.Explorer.2')."
         ),
         inputSchema={
@@ -360,9 +364,13 @@ TOOLS = [
                 "object_type": {"type": "string", "enum": ["form", "report"]},
                 "object_name": {"type": "string", "description": "Form/report name"},
                 "control_type": {"type": "string", "description": "'CommandButton', 'TextBox', 'Label', 'CustomControl'(119), 'WebBrowser'(128)... or number"},
+                "control_name": {
+                    "type": "string",
+                    "description": "Optional. Rename the auto-generated control (Command1/Text2/...) to this. Equivalent to passing 'Name' inside props (props takes precedence if both given).",
+                },
                 "props": {
                     "type": "object",
-                    "description": "Properties: section, parent, column_name, left, top, width, height, Name, Caption, etc.",
+                    "description": "Properties: section, parent, column_name, left, top, width, height (all case-insensitive), plus any COM property: Name, Caption, ControlSource, FontWeight, etc.",
                     "additionalProperties": True,
                 },
                 "class_name": {

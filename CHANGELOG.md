@@ -1,5 +1,67 @@
 # Changelog
 
+## 0.7.38 — 2026-05-28
+
+DX fixes for `access_set_code` on freshly-created forms, `access_create_control`
+with TabControl-Page parents, and the cryptic VBE error you got when the form
+had no code module yet. All real-world tripping points hit while building
+`frmSugerirPedido` for an ERP — see notes below for the actual reproductions.
+
+### Fixed
+
+- **`ac_set_code(form|report)`** failed on forms recently created via
+  `ac_create_form` because `LoadFromText` was always invoked even when the
+  caller passed pure VBA (`Option Compare Database` + `Private Sub …`). Pure
+  VBA isn't a valid form text export, and the binary-section restoration only
+  works against an already-exported baseline — so the import raised `errors
+  while importing` and rolled the form back. The same code now detects
+  VBA-only input and routes it through `_inject_vba_after_import` (open in
+  Design view → activate `HasModule` → write via VBE), preserving the form
+  layout and never touching `LoadFromText`. A full form export (containing
+  `Version =` / `Begin Form`) still takes the original `LoadFromText` path.
+  See `code.py:_looks_like_vba_only`.
+
+- **`ac_vbe_module_info` / any VBE read on a brand-new form** raised
+  `Subscript out of range` with a misleading error mentioning *"Trust access to
+  the VBA project object model"*. The actual cause: `HasModule=False` on a
+  form just made by `ac_create_form`, so `VBComponents("Form_xxx")` had nothing
+  to return. `_force_vbe_init` now flips `HasModule` on when the form/report is
+  opened in Design view before retrying. The fallback error message is also
+  rewritten so it no longer blames Trust Center first when the obvious cause
+  is a missing module. See `vbe.py:_force_vbe_init`.
+
+- **`ac_create_control` rejected `Parent`** (capital P) with `Property
+  'CreateControl.Parent' can not be set` because special keys were popped from
+  `props` case-sensitively. Hand a control to a TabControl Page using
+  `{"parent": "myTab", ...}` or `{"Parent": "myTab", ...}` — both work now.
+  Same case-insensitive treatment for `section`, `column_name`, `left`, `top`,
+  `width`, `height`. See `controls.py:_pop_ci`.
+
+- **`ac_create_control` lost properties Access exposes only via the
+  `Properties` collection.** `setattr(ctrl, "ScrollBars", 2)` raises for some
+  control types even when `ctrl.Properties("ScrollBars").Value = 2` succeeds.
+  The loop now retries via the Properties collection before recording an
+  entry in `property_errors`. Properties that don't exist at all on a given
+  control type (e.g. the `MultiLine` UserForm property on an Access TextBox)
+  still fail loudly — those are legitimate user errors.
+
+### Added
+
+- **`ac_create_control` accepts `control_name` at the top level** (in addition
+  to `{"Name": "..."}` inside `props`). Without this you had to discover that
+  the control was auto-named `Command1` / `Label2` and rename it via
+  `set_control_props` in a second round-trip. `props["Name"]` still wins if
+  both are provided, so existing callers don't change behaviour.
+
+### Notes
+
+- No schema changes to existing required fields — `control_name` is optional,
+  the `Parent` fix is silent, and `set_code` only takes the new path when the
+  caller passes VBA-only code to an existing form/report. Old fixtures that
+  pass complete form exports continue using `LoadFromText`.
+- The CLAUDE.md *Recipes* section gained two entries documenting the new flows
+  for callers who want to build forms from scratch in one MCP session.
+
 ## 0.7.36 — 2026-05-25
 
 Five new capabilities. Net tool count 62 → 65 (3 new tools; macros and the Office-version autodetect refactor are non-additive). All changes are additive — no existing schema or function signature was modified.

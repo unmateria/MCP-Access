@@ -28,6 +28,39 @@ _AC_SAVE_YES = 1   # acSaveYes
 _AC_REPORT   = 3   # acReport
 
 
+# ---------------------------------------------------------------------------
+# Heuristics: distinguish a full form/report text export from raw VBA code
+# ---------------------------------------------------------------------------
+
+# A form/report text export ALWAYS starts (after optional BOM/whitespace) with
+# `Version =NN` followed by `VersionRequired =NN` and `Begin Form`/`Begin Report`.
+# Raw VBA only has Option/Sub/Function/Public/Private/Dim/Const/etc.
+_FORM_EXPORT_RE = re.compile(
+    r"^\s*Version\s*=|^\s*Begin\s+(Form|Report)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+_VBA_HINT_RE = re.compile(
+    r"^\s*(Option\s+(Compare|Explicit|Base|Private)\b|"
+    r"(Public|Private|Friend)?\s*(Sub|Function|Property|Const|Dim|Type|Enum)\b)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _looks_like_vba_only(code: str) -> bool:
+    """True when `code` is plain VBA (no form/report definition).
+
+    Used by ac_set_code to take the VBE-injection shortcut for existing
+    forms/reports instead of round-tripping through LoadFromText. The
+    second test (_VBA_HINT_RE) avoids treating an empty file or a stray
+    comment as "VBA-only", which would silently no-op.
+    """
+    if not code or not code.strip():
+        return False
+    if _FORM_EXPORT_RE.search(code):
+        return False
+    return bool(_VBA_HINT_RE.search(code))
+
+
 def _open_in_design(app: Any, object_type: str, object_name: str) -> None:
     """Opens a form/report in Design view."""
     try:
@@ -323,6 +356,13 @@ def ac_set_code(db_path: str, object_type: str, name: str, code: str) -> str:
     split: first the form/report is imported without VBA, then the VBA code is injected
     via VBE (avoiding encoding issues with LoadFromText).
 
+    **VBA-only shortcut for existing forms/reports** (v0.7.38):
+    If the caller passes only VBA code (starts with Option/Sub/Function/etc.,
+    no `Version =`, `Begin Form`, etc.) for an existing form/report, the layout
+    is preserved and the VBA is injected via VBE — no LoadFromText round-trip
+    that would otherwise fail with "errors while importing" on forms that have
+    not yet been exported to text (e.g. just created with ac_create_form).
+
     object_type='class_module' creates a VBA class module: the canonical
     `VERSION 1.0 CLASS` header is prepended automatically if missing.
     """
@@ -338,6 +378,18 @@ def ac_set_code(db_path: str, object_type: str, name: str, code: str) -> str:
     # Split CodeBehindForm/CodeBehindReport if present
     vba_code = ""
     if object_type in ("form", "report"):
+        # Shortcut: if the caller passes VBA-only code for an existing
+        # form/report, inject it via VBE instead of re-importing the whole
+        # form definition (which fails for freshly-created forms with no
+        # prior SaveAsText baseline).
+        if _looks_like_vba_only(code) and _object_exists(app, object_type, name):
+            _inject_vba_after_import(app, object_type, name, code)
+            invalidate_object_caches(object_type, name)
+            return (
+                f"OK: VBA injected into existing {object_type} '{name}' "
+                f"via VBE (layout preserved, no LoadFromText round-trip)"
+            )
+
         code, vba_code = _split_code_behind(code)
         # Remove HasModule from form text — it will be activated when injecting VBA
         if vba_code:

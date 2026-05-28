@@ -145,25 +145,60 @@ def _get_code_module(app: Any, object_type: str, object_name: str) -> Any:
         except Exception:
             pass  # fall through to original error
         _Session._cm_cache.pop(cache_key, None)
+        hint = (
+            "Is 'Trust access to the VBA project object model' enabled "
+            "in Access Trust Center settings?"
+        )
+        if object_type in ("form", "report"):
+            hint = (
+                f"For forms/reports: the component is only created when "
+                f"HasModule=True. _force_vbe_init already tried to activate "
+                f"it but failed. Either: (1) call access_set_form_property "
+                f"with {{'HasModule': true}} explicitly, or (2) check that "
+                f"'Trust access to the VBA project object model' is enabled "
+                f"in Access Trust Center settings."
+            )
         raise RuntimeError(
-            f"Could not access CodeModule '{component_name}'. "
-            f"Is 'Trust access to the VBA project object model' enabled "
-            f"in Access Trust Center settings?\nError: {exc}"
+            f"Could not access CodeModule '{component_name}'. {hint}\n"
+            f"Error: {exc}"
         )
 
 
 def _force_vbe_init(app, object_type: str, object_name: str):
-    """Force VBE to recognise a component after decompile+compact.
+    """Force VBE to recognise a component after decompile+compact OR after
+    a brand-new form/report was created without a VBA code module.
 
-    For forms/reports: briefly open in Design view and close — this makes
-    Access load the VBA code-behind so VBComponents can find it.
+    For forms/reports: open in Design view, *flip HasModule to True if it
+    is False* (a freshly-created form has no module — VBComponents won't
+    find it until HasModule=True), then close. This makes Access load the
+    VBA code-behind so VBComponents can find it.
+
     For modules: toggle VBE.MainWindow.Visible to trigger enumeration.
     """
     if object_type in ("form", "report"):
         ac_obj = AC_FORM if object_type == "form" else AC_REPORT
         try:
-            app.DoCmd.OpenForm(object_name, AC_DESIGN) if object_type == "form" \
-                else app.DoCmd.OpenReport(object_name, AC_DESIGN)
+            if object_type == "form":
+                app.DoCmd.OpenForm(object_name, AC_DESIGN)
+                obj = app.Forms(object_name)
+            else:
+                app.DoCmd.OpenReport(object_name, AC_DESIGN)
+                obj = app.Reports(object_name)
+            # Activate code module if absent — this is the common case for
+            # forms created via ac_create_form which start with HasModule=False.
+            try:
+                if not bool(obj.HasModule):
+                    obj.HasModule = True
+                    log.info(
+                        "_force_vbe_init: activated HasModule on '%s' "
+                        "(form had no code module yet)",
+                        object_name,
+                    )
+            except Exception as e:
+                log.warning(
+                    "_force_vbe_init: HasModule check/set failed for '%s': %s",
+                    object_name, e,
+                )
             app.DoCmd.Close(ac_obj, object_name, AC_SAVE_YES)
             log.info("_force_vbe_init: opened/closed '%s' in Design view", object_name)
         except Exception as e:

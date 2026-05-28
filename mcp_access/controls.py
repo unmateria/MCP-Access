@@ -330,14 +330,29 @@ def _get_design_obj(app: Any, object_type: str, object_name: str) -> Any:
 def ac_create_control(
     db_path: str, object_type: str, object_name: str,
     control_type: Any, props: dict, class_name: Optional[str] = None,
+    control_name: Optional[str] = None,
 ) -> dict:
     """
     Creates a new control in a form/report by opening it in Design view.
     control_type: name ('CommandButton') or number (104).
+
     props: dict of properties. Special keys passed to CreateControl:
       section (default 0=Detail), parent (''), column_name (''),
       left, top, width, height (twips; -1 = automatic).
-    The rest are assigned as COM properties on the created control.
+    All special keys are matched case-insensitively, so ``Parent``, ``parent``,
+    ``Left`` and ``left`` are all extracted as positional CreateControl args
+    instead of being attempted as COM properties (where ``Parent`` would fail
+    with "Property 'CreateControl.Parent' can not be set").
+    The rest are assigned as COM properties on the created control. Properties
+    that raise via setattr() fall back to ``ctrl.Properties(key).Value = val``
+    before being recorded in ``property_errors`` — this rescues a few props
+    Access exposes only via the Properties collection.
+
+    ``control_name`` is an optional top-level convenience: if provided, it is
+    applied as the control Name *after* CreateControl, replacing the auto-
+    generated ``Command1`` / ``Label2`` / ``TextBox3`` etc. Without this, you
+    had to pass ``"Name": "myBtn"`` inside ``props`` (still supported and
+    takes precedence if both are present).
 
     For ActiveX controls (type 119 = acCustomControl), pass class_name with the ProgID
     of the control (e.g.: 'Shell.Explorer.2', 'MSCAL.Calendar.7') to initialize the OLE.
@@ -351,15 +366,23 @@ def ac_create_control(
     app = _Session.connect(db_path)
     ctype = _resolve_ctrl_type(control_type)
 
-    # Extract positional/structural params from props (not assigned as prop)
+    # Extract positional/structural params from props (case-insensitive).
+    # Without this, e.g. {"Parent": "tabGestion"} would be passed to
+    # setattr(ctrl, "Parent", ...) which Access rejects with
+    # "Property 'CreateControl.Parent' can not be set" — even though Parent
+    # is the 4th positional arg of CreateControl().
     props = dict(props)  # copia para no mutar el original
-    section     = _resolve_section(props.pop("section", 0))
-    parent      = str(props.pop("parent",      ""))
-    column_name = str(props.pop("column_name", ""))
-    left        = int(coerce_prop(props.pop("left",   -1)))
-    top         = int(coerce_prop(props.pop("top",    -1)))
-    width       = int(coerce_prop(props.pop("width",  -1)))
-    height      = int(coerce_prop(props.pop("height", -1)))
+    section     = _resolve_section(_pop_ci(props, "section",     0))
+    parent      = str(_pop_ci(props, "parent",      ""))
+    column_name = str(_pop_ci(props, "column_name", ""))
+    left        = int(coerce_prop(_pop_ci(props, "left",   -1)))
+    top         = int(coerce_prop(_pop_ci(props, "top",    -1)))
+    width       = int(coerce_prop(_pop_ci(props, "width",  -1)))
+    height      = int(coerce_prop(_pop_ci(props, "height", -1)))
+
+    # Top-level control_name → props['Name'] (only if not already explicit).
+    if control_name and not any(k.lower() == "name" for k in props):
+        props["Name"] = control_name
 
     _open_in_design(app, object_type, object_name)
     try:
@@ -391,12 +414,32 @@ def ac_create_control(
             except Exception as exc:
                 log.warning("Could not set Class='%s': %s", class_name, exc)
 
+        # Apply Name first so subsequent prop failures reference the new name.
+        name_val = None
+        for k in list(props):
+            if k.lower() == "name":
+                name_val = props.pop(k)
+                break
+        if name_val is not None:
+            try:
+                ctrl.Name = str(name_val)
+            except Exception as exc:
+                log.warning("Could not rename new control to '%s': %s", name_val, exc)
+
         errors: dict[str, str] = {}
         for key, val in props.items():
+            cv = coerce_prop(val)
             try:
-                setattr(ctrl, key, coerce_prop(val))
-            except Exception as exc:
-                errors[key] = str(exc)
+                setattr(ctrl, key, cv)
+                continue
+            except Exception as exc_attr:
+                # Fallback via Properties collection — rescues some props
+                # Access exposes only there (e.g. ScrollBars on some controls).
+                try:
+                    ctrl.Properties(key).Value = cv
+                    continue
+                except Exception:
+                    errors[key] = str(exc_attr)
 
         result: dict = {
             "name":         ctrl.Name,
@@ -411,6 +454,19 @@ def ac_create_control(
         invalidate_object_caches(object_type, object_name)
 
     return result
+
+
+def _pop_ci(d: dict, key: str, default: Any) -> Any:
+    """Pop `key` from dict d, matching keys case-insensitively.
+
+    Returns `default` if no key matches. Removes ONLY the first match so a
+    caller passing both ``parent`` and ``Parent`` (silly but possible) still
+    sees an error from the loop below — we don't silently swallow dupes.
+    """
+    for k in list(d):
+        if k.lower() == key.lower():
+            return d.pop(k)
+    return default
 
 
 # ---------------------------------------------------------------------------
