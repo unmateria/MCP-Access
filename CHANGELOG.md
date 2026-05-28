@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.7.39 — 2026-05-28
+
+Hardening of the v0.7.38 `_looks_like_vba_only` detector. No behaviour change
+for the well-formed cases that v0.7.38 already handled.
+
+### Fixed
+
+- **VBA comments containing "Begin Form" or "Version =" no longer
+  misclassify pure VBA as a form export.** The previous detector ran
+  `_FORM_EXPORT_RE.search(code)` over the whole text, so a comment like
+  `' Begin Form: this sub opens it` made `_looks_like_vba_only` return
+  False — sending the file through `LoadFromText` instead of VBE
+  injection, which would then fail with "errors while importing". The
+  new detector only inspects the first non-blank line for `Version =NN`
+  and the first 20 lines for `Option Compare` / Sub/Function/etc.,
+  matching how Access actually emits form text exports (the `Version`
+  declaration is the very first line of any SaveAsText output).
+- `_VBA_HINT_RE` now also matches `Public Static Sub` / `Public Static
+  Function` (a real-world VBA pattern used by counters and singletons).
+
 ## 0.7.38 — 2026-05-28
 
 DX fixes for `access_set_code` on freshly-created forms, `access_create_control`
