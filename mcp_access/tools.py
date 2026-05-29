@@ -1141,7 +1141,9 @@ TOOLS = [
     types.Tool(
         name="access_lint_form",
         description=(
-            "Deterministic UI design lint of a form/report. Returns structured "
+            "NOT a designer and NOT aesthetics — expect zero 'good design' from this. "
+            "It is a deterministic checker of the OBVIOUS, mechanically-verifiable "
+            "stuff only (a seatbelt, not a stylist). Returns structured "
             "JSON violations the agent should fix BEFORE declaring a layout done: "
             "contrast (WCAG white-on-white etc.), overlap, out-of-bounds, text "
             "truncation, sibling inconsistency, misalignment, zero-size/invisible. "

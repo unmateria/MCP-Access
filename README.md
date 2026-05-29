@@ -25,6 +25,7 @@ The AI handles the COM automation, design view, VBA modules, binary sections, ca
 - **Tables & SQL** — create via DAO, alter, query, batch execute, full-text search across every Text/Memo field. Linked ODBC tables supported
 - **Relationships, indexes, references, queries, macros** — full CRUD. Clone any object (form / report / module / class / query / macro) preserving VBA and binary sections
 - **Maintenance** — compact & repair, decompile bloated databases, export structure docs. Office install autodetected (no more hardcoded Office 16 paths)
+- **UI lint** — `access_lint_form` flags *objectively* broken layouts (white-on-white text, overlaps, truncation, off-canvas controls). A checker, **not** a designer — see the note below
 
 Works with Claude Code, Cursor, Windsurf, Continue, or any MCP-compatible client.
 
@@ -84,7 +85,7 @@ Add to your MCP config file (`.mcp.json`, `mcp.json`, or client-specific setting
 
 Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 
-## Tools (61)
+## Tools (66)
 
 ### Database
 
@@ -139,6 +140,15 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 | `access_delete_control` | Delete a control via COM |
 | `access_set_control_props` | Modify control properties via COM in design view |
 | `access_set_multiple_controls` | Modify properties of multiple controls in a single design-view session |
+| `access_lint_form` | Deterministic check for objectively-broken layout: contrast (WCAG), overlap, out-of-bounds, truncation, sibling inconsistency, zero-size/invisible. Returns `verdict` PASS/REVIEW/FAIL. Also runs automatically on every control edit |
+
+> ### ⚠️ A note on `access_lint_form` — manage your expectations
+>
+> **This is NOT a designer and there is zero super-design here.** Don't expect it to make a form *look good*, suggest a nice palette, or have any taste — it has none and never will.
+>
+> It is a **dumb, deterministic verifier of the obvious, easy-to-check stuff**: is the text the same colour as its background? do two controls physically overlap? does a caption not fit its box? is something off the edge of the form, or zero pixels tall? That's it. Plain math — WCAG contrast ratios and rectangle intersection — with a pile of false-positive guards so it doesn't cry wolf.
+>
+> Think **seatbelt, not stylist**: it won't make the car pretty, it just stops you shipping a form with white text on a white background without noticing. It runs automatically on every control edit so those obvious mistakes surface on their own. If you were hoping for a UI-design AI, this isn't it (honest PRs to make it smarter are very welcome 😄).
 
 ### Text export/import
 
