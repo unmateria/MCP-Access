@@ -76,20 +76,16 @@ _BUTTON_PRIORITY = (
 )
 
 
-def _dismiss_dialogs_by_pid(pid: int, screenshot_holder: Optional[list] = None) -> bool:
-    """Dismiss modal dialogs owned by a process ID.
-
-    Matches any window where class == '#32770' OR the title contains
-    'wizard' / 'asistente' (catches non-standard wizard windows that do
-    not use the #32770 class).  Used during /decompile subprocess where
-    we have a PID but no COM Application object.
-    Returns True if any dialog was found and dismissed.
-    """
+def _find_dialog_hwnds_by_pid(pid: int) -> list:
+    """Return handles of visible modal dialogs (class '#32770') and wizard
+    windows owned by *pid*.  No dismissal — shared by `_dismiss_dialogs_by_pid`
+    and the global background watchdog (which tracks dialog persistence)."""
     import win32gui
     import win32process
 
-    found = []
-    def _cb(hwnd, found):
+    found: list = []
+
+    def _cb(hwnd, _ignored):
         try:
             if not win32gui.IsWindowVisible(hwnd):
                 return True
@@ -105,10 +101,24 @@ def _dismiss_dialogs_by_pid(pid: int, screenshot_holder: Optional[list] = None) 
         return True
 
     try:
-        win32gui.EnumWindows(_cb, found)
+        win32gui.EnumWindows(_cb, None)
     except Exception:
-        return False
+        return []
+    return found
 
+
+def _dismiss_dialogs_by_pid(pid: int, screenshot_holder: Optional[list] = None) -> bool:
+    """Dismiss modal dialogs owned by a process ID.
+
+    Matches any window where class == '#32770' OR the title contains
+    'wizard' / 'asistente' (catches non-standard wizard windows that do
+    not use the #32770 class).  Used during /decompile subprocess where
+    we have a PID but no COM Application object.
+    Returns True if any dialog was found and dismissed.
+    """
+    import win32gui
+
+    found = _find_dialog_hwnds_by_pid(pid)
     if not found:
         return False
 

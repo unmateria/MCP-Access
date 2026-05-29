@@ -140,6 +140,8 @@ class _Session:
     _app: Optional[Any] = None
     _db_open: Optional[str] = None
     _pid: Optional[int] = None  # captured in _launch() on the COM worker thread (atexit can't query COM)
+    _wd_thread: Optional[Any] = None  # global dialog watchdog thread
+    _wd_stop: Optional[Any] = None    # threading.Event to stop the watchdog
     _cm_cache: dict = {}   # "type:name" -> CodeModule COM object
     _decompiled_dbs: set = set()  # DBs already decompiled in this session
     _attached: bool = False  # True if we attached via GetActiveObject; False if we spawned via DispatchEx
@@ -168,6 +170,7 @@ class _Session:
     @classmethod
     def _force_cleanup(cls):
         """Reset state without calling methods on a dead COM object."""
+        cls._stop_dialog_watchdog()
         _release_shift()
         cls._app = None
         cls._db_open = None
@@ -176,6 +179,81 @@ class _Session:
         cls._cm_cache.clear()
         cls._decompiled_dbs.clear()
         _parsed_controls_cache.clear()
+
+    # -----------------------------------------------------------------------
+    # Global dialog watchdog
+    # -----------------------------------------------------------------------
+    @classmethod
+    def _start_dialog_watchdog(cls) -> None:
+        """Start a background thread that dismisses Access-owned modal dialogs
+        which persist past a grace period.
+
+        This backstops operations that have NO watchdog of their own — most
+        importantly VBE code-module access (get_proc / find_definition /
+        module_info ...).  Without it, a blocking modal raised during the
+        startup form of a DB such as
+            'Error accessing file. Network connection may have been lost.'
+        hangs the COM call indefinitely (observed: a 1-hour hang on
+        mydatabase.accdb).  Operation-specific watchdogs (open / compile /
+        run_vba) react faster and screenshot first; the grace period keeps
+        this thread from stealing their dialog.
+
+        Only runs when WE spawned Access (never auto-dismisses an attached
+        interactive user's dialogs)."""
+        if cls._attached:
+            cls._stop_dialog_watchdog()
+            return
+        pid = cls._pid
+        if not pid:
+            return
+        # Always (re)start fresh so the watchdog tracks the CURRENT pid.
+        cls._stop_dialog_watchdog()
+        stop = threading.Event()
+        cls._wd_stop = stop
+
+        def _loop():
+            from .vba_exec import _find_dialog_hwnds_by_pid, _dismiss_dialogs_by_pid
+            GRACE = 3.0   # s a dialog must persist before we force-dismiss
+            POLL = 0.5
+            seen: dict = {}   # hwnd -> monotonic first-seen
+            while not stop.wait(POLL):
+                try:
+                    hwnds = _find_dialog_hwnds_by_pid(pid)
+                except Exception:
+                    continue
+                now = time.monotonic()
+                for h in list(seen):
+                    if h not in hwnds:
+                        del seen[h]
+                for h in hwnds:
+                    seen.setdefault(h, now)
+                stale = [h for h in hwnds if now - seen.get(h, now) >= GRACE]
+                if stale:
+                    log.warning(
+                        "Global dialog watchdog: %d dialog(s) persisted >%.0fs "
+                        "(pid=%s) -- dismissing", len(stale), GRACE, pid,
+                    )
+                    try:
+                        _dismiss_dialogs_by_pid(pid)
+                    except Exception as e:
+                        log.warning("Global watchdog dismiss error: %s", e)
+                    seen.clear()  # re-grace any survivors before re-hitting
+
+        t = threading.Thread(target=_loop, name="mcp-access-global-dialog-wd",
+                             daemon=True)
+        cls._wd_thread = t
+        t.start()
+        log.info("Global dialog watchdog started (pid=%s, grace=%.1fs)", pid, 3.0)
+
+    @classmethod
+    def _stop_dialog_watchdog(cls) -> None:
+        try:
+            if cls._wd_stop is not None:
+                cls._wd_stop.set()
+        except Exception:
+            pass
+        cls._wd_thread = None
+        cls._wd_stop = None
 
     @classmethod
     def _launch(cls) -> None:
@@ -229,6 +307,11 @@ class _Session:
         # match the real install. Never raises; logs a warning and keeps
         # defaults if nothing matched.
         cls._detect_office_install()
+        # Global background dialog watchdog — backstops operations without
+        # their own watchdog (VBE access) so a blocking modal like
+        # "Error accessing file. Network connection may have been lost."
+        # can't hang a COM call forever.
+        cls._start_dialog_watchdog()
 
     @classmethod
     def reopen(cls, path: str) -> None:
@@ -650,6 +733,7 @@ class _Session:
 
     @classmethod
     def quit(cls) -> None:
+        cls._stop_dialog_watchdog()
         if cls._app is not None:
             if cls._attached:
                 log.info("Releasing attached Access.Application (not quitting user's session)")
