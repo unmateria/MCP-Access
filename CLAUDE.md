@@ -11,7 +11,7 @@ MCP server for reading and editing Microsoft Access databases (`.accdb`/`.mdb`) 
 - **Caches**: `_parsed_controls_cache` (control parsing) and `_Session._cm_cache` (CodeModule COM objects — live COM proxies). Both invalidated on DB switch, object modification, and design operations. There is **no** Python-side cache of VBE text: `_cm_all_code()` always reads via `cm.Lines(1, total)` so external edits (manual VBE edits, Ctrl+Z, add-ins) are picked up immediately. See issue #26 for the reason this cache was removed.
 - **Binary section handling**: `ac_get_code` strips PrtMip/PrtDevMode from form/report exports; `ac_set_code` restores them automatically before import.
 
-## Tools (65 total)
+## Tools (66 total)
 
 | Category | Tools |
 |----------|-------|
@@ -20,6 +20,7 @@ MCP server for reading and editing Microsoft Access databases (`.accdb`/`.mdb`) 
 | **SQL/Tables** | `access_execute_sql`, `access_execute_batch`, `access_table_info`, `access_search_queries`, `access_search_data`, `access_create_table`, `access_alter_table` |
 | **VBE line-level** | `access_vbe_get_lines`, `access_vbe_get_proc`, `access_vbe_module_info`, `access_vbe_replace_lines`, `access_vbe_find`, `access_vbe_search_all`, `access_vbe_replace_proc`, `access_vbe_patch_proc`, `access_vbe_append` |
 | **Controls** | `access_list_controls`, `access_get_control`, `access_create_control`, `access_delete_control`, `access_set_control_props`, `access_set_multiple_controls`, `access_manage_tab_order` |
+| **UI lint** | `access_lint_form` |
 | **DB Properties** | `access_get_db_property`, `access_set_db_property`, `access_get_form_property`, `access_set_form_property` |
 | **Text Export/Import** | `access_export_text`, `access_import_text` |
 | **Linked Tables** | `access_list_linked_tables`, `access_relink_table` |
@@ -121,6 +122,86 @@ Macros have always been fully supported via the regular code tools — no dedica
 ## Tab order (v0.7.36)
 
 `access_manage_tab_order` uses **single-pass assignment** in target order — Access enforces TabIndex to be in `0..(N-1)` per section and auto-renumbers the rest to preserve uniqueness when you set one. Do NOT try to "park" controls at indices >= N (Access rejects with "The value you used for the TabIndex property isn't valid. The correct values are from 0 through N-1."). Skips non-tabbable types (100=Label, 101=Rectangle, 102=Line, 103=Image, 114=PageBreak, 118=Page). Optional `section` filter; defaults to all sections.
+
+## UI design lint (v0.7.41)
+
+`mcp_access/lint.py` is a **deterministic, pure-Python** design validator (no
+LLM, no external service). `access_lint_form` returns structured JSON
+violations; the same engine runs **automatically** on every design mutation.
+
+### Why it exists
+The LLM sets control coordinates/colours blind and used to accept objectively
+broken layouts (white-on-white, overlap, truncation, inconsistent siblings,
+out-of-bounds). The fix the user asked for: validation that lives *inside* the
+MCP and **cannot be skipped or "talked past"** by the model. So the rules are
+numeric and the result is attached to mutations whether the model asks or not.
+
+### Architecture
+- One SaveAsText export (via `ac_get_code`, binary sections already stripped),
+  never opens Design view. `_build_model` layers a style dict (`_extract_style`,
+  reading the control's `raw_block`) and section assignment onto the cached
+  `_parse_controls` result, plus `_parse_geometry` (form Width/BackColor +
+  per-section Height/BackColor/line-range).
+- Rules: `contrast` (WCAG 2.1, `_decode_bgr`+`_contrast_ratio`), `overlap`
+  (AABB, same section+parent only), `out_of_bounds`, `truncation`,
+  `sibling_inconsistency`, `misalignment`, `invisible_or_zero_size`.
+- `lint_compact()` (errors+warnings, heuristic measure, capped) is attached by
+  `_attach_lint` to the result of `ac_set_control_props`,
+  `ac_set_multiple_controls`, `ac_create_control`. Wrapped in try/except so a
+  lint failure NEVER breaks the mutation. `skip_lint=true` opts out for bulk ops.
+
+### Hard-won gotchas baked into the rules (do NOT "simplify" these away)
+- **Absent dimension ≠ 0.** Access omits `Left/Top/Width/Height` (and `BackColor`)
+  when they equal the form default. `_twips_opt` returns None for absent; rules
+  use `_has_full_geom` and skip None. Treating absent as 0 caused false
+  "zero-size" / bounds violations on inherited-default controls.
+- **Opaque text control with no `BackColor` renders on white.** Access omits the
+  default white BackColor — this is exactly how white-on-white slips through, so
+  `_effective_background` defaults Label/TextBox/ComboBox/ListBox to white.
+- **`ControlType =` is often absent** in modern exports; type comes from the
+  `Begin <Type>` keyword. Rules key off `type_name`, not the int.
+- **Attached labels are nested inside their control's block** → `_parse_controls`
+  never enumerates them, so no overlap false positives there for free.
+- **Access auto-grows form Width (and section Height) to fit controls**, so
+  horizontal `out_of_bounds` rarely fires for forms (still useful for reports +
+  negative coords). Not a bug — documented limitation.
+- **`ConditionalFormat = Begin … End`** holds its own colours; `_extract_style`
+  tracks block depth so only the control's own (depth-1) props are read.
+- **System/theme colours** have the high bit `0x80000000` (e.g. `-2147483633`) —
+  `_decode_bgr` flags them; contrast emits an `info` note instead of a number.
+- **Conditional formatting** (`format_conditions`) overrides ForeColor/BackColor
+  at runtime and is BINARY in the export — `_rule_contrast` skips those controls
+  and notes them (can't verify the runtime colour statically).
+- **Captions wrap.** Both Labels AND CommandButtons wrap their caption across
+  lines; SaveAsText encodes the breaks as literal `\015\012`. `_caption_lines`
+  splits them; truncation counts how many display lines the text needs
+  (`ceil(line_width/avail)`) vs how many fit the height (`round(height/lineH)`,
+  `lineH ≈ fontPt*20*1.2`). A 540-twip button shows 2 lines of 11pt — use
+  `round`, not `floor`, or you under-count and false-flag.
+- **Heuristic width is approximate.** Narrow UI fonts (Calibri/Tahoma) average
+  ~0.46× the point size per glyph; the heuristic only flags a line as
+  overflowing past **1.25×** the available width (absorbs metric error). WizHook
+  uses 1.02×. Without these, bold header labels that fit get false-flagged.
+- **Transparent buttons are a click layer, not an overlap.** A `Transparent=True`
+  CommandButton stacked on a styled Label/Rectangle is the standard Access
+  custom-button pattern (the label shows the colour, the invisible button takes
+  the click) — `_rule_overlap` skips any pair where one side is a transparent
+  button. (Classic command buttons ignore `BackColor` even with `UseTheme=No`
+  on Win11/Office16, so this label+transparent-button trick is how you get
+  coloured tiles.)
+- **`sibling_inconsistency` clusters, not modes.** A form legitimately uses two
+  sizes (tall main buttons + a row of short inline buttons). `_accepted_clusters`
+  treats any value ≥2 controls share as a norm; only a lone outlier (and not a
+  >2× different class like a memo box) is flagged. Needs ≥4 controls in the group.
+
+### WizHook text measurement
+`measure="auto"|"wizhook"|"heuristic"`. WizHook (`_measure_text_batch`) measures
+exact rendered width in ONE COM round-trip via a temp std module +
+`_invoke_app_run`. It REQUIRES a compiled VBA project (`Application.IsCompiled`);
+during active development the ERP project is usually uncompiled, so it fails and
+falls back to the conservative heuristic (a `note` is added when `measure` was
+explicitly `wizhook`). The embedded lint always uses `heuristic` (fast, no Run
+dependency). Default everywhere leans on the heuristic for reliability.
 
 ## Build-a-form-from-scratch recipes (v0.7.38)
 

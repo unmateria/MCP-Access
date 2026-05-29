@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mcp-msaccess-database"
-version = "0.7.39"
-description = "MCP server for reading and editing Microsoft Access databases (.accdb/.mdb) via COM automation. Forms, VBA, tables, controls, queries, relationships — 65 tools."
+version = "0.7.41"
+description = "MCP server for reading and editing Microsoft Access databases (.accdb/.mdb) via COM automation. Forms, VBA, tables, controls, queries, relationships — 66 tools."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

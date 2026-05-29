@@ -330,7 +330,7 @@ def _get_design_obj(app: Any, object_type: str, object_name: str) -> Any:
 def ac_create_control(
     db_path: str, object_type: str, object_name: str,
     control_type: Any, props: dict, class_name: Optional[str] = None,
-    control_name: Optional[str] = None,
+    control_name: Optional[str] = None, skip_lint: bool = False,
 ) -> dict:
     """
     Creates a new control in a form/report by opening it in Design view.
@@ -453,6 +453,26 @@ def ac_create_control(
         # Invalidate caches — form changed in Design view
         invalidate_object_caches(object_type, object_name)
 
+    return _attach_lint(result, db_path, object_type, object_name, skip_lint)
+
+
+def _attach_lint(result: dict, db_path: str, object_type: str,
+                 object_name: str, skip_lint: bool) -> dict:
+    """Attach a compact deterministic lint of the affected object to a design
+    mutation's result. Deterministic and unconditional (unless skip_lint) so a
+    broken layout surfaces on every edit — the LLM cannot wave it through.
+
+    Never raises: lint failures leave the mutation result untouched.
+    """
+    if skip_lint or object_type not in ("form", "report"):
+        return result
+    try:
+        from .lint import lint_compact
+        compact = lint_compact(db_path, object_type, object_name)
+        if compact is not None:
+            result["lint"] = compact
+    except Exception:
+        pass
     return result
 
 
@@ -664,7 +684,7 @@ def ac_import_text(db_path: str, object_type: str, object_name: str,
 
 def ac_set_control_props(
     db_path: str, object_type: str, object_name: str,
-    control_name: str, props: dict
+    control_name: str, props: dict, skip_lint: bool = False,
 ) -> dict:
     """
     Modifies properties of an existing control by opening the form/report in Design view.
@@ -693,7 +713,8 @@ def ac_set_control_props(
         # Invalidate caches — form changed in Design view
         invalidate_object_caches(object_type, object_name)
 
-    return {"applied": applied, "errors": errors}
+    return _attach_lint({"applied": applied, "errors": errors},
+                        db_path, object_type, object_name, skip_lint)
 
 
 # ---------------------------------------------------------------------------
@@ -1000,7 +1021,7 @@ def ac_manage_tab_order(
 
 def ac_set_multiple_controls(
     db_path: str, object_type: str, object_name: str,
-    controls: list[dict],
+    controls: list[dict], skip_lint: bool = False,
 ) -> dict:
     """
     Modifies properties of multiple controls in a single operation.
@@ -1041,4 +1062,5 @@ def ac_set_multiple_controls(
         _save_and_close(app, object_type, object_name)
         invalidate_object_caches(object_type, object_name)
 
-    return {"results": results}
+    return _attach_lint({"results": results},
+                        db_path, object_type, object_name, skip_lint)

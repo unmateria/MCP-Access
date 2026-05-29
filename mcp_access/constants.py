@@ -168,3 +168,23 @@ CONTROL_SEARCH_PROPS = frozenset({
     "ControlSource", "RecordSource", "RowSource", "DefaultValue", "ValidationRule",
     "SourceObject", "LinkChildFields", "LinkMasterFields",
 })
+
+# ---------------------------------------------------------------------------
+# UI design lint (access_lint_form + embedded design-mutation checks)
+# ---------------------------------------------------------------------------
+TWIPS_PER_INCH = 1440
+
+# WizHook unlock key (undocumented) — enables WizHook.TwipsFromFont for exact
+# rendered text width. Requires a compiled VBA project.
+WIZHOOK_KEY = 51488399
+
+# Rule ids, in the canonical order used for the schema enum and "all rules".
+LINT_RULES = (
+    "contrast",
+    "overlap",
+    "out_of_bounds",
+    "truncation",
+    "sibling_inconsistency",
+    "misalignment",
+    "invisible_or_zero_size",
+)

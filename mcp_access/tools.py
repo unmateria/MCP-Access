@@ -1,5 +1,5 @@
 """
-MCP Tool definitions (65 tools) and schema utilities.
+MCP Tool definitions (66 tools) and schema utilities.
 """
 
 import mcp.types as types
@@ -377,6 +377,10 @@ TOOLS = [
                     "type": "string",
                     "description": "ProgID for ActiveX (type 119). E.g.: 'Shell.Explorer.2', 'MSCAL.Calendar.7'. Initializes the OLE control.",
                 },
+                "skip_lint": {
+                    "type": "boolean",
+                    "description": "Suppress the embedded UI lint of the affected object (default false). Only for bulk programmatic edits.",
+                },
             },
             "required": ["db_path", "object_type", "object_name", "control_type", "props"],
         },
@@ -437,6 +441,10 @@ TOOLS = [
                     "type": "object",
                     "description": "Properties to modify: {Caption: 'X', Left: 1000, Visible: true, ...}",
                     "additionalProperties": True,
+                },
+                "skip_lint": {
+                    "type": "boolean",
+                    "description": "Suppress the embedded UI lint of the affected object (default false). Only for bulk programmatic edits.",
                 },
             },
             "required": ["db_path", "object_type", "object_name", "control_name", "props"],
@@ -1122,14 +1130,58 @@ TOOLS = [
                         "required": ["name", "props"],
                     },
                 },
+                "skip_lint": {
+                    "type": "boolean",
+                    "description": "Suppress the embedded UI lint of the affected object (default false). Only for bulk programmatic edits.",
+                },
             },
             "required": ["db_path", "object_type", "object_name", "controls"],
+        },
+    ),
+    types.Tool(
+        name="access_lint_form",
+        description=(
+            "Deterministic UI design lint of a form/report. Returns structured "
+            "JSON violations the agent should fix BEFORE declaring a layout done: "
+            "contrast (WCAG white-on-white etc.), overlap, out-of-bounds, text "
+            "truncation, sibling inconsistency, misalignment, zero-size/invisible. "
+            "summary.verdict is PASS / REVIEW / FAIL. Static (one export, no Design "
+            "view). measure='auto' tries Access WizHook for exact text width and "
+            "falls back to a heuristic. The same engine runs automatically on every "
+            "control mutation (see the 'lint' block in those tools' results)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Path to .accdb/.mdb file"},
+                "object_type": {"type": "string", "enum": ["form", "report"], "default": "form"},
+                "object_name": {"type": "string", "description": "Form/report name"},
+                "rules": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Subset of rule ids to run; omit for all. Ids: contrast, overlap, out_of_bounds, truncation, sibling_inconsistency, misalignment, invisible_or_zero_size",
+                },
+                "measure": {
+                    "type": "string",
+                    "enum": ["auto", "wizhook", "heuristic"],
+                    "description": "Text-width source for truncation. 'wizhook' = exact (needs compiled VBA); 'heuristic' = no COM; 'auto' tries wizhook then falls back. Default 'auto'.",
+                },
+                "include_screenshot": {
+                    "type": "boolean",
+                    "description": "Also capture a PNG of the form and return its path (default false).",
+                },
+                "max_violations": {
+                    "type": "integer",
+                    "description": "Cap on returned violations (default 200; info dropped first, errors kept).",
+                },
+            },
+            "required": ["db_path", "object_name"],
         },
     ),
     # -- Tips / knowledge base -----------------------------------------------
     types.Tool(
         name="access_tips",
-        description="Tips and gotchas for working with Access via MCP. Topics: eval, controls, gotchas, sql, vbe, compile, design. Without topic returns the list.",
+        description="Tips and gotchas for working with Access via MCP. Topics: eval, controls, gotchas, sql, vbe, compile, design, lint, macros, subform_tabcontrol. Without topic returns the list.",
         inputSchema={
             "type": "object",
             "properties": {

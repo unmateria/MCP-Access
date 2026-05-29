@@ -1,5 +1,76 @@
 # Changelog
 
+## 0.7.41 — 2026-05-29
+
+Adds **deterministic UI design validation** so the assistant stops accepting
+objectively broken form/report layouts. **65 → 66 tools.**
+
+### Added
+
+- **`access_lint_form`** — pure-Python, rules-based lint of a form/report.
+  Returns structured JSON violations with `summary.verdict` (PASS / REVIEW /
+  FAIL) and per-violation `suggested_fix`. Rules: `contrast` (WCAG 2.1
+  ratio — catches white-on-white & low-contrast text), `overlap`,
+  `out_of_bounds`, `truncation`, `sibling_inconsistency`, `misalignment`,
+  `invisible_or_zero_size`. Static — one `SaveAsText` export, never opens
+  Design view. `measure="auto"|"wizhook"|"heuristic"` (WizHook gives exact
+  rendered text width when the VBA project is compiled; otherwise a
+  conservative heuristic).
+- **Embedded enforcement.** `access_set_control_props`,
+  `access_set_multiple_controls` and `access_create_control` now attach a
+  compact `lint` block (errors + warnings) to their result **automatically**.
+  The validation is deterministic and lives entirely inside the MCP — it
+  cannot be skipped or "talked past" by the model. `skip_lint=true` opts out
+  for bulk programmatic edits. A lint failure never breaks the mutation.
+- `access_tips('lint')` documents the rules, thresholds and colour encoding.
+- Unit tests: `tests/test_lint.py` (29 COM-free tests for colour decoding,
+  WCAG contrast, geometry parsing, and every rule incl. false-positive guards).
+
+### Notes
+
+False-positive guards, hardened against a real 85-control ERP form (findings
+dropped 62 → 10, remainder genuine):
+
+- **Conditional formatting** overrides colours at runtime (binary in the export)
+  → contrast skips + notes those controls.
+- **Captions wrap** — Labels *and* CommandButtons; line breaks (`\015\012`) are
+  split, truncation compares wrapped-line count vs lines that fit the height.
+- **`sibling_inconsistency` clusters** values: two legitimate sizes (main vs
+  inline buttons) are both accepted; only a lone outlier flags.
+- **Transparent buttons** stacked on styled labels (the custom-button pattern)
+  are not flagged as overlaps.
+- **Heuristic width is calibrated** for narrow UI fonts (≈0.46×) and only flags
+  overflow past 1.25× — bold header labels that fit are no longer flagged.
+- Absent dimensions inherit form defaults (not zero); attached labels,
+  cross-tab-page controls, container Pages and transparent layering never count
+  as overlaps; icon buttons aren't measured for caption truncation.
+- Access auto-grows form Width / section Height to fit controls, so horizontal
+  `out_of_bounds` rarely fires for forms (still effective for reports and
+  negative coordinates).
+
+## 0.7.40 — 2026-05-29
+
+Fixes an indefinite hang on databases whose **startup form raises a blocking
+modal** during open / VBE access.
+
+### Fixed
+
+- **Global dialog watchdog.** Until now the dialog-dismiss watchdog only ran
+  during `open` / `compile` / `run_vba`. Operations that access the VBE
+  (`vbe_get_proc`, `find_definition`, `module_info`, ...) had **no** watchdog,
+  so a modal raised by a DB's startup form — e.g.
+  `"Error accessing file. Network connection may have been lost."` on a DB with
+  `StartupForm` set — would hang the COM call forever (observed: a ~1-hour hang
+  on `mydatabase.accdb`). `_Session` now starts a background watchdog in
+  `_launch()` that dismisses Access-owned `#32770` / wizard dialogs which
+  persist past a 3 s grace period, for the whole lifetime of the spawned Access
+  process. The grace period lets operation-specific watchdogs handle (and
+  screenshot) their own dialogs first; the global thread only backstops
+  un-watched operations. It is **not** started when attached to an existing
+  interactive user session.
+- Factored the dialog enumeration into `_find_dialog_hwnds_by_pid()` (shared by
+  the dismisser and the new watchdog).
+
 ## 0.7.39 — 2026-05-28
 
 Hardening of the v0.7.38 `_looks_like_vba_only` detector. No behaviour change

@@ -38,6 +38,7 @@ from .relations import (
     ac_list_references, ac_manage_reference,
     ac_list_indexes, ac_manage_index,
 )
+from .lint import ac_lint_form
 from .maintenance import ac_compact_repair, ac_decompile_compact
 from .vba_exec import ac_run_macro, ac_run_vba, ac_eval_vba
 from .compile import ac_compile_vba
@@ -219,6 +220,7 @@ def call_tool_sync(name: str, arguments: dict) -> str:
                 dict(arguments.get("props", {})),
                 class_name=arguments.get("class_name"),
                 control_name=arguments.get("control_name"),
+                skip_lint=bool(arguments.get("skip_lint", False)),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -255,6 +257,7 @@ def call_tool_sync(name: str, arguments: dict) -> str:
                 arguments["object_name"],
                 arguments["control_name"],
                 dict(arguments.get("props", {})),
+                skip_lint=bool(arguments.get("skip_lint", False)),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -553,6 +556,19 @@ def call_tool_sync(name: str, arguments: dict) -> str:
                 arguments["object_type"],
                 arguments["object_name"],
                 arguments["controls"],
+                skip_lint=bool(arguments.get("skip_lint", False)),
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        elif name == "access_lint_form":
+            result = ac_lint_form(
+                arguments["db_path"],
+                arguments.get("object_type", "form"),
+                arguments["object_name"],
+                rules=arguments.get("rules"),
+                measure=arguments.get("measure", "auto"),
+                include_screenshot=bool(arguments.get("include_screenshot", False)),
+                max_violations=int(arguments.get("max_violations", 200)),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
