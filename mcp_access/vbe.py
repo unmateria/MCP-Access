@@ -281,12 +281,27 @@ def _check_module_health(cm: Any, cache_key: str, expected_total: int = 0) -> li
     all_code = cm.Lines(1, total)
     lines = all_code.splitlines()
 
-    # Check 1 — Option placement: should be in first 5 lines
+    # Check 1 — Option placement. Option statements must precede all executable
+    # code, but a comment/blank header of any length is perfectly legal (e.g. a
+    # banner comment block). So flag an Option line only when real code already
+    # appeared above it — NOT by a fixed line-number threshold, which false-
+    # positives on long headers (a 6-line header pushes Option to line 7).
+    seen_code = False
     for i, line in enumerate(lines):
-        if _OPTION_RE.match(line.rstrip('\r\n')) and i >= 5:
-            warnings.append(
-                f"WARNING: '{line.strip()}' found at line {i + 1} (expected in first 5 lines)"
-            )
+        stripped = line.strip()
+        low = stripped.lower()
+        if _OPTION_RE.match(line.rstrip('\r\n')):
+            if seen_code:
+                warnings.append(
+                    f"WARNING: '{stripped}' found at line {i + 1} after executable "
+                    f"code (Option statements must precede all code)"
+                )
+            continue
+        # Blanks, comments and other Option-family lines are not "code".
+        if not stripped or stripped.startswith("'") or low.startswith("rem ") \
+                or low.startswith("option "):
+            continue
+        seen_code = True
 
     # Check 2 — Duplicate labels (scoped per procedure).
     # VBA accepts combinations like "Public Static Sub Foo" — allow scope
@@ -429,6 +444,10 @@ def ac_vbe_get_proc(
     Returns information and code for a specific procedure.
     Much more efficient than ac_get_code when only one function is needed.
     Returns: start_line, body_line, count, code.
+      - start_line: VBE proc start — INCLUDES the blank/comment lines above the
+        proc (use for whole-proc operations).
+      - body_line: the Sub/Function/Property declaration line (use for body
+        line-range edits).
     """
     app = _Session.connect(db_path)
     _close_form_design_view(app, object_type, object_name)
@@ -458,6 +477,8 @@ def ac_vbe_module_info(
     """
     Returns the total lines and the list of procedures with their positions.
     Useful as a quick index before editing, without downloading the full code.
+    Per proc: start_line (VBE proc start — includes preceding blank/comment
+    lines) and body_line (the Sub/Function/Property declaration line).
     """
     app = _Session.connect(db_path)
     _close_form_design_view(app, object_type, object_name)
@@ -627,6 +648,15 @@ def ac_vbe_replace_lines(
         f"({r['deleted']} deleted, {r['inserted']} inserted){r['clamp_note']} "
         f"→ module now has {new_total} lines"
     )
+    # Surface a destructive no-op: lines were deleted but nothing was inserted.
+    # This is the footgun where new_code/new_lines arrives empty (e.g. a misnamed
+    # argument) and a replace silently degrades into a pure delete.
+    if r["deleted"] > 0 and r["inserted"] == 0:
+        status += (
+            f"\nnote: {r['deleted']} line(s) deleted and nothing inserted "
+            f"(new_code/new_lines was empty). If you meant to REPLACE, pass the "
+            f"new text in new_code or new_lines."
+        )
     if health:
         status += f"\n" + "\n".join(health)
     if new_code:
@@ -881,7 +911,9 @@ def ac_vbe_replace_proc(
     Replaces a complete procedure (Sub/Function/Property) by name.
     Calculates boundaries automatically via COM (ProcStartLine/ProcCountLines),
     eliminating calculation errors from the caller.
-    If new_code is empty, deletes the procedure.
+    Preserves the blank separator line above the proc when replacing (delete/
+    insert happen below the leading blanks).
+    If new_code is empty, deletes the procedure AND its leading blank separator.
     """
     app = _Session.connect(db_path)
     _close_form_design_view(app, object_type, object_name)
@@ -900,25 +932,41 @@ def ac_vbe_replace_proc(
     # Clamp count to actual module total (ProcCountLines can inflate the last proc)
     total = cm.CountOfLines
     count = min(count, total - start + 1)
-    # Backup original proc in RAM for rollback if it fails
-    backup_code = cm.Lines(start, count)
     # Strip Option lines if proc is NOT at the top of the module
     option_warnings = []
     if new_code and start > 5:
         new_code, option_warnings = _strip_option_lines(new_code)
+    # ProcStartLine = previous proc's End + 1, so it INCLUDES the blank
+    # separator line(s) above this proc. When REPLACING, preserve that
+    # separator (delete/insert below it) so we don't eat the blank line
+    # between procs on every replace. A pure delete (new_code == '') removes
+    # the whole range, separator included — that correctly closes the gap
+    # (the following proc still owns its own leading blank).
+    del_start, del_count = start, count
+    if new_code:
+        lead = 0
+        for ln in cm.Lines(start, count).splitlines():
+            if ln.strip() == "":
+                lead += 1
+            else:
+                break
+        if 0 < lead < count:
+            del_start, del_count = start + lead, count - lead
+    # Backup the portion we delete, for rollback on failure
+    backup_code = cm.Lines(del_start, del_count)
     # Delete old procedure and insert new one with automatic rollback
     try:
-        cm.DeleteLines(start, count)
+        cm.DeleteLines(del_start, del_count)
         inserted = 0
         if new_code:
             normalized = new_code.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
-            pre_insert_total = total - count
-            cm.InsertLines(start, normalized)
+            pre_insert_total = total - del_count
+            cm.InsertLines(del_start, normalized)
             inserted = cm.CountOfLines - pre_insert_total
     except Exception:
         # Restore original code
         try:
-            cm.InsertLines(start, backup_code)
+            cm.InsertLines(del_start, backup_code)
         except Exception:
             pass  # best-effort restore
         raise
@@ -929,7 +977,7 @@ def ac_vbe_replace_proc(
     action = "replaced" if new_code else "deleted"
     status = (
         f"OK: proc '{proc_name}' {action} "
-        f"({count} deleted, {inserted} inserted) "
+        f"({del_count} deleted, {inserted} inserted) "
         f"→ module now has {new_total} lines"
     )
     if option_warnings:
@@ -1122,7 +1170,7 @@ def ac_vbe_append(
 
 # ---------------------------------------------------------------------------
 # Find definition — "Go To Definition" for VBA symbols
-# (requested by Tom — @TvanStiphout-Home, thanks!)
+# (requested by @TvanStiphout-Home, thanks!)
 # ---------------------------------------------------------------------------
 
 _FD_PROC_RE = re.compile(

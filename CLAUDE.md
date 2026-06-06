@@ -269,6 +269,36 @@ ac_set_form_property(db, "form", "frmFoo", {"HasModule": True})
 ac_vbe_module_info(db, "form", "frmFoo")  # then this works too
 ```
 
+## VBE procedure editing (v0.7.42)
+
+Field-report fixes for `vbe.py`. Three behaviours to keep in mind:
+
+- **`ProcStartLine` owns the blank separator above a proc** (it equals the
+  previous proc's `End` + 1, so it includes the blank/comment lines VBE attributes
+  to the proc). `ac_vbe_replace_proc` therefore, *when replacing*, counts the run
+  of leading whitespace-only lines (`lead`) and deletes/inserts at `start + lead`
+  over `count - lead` — preserving the separator. A pure delete (`new_code==""`)
+  still deletes the whole `[start, count]` range (separator included) so a deleted
+  proc doesn't leave an orphan blank. Do NOT "simplify" this back to
+  `DeleteLines(start, count)` for the replace path — that re-introduces the
+  blank-eating bug Tom reported.
+- **The Option-placement health check is comment-header-aware**, not
+  line-number-thresholded. `_check_module_health` flags an `Option …` line only
+  when real code (non-blank, non-comment `'`/`Rem`, non-`Option`) already appeared
+  above it. A banner comment header of any length is fine. Do NOT restore the old
+  `i >= 5` threshold — it false-positived on long headers (e.g. `_modTest`).
+- **`new_lines` is an alias for `new_code` in `access_vbe_replace_lines`.** The
+  dispatcher (`_new_lines_to_code`) joins a list with `\n` (so `""` entries are
+  blank lines) and tolerates a JSON-encoded string from string-serialising
+  clients. A single-mode replace that deletes lines but inserts nothing appends a
+  note — the silent destructive-delete footgun (wrong arg name → empty `new_code`
+  → pure delete) is now surfaced, not hidden.
+
+`start_line` vs `body_line` (get_proc / module_info): `start_line` is the VBE proc
+start (includes the blank/comment lines above); `body_line` is the
+`Sub`/`Function`/`Property` declaration line. Use `start_line` for whole-proc ops,
+`body_line` for body line-range edits.
+
 ## Common Gotchas
 
 - VBE line numbers are **1-based**

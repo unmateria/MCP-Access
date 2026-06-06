@@ -54,7 +54,7 @@ _TIPS: dict[str, str] = {
         "  Use SHORT instead of SMALLINT, LONG instead of INT\n"
         "  Prefer access_create_table over CREATE TABLE SQL for full type+default+description support\n\n"
         "ODBC pass-through:\n"
-        "  QueryDef.Connect limit 255 chars — hardcode minimal connect string:\n"
+        "  QueryDef.Connect limit 255 chars — hardcode a minimal connect string:\n"
         "  \"ODBC;DRIVER={ODBC Driver 17 for SQL Server};SERVER=myserver\\sqlexpress;"
         "DATABASE=mydb;UID=myuser;PWD=mypassword\""
     ),
@@ -70,7 +70,17 @@ _TIPS: dict[str, str] = {
         "  For specific procedures: use access_vbe_get_proc (fast, precise).\n"
         "  For procedure index: use access_vbe_module_info first.\n"
         "  access_get_code exports the ENTIRE form (controls + VBA, can be 90KB+) — avoid for VBA investigation.\n"
-        "  Recommended flow: access_vbe_module_info → access_vbe_get_proc for each relevant proc."
+        "  Recommended flow: access_vbe_module_info → access_vbe_get_proc for each relevant proc.\n\n"
+        "start_line vs body_line (get_proc / module_info):\n"
+        "  start_line = VBE proc start — INCLUDES the blank separator + comment lines above the proc.\n"
+        "  body_line  = the Sub/Function/Property declaration line itself.\n"
+        "  Use start_line for whole-proc operations; body_line for body line-range edits.\n\n"
+        "Editing procedures:\n"
+        "  access_vbe_replace_proc replaces a whole proc by name and PRESERVES the blank\n"
+        "    separator line above it (no more manual re-add after each replace).\n"
+        "  Delete a proc: access_vbe_replace_proc(..., new_code='') — also removes its leading blank separator.\n"
+        "  access_vbe_replace_lines: pass new_code (string) OR new_lines (list of lines; '' = blank line).\n"
+        "    A replace that deletes lines but inserts nothing (empty new_code/new_lines) is flagged in the result."
     ),
     "compile": (
         "access_compile_vba tips:\n"

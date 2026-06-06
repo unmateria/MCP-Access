@@ -331,6 +331,24 @@ The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/s
 
 ## Changelog
 
+### v0.7.42 — 2026-06-06
+
+VBE procedure-editing fixes from field reports.
+
+- **Fix:** `access_vbe_replace_proc` no longer deletes the blank separator line
+  above a procedure — it preserves leading blank line(s) on replace (a pure
+  `new_code=''` delete still removes the proc and its leading blank).
+- **Fix:** modules with a long comment/banner header no longer trigger a
+  spurious *"Option … expected in first 5 lines"* warning. The check now flags an
+  Option statement only when real code precedes it.
+- **DX:** `access_vbe_replace_lines` accepts `new_lines` (a list of lines) as an
+  alias for `new_code`, and now warns when a replace deletes lines but inserts
+  nothing — so a misnamed argument can no longer cause a silent destructive
+  delete.
+- `access_vbe_get_proc` / `access_vbe_module_info` docs clarify `start_line`
+  (includes the blank/comment lines above the proc) vs `body_line` (the
+  declaration line).
+
 ### v0.7.38 — 2026-05-28
 
 DX fixes for form-building workflows, found while assembling a non-trivial form

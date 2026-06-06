@@ -139,7 +139,13 @@ TOOLS = [
     ),
     types.Tool(
         name="access_vbe_get_proc",
-        description="Code of a VBA procedure by name. Returns start_line, body_line, count, code.",
+        description=(
+            "Code of a VBA procedure by name. Returns start_line, body_line, count, code. "
+            "start_line = VBE proc start, which INCLUDES the blank separator / comment "
+            "lines above the proc (use it for whole-proc operations). "
+            "body_line = the Sub/Function/Property declaration line itself (use it for "
+            "line-range edits of the body)."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
@@ -153,7 +159,11 @@ TOOLS = [
     ),
     types.Tool(
         name="access_vbe_module_info",
-        description="Index of procedures in a VBA module: total_lines, procs [{name, start_line, body_line, count}].",
+        description=(
+            "Index of procedures in a VBA module: total_lines, procs [{name, start_line, "
+            "body_line, count}]. start_line = VBE proc start (INCLUDES preceding blank/"
+            "comment lines); body_line = the Sub/Function/Property declaration line."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
@@ -169,7 +179,9 @@ TOOLS = [
         description=(
             "Replaces lines in a VBA module via VBE. "
             "count=0: insertion. new_code='': deletion. Validates bounds automatically. "
-            "Batch mode: pass 'operations' (list of {start_line, count, new_code}) "
+            "Pass new code as new_code (a string) OR new_lines (a list of strings, "
+            "joined with newlines — '' entries become blank lines). "
+            "Batch mode: pass 'operations' (list of {start_line, count, new_code|new_lines}) "
             "to execute multiple operations in 1 call (auto-sorted bottom-to-top)."
         ),
         inputSchema={
@@ -181,15 +193,18 @@ TOOLS = [
                 "start_line":  {"type": "integer", "description": "First line (1-based). Ignored if operations present."},
                 "count":       {"type": "integer", "description": "Lines to delete (0 = insert). Ignored if operations present."},
                 "new_code":    {"type": "string",  "description": "New code ('' = delete). Ignored if operations present."},
+                "new_lines":   {"type": "array", "items": {"type": "string"},
+                                "description": "Alias for new_code as a list of lines (joined with '\\n'; '' = blank line). Ignored if operations present."},
                 "operations":  {
                     "type": "array",
-                    "description": "Batch mode: list of operations. Each: {start_line, count, new_code}. Auto-sorted bottom-to-top.",
+                    "description": "Batch mode: list of operations. Each: {start_line, count, new_code|new_lines}. Auto-sorted bottom-to-top.",
                     "items": {
                         "type": "object",
                         "properties": {
                             "start_line": {"type": "integer"},
                             "count": {"type": "integer"},
                             "new_code": {"type": "string"},
+                            "new_lines": {"type": "array", "items": {"type": "string"}},
                         },
                         "required": ["start_line", "count"],
                     },
@@ -258,7 +273,12 @@ TOOLS = [
     ),
     types.Tool(
         name="access_vbe_replace_proc",
-        description="Replaces an entire VBA procedure by name. new_code='' deletes it.",
+        description=(
+            "Replaces an entire VBA procedure by name (boundaries found via VBE). "
+            "Preserves the blank separator line above the proc. "
+            "new_code='' DELETES the proc (and its leading blank separator) — this is "
+            "the supported way to delete a procedure."
+        ),
         inputSchema={
             "type": "object",
             "properties": {

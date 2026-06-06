@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.7.42 — 2026-06-06
+
+VBE procedure-editing fixes from field reports (thanks to
+[@TvanStiphout-Home](https://github.com/TvanStiphout-Home)). No new tools — tool
+count stays **66**.
+
+### Fixed
+
+- **`access_vbe_replace_proc` no longer eats the blank separator line above a
+  procedure.** `ProcStartLine` is the previous proc's `End` + 1, so it *includes*
+  the blank line VBE attributes to the proc; the old code deleted from there and
+  re-inserted code with no leading blank, consuming the separator on every
+  replace. Replaces now preserve the leading blank line(s) — delete/insert happen
+  below them. A pure delete (`new_code=''`) still removes the whole range incl.
+  the leading blank (so deleting a proc closes its gap cleanly).
+- **No more spurious "Option … expected in first 5 lines" warning on modules
+  with a long comment header** (e.g. a banner block pushing `Option Compare` past
+  line 5). The structural health check replaced its fixed line-number threshold
+  with a rule that flags an Option statement only when real (non-comment,
+  non-blank) code already appeared above it — still catching genuinely misplaced
+  Option statements.
+
+### Added
+
+- **`access_vbe_replace_lines` accepts `new_lines`** (a list of strings, joined
+  with `\n`; `''` entries become blank lines) as an alias for `new_code`. This
+  closes a destructive footgun: a call that passed the code under a wrong key
+  left `new_code` empty and silently degraded into a pure delete. A replace that
+  deletes lines but inserts nothing now also appends an explicit note to its
+  result, so a destructive no-op is never silent.
+
+### Changed
+
+- `access_vbe_get_proc` / `access_vbe_module_info` descriptions and docstrings
+  now spell out `start_line` (VBE proc start — includes preceding blank/comment
+  lines) vs `body_line` (the `Sub`/`Function`/`Property` declaration line).
+  `access_tips('vbe')` documents both, the separator-preserving replace, and
+  `new_code=''` deletion.
+
+### Tests
+
+- `tests/test_vbe_fixes.py` — 11 COM-free tests for the Option-placement check
+  and the `new_lines` alias normalisation. Blank-separator preservation and the
+  end-to-end `new_lines` path were verified with a live COM integration run.
+
 ## 0.7.41 — 2026-05-29
 
 Adds **deterministic UI design validation** so the assistant stops accepting
@@ -61,7 +106,7 @@ modal** during open / VBE access.
   so a modal raised by a DB's startup form — e.g.
   `"Error accessing file. Network connection may have been lost."` on a DB with
   `StartupForm` set — would hang the COM call forever (observed: a ~1-hour hang
-  on `mydatabase.accdb`). `_Session` now starts a background watchdog in
+  on one such database). `_Session` now starts a background watchdog in
   `_launch()` that dismisses Access-owned `#32770` / wizard dialogs which
   persist past a 3 s grace period, for the whole lifetime of the spawned Access
   process. The grace period lets operation-specific watchdogs handle (and

@@ -193,8 +193,8 @@ class _Session:
         module_info ...).  Without it, a blocking modal raised during the
         startup form of a DB such as
             'Error accessing file. Network connection may have been lost.'
-        hangs the COM call indefinitely (observed: a 1-hour hang on
-        mydatabase.accdb).  Operation-specific watchdogs (open / compile /
+        hangs the COM call indefinitely (observed: a 1-hour hang on a DB
+        with a startup form).  Operation-specific watchdogs (open / compile /
         run_vba) react faster and screenshot first; the grace period keeps
         this thread from stealing their dialog.
 

@@ -47,6 +47,32 @@ from .ui import ac_screenshot, ac_ui_click, ac_ui_type
 from .tips import ac_tips
 
 
+def _new_lines_to_code(val):
+    """Normalise a ``new_lines`` alias into a ``new_code`` string.
+
+    ``new_lines`` is accepted as a convenience alias for ``new_code`` so callers
+    can pass a list of lines instead of a single embedded-newline string (and so
+    a misnamed-arg call no longer silently degrades to a destructive delete).
+    Returns the joined code, or ``None`` when no usable value is present. Tolerates
+    string-serialising clients that send the list as a JSON-encoded string."""
+    if val is None:
+        return None
+    if isinstance(val, str):
+        stripped = val.strip()
+        if stripped.startswith("["):
+            try:
+                parsed = json.loads(stripped)
+                if isinstance(parsed, list):
+                    val = parsed
+            except (ValueError, TypeError):
+                pass
+        if isinstance(val, str):
+            return val  # plain string: treat as new_code verbatim
+    if isinstance(val, list):
+        return "\n".join("" if x is None else str(x) for x in val)
+    return str(val)
+
+
 def call_tool_sync(name: str, arguments: dict) -> str:
     """Synchronous tool dispatcher -- runs in a thread to avoid blocking the event loop."""
     try:
@@ -125,13 +151,27 @@ def call_tool_sync(name: str, arguments: dict) -> str:
 
         elif name == "access_vbe_replace_lines":
             ops = arguments.get("operations")
+            if ops:
+                # Per-op new_lines is an alias for new_code (don't override an
+                # explicit new_code already in the op).
+                for op in ops:
+                    if "new_code" not in op and "new_lines" in op:
+                        nc = _new_lines_to_code(op.get("new_lines"))
+                        if nc is not None:
+                            op["new_code"] = nc
+            # Single mode: new_lines alias → new_code (only when new_code absent/empty).
+            new_code = arguments.get("new_code", "")
+            if not new_code and "new_lines" in arguments:
+                nc = _new_lines_to_code(arguments.get("new_lines"))
+                if nc is not None:
+                    new_code = nc
             text = ac_vbe_replace_lines(
                 arguments["db_path"],
                 arguments["object_type"],
                 arguments["object_name"],
                 int(arguments.get("start_line", 0)),
                 int(arguments.get("count", 0)),
-                arguments.get("new_code", ""),
+                new_code,
                 operations=ops,
             )
 
