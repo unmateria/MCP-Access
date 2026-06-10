@@ -158,6 +158,15 @@ class _Session:
             # Health check: verify COM session is still alive
             try:
                 _ = cls._app.Visible  # cheap COM property access
+                if cls._db_open is not None:
+                    # The app proxy can be alive while the database has been
+                    # closed under us (e.g. by its own startup code). A stale
+                    # _db_open wedges every later CurrentDb/CurrentData call
+                    # with "object is closed or doesn't exist".
+                    if cls._app.CurrentDb() is None:
+                        raise RuntimeError(
+                            f"database no longer open: {cls._db_open}"
+                        )
             except Exception:
                 log.warning("COM session stale — auto-reconnecting...")
                 cls._force_cleanup()
@@ -711,6 +720,43 @@ class _Session:
         if _dialog_screenshots:
             log.warning("A blocking dialog was auto-dismissed. Screenshot: %s",
                         _dialog_screenshots[0])
+
+        # Post-open validation: confirm the database actually stayed open.
+        # Startup code can close the database during an automated open — e.g.
+        # an AutoExec/startup form error path firing because backend links are
+        # broken, with AllowBypassKey=False defeating the SHIFT bypass (the
+        # watchdog's Cancel click then routes through the form's error
+        # handler, which closes the db).  Without this check, _db_open would
+        # record a database that isn't there, and every later call would die
+        # at CurrentDb/CurrentData with "object is closed or doesn't exist",
+        # wedging the session permanently.  Also catches the case where the
+        # "already have the database open" swallow above masked a dead db.
+        db_alive = False
+        try:
+            db_alive = cls._app.CurrentDb() is not None
+        except Exception as e_val:
+            log.warning("Post-open validation raised: %s", e_val)
+        if not db_alive:
+            log.error(
+                "Database closed itself during open: %s — resetting session",
+                path,
+            )
+            # quit() does the right thing for both cases: spawned instances
+            # are quit (taskkill fallback included); attached instances are
+            # released without touching the user's Access.
+            try:
+                cls.quit()
+            except Exception as e_q:
+                log.warning("Session teardown after failed open: %s", e_q)
+                cls._force_cleanup()
+            raise RuntimeError(
+                f"Database closed itself while opening: {path}. Its startup "
+                "code (AutoExec / startup form) most likely failed and closed "
+                "the database — common causes: missing backend table links, "
+                "or AllowBypassKey=False defeating the SHIFT bypass. The COM "
+                "session has been reset; open the file manually in Access "
+                "while holding SHIFT to investigate."
+            )
 
         cls._db_open = path
 
