@@ -69,6 +69,21 @@ def ac_create_database(db_path: str) -> dict:
         app.OpenCurrentDatabase(resolved)
     except Exception:
         pass  # If reopen fails, at least the file was created
+    # Same post-open validation as _Session._switch(): never record _db_open
+    # for a database that isn't actually open (a swallowed reopen failure
+    # would wedge every later CurrentDb call).
+    db_alive = False
+    try:
+        db_alive = app.CurrentDb() is not None
+    except Exception:
+        pass
+    if not db_alive:
+        _Session._db_open = None
+        raise RuntimeError(
+            f"Database file was created at {resolved} but could not be "
+            "reopened afterwards. Open it with access_execute_sql or "
+            "access_list_objects to continue working with it."
+        )
     _Session._db_open = resolved
     invalidate_all_caches()
     size = os.path.getsize(resolved) if os.path.exists(resolved) else 0

@@ -1064,7 +1064,7 @@ TOOLS = [
         name="access_execute_batch",
         description=(
             "Executes multiple SQL statements in a single call. "
-            "Each statement can be SELECT (returns rows, limit 100) or "
+            "Each statement can be SELECT (returns rows, default limit 100 — adjustable via 'limit') or "
             "INSERT/UPDATE/DELETE (returns affected_rows). "
             "stop_on_error=true stops at first error. "
             "DELETE/DROP/TRUNCATE/ALTER require confirm_destructive=true."
@@ -1093,6 +1093,11 @@ TOOLS = [
                 "confirm_destructive": {
                     "type": "boolean", "default": False,
                     "description": "Required for DELETE/DROP/TRUNCATE/ALTER",
+                },
+                "limit": {
+                    "type": "integer", "default": 100,
+                    "description": "Max rows returned per SELECT statement "
+                                   "(1-10000, default 100)",
                 },
             },
             "required": ["db_path", "statements"],

@@ -85,6 +85,14 @@ Passing VBE-style headers to `LoadFromText` creates a corrupt standard module. `
 ### Dialog watchdog system
 Blocking COM calls (`OpenCurrentDatabase`, `CompactRepair`, `RunCommand`, `Application.Run`) are protected by polling watchdog threads that dismiss Access dialogs via `_dismiss_access_dialogs()` / `_dismiss_dialogs_by_pid()`. Button priority: Cancel > End > OK (Cancel-first avoids advancing wizards).
 
+**Attached-instance policy (v0.7.43)**: the global watchdog also runs when we attached to the user's Access, but it only dismisses dialogs while one of OUR tool calls has been in flight longer than the grace period (5 s attached vs 3 s spawned). `_Session._tool_started` (monotonic timestamp, set/cleared by `server.call_tool` around `run_in_executor`) is the in-flight signal. A modal with no tool call in flight belongs to the interactive user — never touched. Do NOT "simplify" this back to disabling the watchdog on attach: that re-introduces the 1-hour VBE hang when a broken-reference VBA project pops "Error accessing file..." during one of our calls.
+
+### Wedged-session detection (v0.7.43, from PR #30 by @CaptainStormfield)
+A DB whose startup code closes it during the open (startup-form error path + `AllowBypassKey=False`) used to leave `_db_open` pointing at a dead database — every later call died at `CurrentDb` and reconnects re-attached to the same broken instance. Now: `_switch()` validates `CurrentDb() is not None` post-open (raises an actionable RuntimeError after `quit()`-resetting the session), `connect()` health-checks `CurrentDb()` whenever `_db_open` is set (auto-reconnect via `_force_cleanup()`), and `ac_create_database` validates its reopen. Cost: one extra `CurrentDb()` COM round-trip per tool call — accepted trade-off.
+
+### Multi-object scans must not lie with "0 matches" (v0.7.43)
+`ac_vbe_search_all` / `ac_find_usages` / `ac_find_definition` collect per-object failures into `errors` (capped at `_SEARCH_ERROR_CAP = 20`) + `objects_skipped` + a `warning`, instead of `except: continue`. A VBA project that fails to load (broken reference, Trust Center) makes EVERY object fail — a clean `total: 0` was a false "doesn't exist". Same idea in `ac_list_references`: each reference property is read defensively (broken references raise `com_error` on `FullPath`), never kill the listing.
+
 ### Application.Run via InvokeTypes
 `Application.Run` has 31 params (1 required + 30 optional). pywin32's late-bound `Dispatch` can't handle this. `_invoke_app_run()` calls `_oleobj_.InvokeTypes()` directly with `pythoncom.Missing` padding. Same approach for `Application.Eval` via `_invoke_app_eval()`.
 

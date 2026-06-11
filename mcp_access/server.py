@@ -4,6 +4,7 @@ MCP Server setup: list_tools, list_prompts, get_prompt, call_tool, main.
 
 import asyncio
 import json
+import time
 import traceback
 
 import mcp.types as types
@@ -98,7 +99,15 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     log.info(">>> %s  %s", name, safe_args)
 
     loop = asyncio.get_running_loop()
-    text = await loop.run_in_executor(_com_executor, call_tool_sync, name, arguments)
+    # Mark a tool call as in flight so the global dialog watchdog knows a
+    # persistent modal on an ATTACHED Access instance was provoked by our
+    # (now blocked) COM call and may be dismissed.  Cleared in finally so an
+    # idle session never auto-dismisses the interactive user's dialogs.
+    _Session._tool_started = time.monotonic()
+    try:
+        text = await loop.run_in_executor(_com_executor, call_tool_sync, name, arguments)
+    finally:
+        _Session._tool_started = None
     return [types.TextContent(type="text", text=text)]
 
 

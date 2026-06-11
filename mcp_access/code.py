@@ -404,7 +404,16 @@ def ac_set_code(db_path: str, object_type: str, name: str, code: str) -> str:
         # form/report, inject it via VBE instead of re-importing the whole
         # form definition (which fails for freshly-created forms with no
         # prior SaveAsText baseline).
-        if _looks_like_vba_only(code) and _object_exists(app, object_type, name):
+        if _looks_like_vba_only(code):
+            if not _object_exists(app, object_type, name):
+                # Without this check the VBA-only text would fall through to
+                # LoadFromText and die with an opaque "errors while importing".
+                raise ValueError(
+                    f"{object_type} '{name}' does not exist — VBA-only code can "
+                    f"only be injected into an existing {object_type}. Create it "
+                    f"first (access_create_form) or pass a full definition "
+                    f"(starting with 'Version =' / 'Begin {object_type.capitalize()}')."
+                )
             _inject_vba_after_import(app, object_type, name, code)
             invalidate_object_caches(object_type, name)
             return (

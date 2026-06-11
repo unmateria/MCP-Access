@@ -30,6 +30,7 @@ def _sql_effective_prefix(sql: str) -> str:
         if s.startswith("--"):
             newline = s.find("\n")
             if newline == -1:
+                # Comment with no newline: nothing executable follows.
                 return ""
             s = s[newline + 1:]
             changed = True
@@ -38,7 +39,10 @@ def _sql_effective_prefix(sql: str) -> str:
         if s.startswith("/*"):
             end = s.find("*/")
             if end == -1:
-                return ""
+                # Unclosed block comment — fail CLOSED: classify on the rest
+                # of the text so "/* oops\nDELETE FROM t" still trips the
+                # destructive guard instead of slipping past as "".
+                return s[2:].lstrip().upper()
             s = s[end + 2:]
             changed = True
             continue
@@ -124,12 +128,13 @@ def ac_execute_sql(
 
 def ac_execute_batch(
     db_path: str, statements: list[dict], stop_on_error: bool = True,
-    confirm_destructive: bool = False,
+    confirm_destructive: bool = False, limit: int = 100,
 ) -> dict:
     """
     Executes multiple SQL statements in a single call.
     statements: [{sql: str, label?: str}, ...]
-    SELECT returns rows (limit 100 per statement).
+    SELECT returns rows (default limit 100 per statement, adjustable 1-10000;
+    'truncated': true is set on the entry when rows were cut off).
     INSERT/UPDATE/DELETE returns affected_rows.
     stop_on_error=True stops at first error; False continues and reports all.
     confirm_destructive applies to entire batch.
@@ -175,7 +180,7 @@ def ac_execute_batch(
                         raise RuntimeError(str(first_err)) from first_err
                 fields = [rs.Fields(j).Name for j in range(rs.Fields.Count)]
                 rows: list[dict] = []
-                select_limit = 100
+                select_limit = max(1, min(int(limit), 10000))
                 if not rs.EOF:
                     rs.MoveFirst()
                     while not rs.EOF and len(rows) < select_limit:

@@ -41,6 +41,10 @@ _VBEXT_PK_SET = 2
 _VBEXT_PK_GET = 3
 _ALL_PROC_KINDS = (0, 1, 2, 3)
 
+# Max per-object errors reported by the multi-object scans (search_all /
+# find_usages / find_definition) before collapsing into the skipped count.
+_SEARCH_ERROR_CAP = 20
+
 # Maps regex-captured keyword → VBE kind for ac_vbe_module_info
 _KEYWORD_TO_KIND: dict[str, int] = {
     "sub": 0,
@@ -414,6 +418,10 @@ def ac_vbe_get_lines(
 ) -> str:
     """Reads a range of lines without exporting the entire module."""
     if end_line is not None and count is None:
+        if end_line < start_line:
+            raise ValueError(
+                f"end_line ({end_line}) must be >= start_line ({start_line})"
+            )
         count = end_line - start_line + 1
     if count is None:
         raise ValueError("Either count or end_line must be provided")
@@ -426,6 +434,10 @@ def ac_vbe_get_lines(
     all_code = _cm_all_code(cm, cache_key)
     all_lines = all_code.splitlines()
     total = len(all_lines)
+    if total == 0:
+        raise ValueError(
+            f"Module '{object_name}' is empty (0 lines) — nothing to read."
+        )
     if start_line < 1 or start_line > total:
         raise ValueError(f"start_line {start_line} out of range (1-{total})")
     actual = min(count, total - start_line + 1)
@@ -516,9 +528,15 @@ def ac_vbe_module_info(
                     # in the source text for the matching End keyword.
                     end_kw = ("end property" if keyword.lower().startswith("property")
                               else f"end {keyword}".lower())
+                    # \b + optional trailing comment: "End Sub ' done" is
+                    # valid VBA and must still close the proc.
+                    end_re = re.compile(
+                        r"^\s*" + re.escape(end_kw) + r"\s*(?:'.*)?$",
+                        re.IGNORECASE,
+                    )
                     count = 1
                     for j in range(i - 1, total):  # 0-based scan from declaration
-                        if all_lines[j].strip().lower() == end_kw:
+                        if end_re.match(all_lines[j]):
                             count = (j + 1) - i + 1  # both 1-based, inclusive
                             break
                     procs.append({"name": pname, "keyword": keyword,
@@ -587,6 +605,14 @@ def ac_vbe_replace_lines(
 
     Returns the status + preview of inserted code to avoid an extra get_proc call.
     """
+    if not operations and start_line < 1:
+        # 0 is the "not provided" sentinel from the dispatcher — turn the
+        # cryptic "start_line 0 out of range (1-N)" into an actionable error.
+        raise ValueError(
+            "start_line is required (1-based). Pass start_line/count/new_code "
+            "for a single edit, or operations=[{start_line, count, new_code}, "
+            "...] for batch mode."
+        )
     app = _Session.connect(db_path)
     _close_form_design_view(app, object_type, object_name)
 
@@ -627,6 +653,19 @@ def ac_vbe_replace_lines(
             f"Total: {total_deleted} deleted, {total_inserted} inserted "
             f"→ module now has {new_total} lines"
         )
+        # Same destructive no-op note as single mode: an operation that
+        # deleted lines but inserted nothing usually means new_code arrived
+        # empty (misnamed argument) — surface it instead of hiding it.
+        destructive = [r for r in results if r["deleted"] > 0 and r["inserted"] == 0]
+        if destructive:
+            ops_desc = ", ".join(
+                f"L{r['start_line']} ({r['deleted']} deleted)" for r in destructive
+            )
+            status += (
+                f"\nnote: {len(destructive)} operation(s) deleted lines and "
+                f"inserted nothing: {ops_desc}. If you meant to REPLACE, pass "
+                f"the new text in new_code."
+            )
         if health:
             status += f"\n" + "\n".join(health)
         return status
@@ -735,6 +774,8 @@ def ac_vbe_search_all(
     app = _Session.connect(db_path)
     objects = ac_list_objects(db_path, "all")
     results: list[dict] = []
+    errors: list[dict] = []
+    skipped = 0
     total = 0
     truncated = False
 
@@ -765,12 +806,29 @@ def ac_vbe_search_all(
                         "object_name": obj_name,
                         "matches": obj_matches,
                     })
-            except Exception:
-                continue  # skip objects without accessible CodeModule
+            except Exception as exc:
+                # Never swallow this silently: if the whole VBA project fails
+                # to load (broken reference, Trust Center...) every object
+                # lands here and a clean "0 matches" would be a lie.
+                skipped += 1
+                if len(errors) < _SEARCH_ERROR_CAP:
+                    errors.append({
+                        "object": f"{obj_type}:{obj_name}",
+                        "error": str(exc).splitlines()[0] if str(exc) else repr(exc),
+                    })
+                continue
 
     out: dict = {"total_matches": total, "results": results}
     if truncated:
         out["truncated"] = True
+    if skipped:
+        out["objects_skipped"] = skipped
+        out["errors"] = errors
+        out["warning"] = (
+            f"{skipped} object(s) had no accessible CodeModule — results may "
+            "be incomplete. If ALL objects failed, the VBA project is likely "
+            "not loading (broken reference / Trust Center)."
+        )
     return out
 
 
@@ -834,6 +892,8 @@ def ac_find_usages(
             })
     total = len(vba_matches)
     truncated = vba_result.get("truncated", False)
+    errors: list[dict] = list(vba_result.get("errors", []))
+    skipped = vba_result.get("objects_skipped", 0)
 
     # 2. Query matches — delegates to ac_search_queries
     query_matches: list[dict] = []
@@ -884,7 +944,13 @@ def ac_find_usages(
                                     if total >= max_results:
                                         truncated = True
                                     break
-                except Exception:
+                except Exception as exc:
+                    skipped += 1
+                    if len(errors) < _SEARCH_ERROR_CAP:
+                        errors.append({
+                            "object": f"{obj_type}:{obj_name}",
+                            "error": str(exc).splitlines()[0] if str(exc) else repr(exc),
+                        })
                     continue
 
     out: dict = {
@@ -896,6 +962,14 @@ def ac_find_usages(
     }
     if truncated:
         out["truncated"] = True
+    if skipped:
+        out["objects_skipped"] = skipped
+        out["errors"] = errors
+        out["warning"] = (
+            f"{skipped} object(s) could not be scanned — results may be "
+            "incomplete. If ALL objects failed, the VBA project is likely "
+            "not loading (broken reference / Trust Center)."
+        )
     return out
 
 
@@ -1382,6 +1456,8 @@ def ac_find_definition(
     app = _Session.connect(db_path)
     objects = ac_list_objects(db_path, "all")
     definitions: list[dict] = []
+    errors: list[dict] = []
+    skipped = 0
 
     def _stop() -> bool:
         return first_only and bool(definitions)
@@ -1396,8 +1472,16 @@ def ac_find_definition(
                 cm = _get_code_module(app, obj_type, obj_name)
                 cache_key = f"{obj_type}:{obj_name}"
                 all_code = _cm_all_code(cm, cache_key)
-            except Exception:
-                continue  # skip modules we cannot access
+            except Exception as exc:
+                # Surface inaccessible modules instead of silently reporting
+                # "0 definitions" when the whole VBA project fails to load.
+                skipped += 1
+                if len(errors) < _SEARCH_ERROR_CAP:
+                    errors.append({
+                        "object": f"{obj_type}:{obj_name}",
+                        "error": str(exc).splitlines()[0] if str(exc) else repr(exc),
+                    })
+                continue
             if not all_code:
                 continue
 
@@ -1615,8 +1699,17 @@ def ac_find_definition(
                                 if _stop():
                                     break
 
-    return {
+    out: dict = {
         "symbol": symbol,
         "total": len(definitions),
         "definitions": definitions,
     }
+    if skipped:
+        out["objects_skipped"] = skipped
+        out["errors"] = errors
+        out["warning"] = (
+            f"{skipped} object(s) had no accessible CodeModule — results may "
+            "be incomplete. If ALL objects failed, the VBA project is likely "
+            "not loading (broken reference / Trust Center)."
+        )
+    return out

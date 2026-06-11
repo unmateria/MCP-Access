@@ -145,6 +145,12 @@ class _Session:
     _cm_cache: dict = {}   # "type:name" -> CodeModule COM object
     _decompiled_dbs: set = set()  # DBs already decompiled in this session
     _attached: bool = False  # True if we attached via GetActiveObject; False if we spawned via DispatchEx
+    # time.monotonic() when a tool call entered the COM executor; None when
+    # idle.  Set/cleared by server.call_tool around run_in_executor.  Lets the
+    # global dialog watchdog distinguish a modal raised by OUR blocked COM
+    # call (dismiss it) from one the interactive user is looking at (leave it)
+    # on attached instances.  Plain attribute read/write — atomic under GIL.
+    _tool_started: Optional[float] = None
     # Detected Office install. Defaults are the hardcoded fallback used pre-0.7.36.
     # _detect_office_install() runs once per process and updates these in place.
     _office_version: str = "16.0"
@@ -161,6 +167,27 @@ class _Session:
             except Exception:
                 log.warning("COM session stale — auto-reconnecting...")
                 cls._force_cleanup()
+            else:
+                # The app proxy can be alive while the database has been
+                # closed under us (e.g. by its own startup code, or by the
+                # user in an attached instance).  A stale _db_open wedges
+                # every later CurrentDb/CurrentData call with "object is
+                # closed or doesn't exist" — and on attached instances
+                # reconnects re-attach to the same broken instance forever.
+                # CurrentDb() costs one extra COM round-trip per tool call;
+                # acceptable (~ms) for the recovery it buys.
+                if cls._db_open is not None:
+                    db_alive = False
+                    try:
+                        db_alive = cls._app.CurrentDb() is not None
+                    except Exception:
+                        pass
+                    if not db_alive:
+                        log.warning(
+                            "Database closed under the session (%s) — "
+                            "auto-reconnecting...", cls._db_open,
+                        )
+                        cls._force_cleanup()
         if cls._app is None:
             cls._launch()
         if cls._db_open != resolved:
@@ -198,11 +225,14 @@ class _Session:
         run_vba) react faster and screenshot first; the grace period keeps
         this thread from stealing their dialog.
 
-        Only runs when WE spawned Access (never auto-dismisses an attached
-        interactive user's dialogs)."""
-        if cls._attached:
-            cls._stop_dialog_watchdog()
-            return
+        On spawned instances every persistent dialog is ours to dismiss.
+        On ATTACHED instances (user's own Access) we only dismiss while one
+        of OUR tool calls is in flight (_tool_started) — a modal raised then
+        was almost certainly provoked by that blocked COM call (e.g. a VBA
+        project that fails to load popping 'Error accessing file. Network
+        connection may have been lost.'), and without dismissal the tool
+        call hangs until a human clicks.  A dialog with no tool call in
+        flight belongs to the interactive user and is never touched."""
         pid = cls._pid
         if not pid:
             return
@@ -213,7 +243,8 @@ class _Session:
 
         def _loop():
             from .vba_exec import _find_dialog_hwnds_by_pid, _dismiss_dialogs_by_pid
-            GRACE = 3.0   # s a dialog must persist before we force-dismiss
+            GRACE = 3.0            # s a dialog must persist before we force-dismiss
+            GRACE_ATTACHED = 5.0   # more conservative on the user's own Access
             POLL = 0.5
             seen: dict = {}   # hwnd -> monotonic first-seen
             while not stop.wait(POLL):
@@ -227,11 +258,20 @@ class _Session:
                         del seen[h]
                 for h in hwnds:
                     seen.setdefault(h, now)
-                stale = [h for h in hwnds if now - seen.get(h, now) >= GRACE]
+                attached = cls._attached
+                grace = GRACE_ATTACHED if attached else GRACE
+                if attached:
+                    # Only act while one of our tool calls has been blocked
+                    # at least as long as the grace period.
+                    started = cls._tool_started
+                    if started is None or now - started < grace:
+                        continue
+                stale = [h for h in hwnds if now - seen.get(h, now) >= grace]
                 if stale:
                     log.warning(
                         "Global dialog watchdog: %d dialog(s) persisted >%.0fs "
-                        "(pid=%s) -- dismissing", len(stale), GRACE, pid,
+                        "(pid=%s, attached=%s) -- dismissing",
+                        len(stale), grace, pid, attached,
                     )
                     try:
                         _dismiss_dialogs_by_pid(pid)
@@ -243,7 +283,8 @@ class _Session:
                              daemon=True)
         cls._wd_thread = t
         t.start()
-        log.info("Global dialog watchdog started (pid=%s, grace=%.1fs)", pid, 3.0)
+        log.info("Global dialog watchdog started (pid=%s, attached=%s)",
+                 pid, cls._attached)
 
     @classmethod
     def _stop_dialog_watchdog(cls) -> None:
@@ -711,6 +752,43 @@ class _Session:
         if _dialog_screenshots:
             log.warning("A blocking dialog was auto-dismissed. Screenshot: %s",
                         _dialog_screenshots[0])
+
+        # Post-open validation: confirm the database actually stayed open.
+        # Startup code can close the database during an automated open — e.g.
+        # an AutoExec/startup-form error path firing because backend links are
+        # broken, with AllowBypassKey=False defeating the SHIFT bypass (the
+        # watchdog's Cancel click then routes through the form's error
+        # handler, which closes the db).  Without this check, _db_open would
+        # record a database that isn't there, and every later call would die
+        # at CurrentDb/CurrentData with "object is closed or doesn't exist",
+        # wedging the session permanently.  Also covers the case where the
+        # "already have the database open" swallow above masked a dead db.
+        db_alive = False
+        try:
+            db_alive = cls._app.CurrentDb() is not None
+        except Exception as e_val:
+            log.warning("Post-open validation raised: %s", e_val)
+        if not db_alive:
+            log.error(
+                "Database closed itself during open: %s — resetting session",
+                path,
+            )
+            # quit() does the right thing for both cases: spawned instances
+            # are quit (taskkill fallback included); attached instances are
+            # released without touching the user's Access.
+            try:
+                cls.quit()
+            except Exception as e_q:
+                log.warning("Session teardown after failed open: %s", e_q)
+                cls._force_cleanup()
+            raise RuntimeError(
+                f"Database closed itself while opening: {path}. Its startup "
+                "code (AutoExec / startup form) most likely failed and closed "
+                "the database — common causes: missing backend table links, "
+                "or AllowBypassKey=False defeating the SHIFT bypass. The COM "
+                "session has been reset; open the file manually in Access "
+                "while holding SHIFT to investigate."
+            )
 
         cls._db_open = path
 

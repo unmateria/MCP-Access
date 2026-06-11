@@ -576,6 +576,7 @@ def call_tool_sync(name: str, arguments: dict) -> str:
                 arguments["statements"],
                 stop_on_error=bool(arguments.get("stop_on_error", True)),
                 confirm_destructive=bool(arguments.get("confirm_destructive", False)),
+                limit=int(arguments.get("limit", 100)),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 

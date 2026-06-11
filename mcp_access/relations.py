@@ -304,6 +304,16 @@ def ac_list_references(db_path: str) -> dict:
         refs_col = app.VBE.ActiveVBProject.References
     except Exception as exc:
         raise RuntimeError(f"Could not access VBE. Error: {exc}")
+    def _prop(ref, name, default=None):
+        # Every property of a broken reference can raise com_error — e.g.
+        # FullPath on a TYPE_E_LIBNOTREGISTERED library. Read each one
+        # defensively so ONE broken reference doesn't kill the whole call
+        # (listing references is exactly how you diagnose the broken one).
+        try:
+            return getattr(ref, name)
+        except Exception:
+            return default
+
     refs: list[dict] = []
     for i in range(1, refs_col.Count + 1):  # VBA collections are 1-based
         ref = refs_col(i)
@@ -315,17 +325,29 @@ def ac_list_references(db_path: str) -> dict:
             built_in = bool(ref.BuiltIn)
         except Exception:
             built_in = False
-        refs.append({
-            "name": ref.Name,
-            "description": ref.Description,
-            "full_path": ref.FullPath,
-            "guid": ref.GUID if ref.GUID else "",
-            "major": ref.Major,
-            "minor": ref.Minor,
-            "is_broken": is_broken,
+        full_path = _prop(ref, "FullPath")
+        guid = _prop(ref, "GUID")
+        entry = {
+            "name": _prop(ref, "Name", "<unreadable>"),
+            "description": _prop(ref, "Description"),
+            "full_path": full_path,
+            "guid": guid if guid else "",
+            "major": _prop(ref, "Major"),
+            "minor": _prop(ref, "Minor"),
+            "is_broken": is_broken or full_path is None,
             "built_in": built_in,
-        })
-    return {"count": len(refs), "references": refs}
+        }
+        refs.append(entry)
+    broken = sum(1 for r in refs if r["is_broken"])
+    out: dict = {"count": len(refs), "references": refs}
+    if broken:
+        out["broken_count"] = broken
+        out["warning"] = (
+            f"{broken} broken reference(s) — the VBA project may fail to "
+            "load/compile until fixed (access_manage_reference can remove or "
+            "re-add them)."
+        )
+    return out
 
 
 def ac_manage_reference(

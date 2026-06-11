@@ -331,6 +331,32 @@ The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/s
 
 ## Changelog
 
+### v0.7.43 — 2026-06-11
+
+Wedged-session detection — thanks to
+[@CaptainStormfield](https://github.com/CaptainStormfield)
+([#30](https://github.com/unmateria/MCP-Access/pull/30)) — plus a usability
+bughunt round.
+
+- **Fix:** a database whose startup code closes it during the open no longer
+  wedges the COM session permanently. The open is validated (`CurrentDb()`),
+  the session resets itself, and every tool call health-checks that the db is
+  still open (auto-reconnect if not). Based on PR #30 by @CaptainStormfield.
+- **Fix:** the global dialog watchdog now also protects ATTACHED Access
+  instances — a modal raised by one of our blocked COM calls (e.g. a VBA
+  project that fails to load) is dismissed after a 5 s grace, instead of
+  hanging the tool call until a human clicks. Idle dialogs of the interactive
+  user are never touched.
+- **Fix:** `access_vbe_search_all` / `access_find_usages` /
+  `access_find_definition` report `objects_skipped` + `errors` instead of a
+  false "0 matches" when modules are inaccessible.
+- **Fix:** `access_list_references` survives broken references (per-property
+  fallback to `null`, `is_broken` flag, `broken_count`).
+- **DX:** clearer errors for omitted `start_line` (`access_vbe_replace_lines`),
+  VBA-only code on a non-existent form (`access_set_code`), and empty modules
+  (`access_vbe_get_lines`); batch replace warns on destructive no-op deletes;
+  `access_execute_batch` gained a `limit` parameter.
+
 ### v0.7.42 — 2026-06-06
 
 VBE procedure-editing fixes from field reports.

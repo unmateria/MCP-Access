@@ -1,5 +1,76 @@
 # Changelog
 
+## 0.7.43 — 2026-06-11
+
+Wedged-session detection — thanks to
+[@CaptainStormfield](https://github.com/CaptainStormfield)
+([#30](https://github.com/unmateria/MCP-Access/pull/30)) — plus a usability
+bughunt round across the whole server. No new tools — tool count stays **66**.
+
+### Fixed
+
+- **Self-closing databases no longer wedge the COM session permanently**
+  (from PR #30 by @CaptainStormfield, reimplemented with refinements). Two
+  holes worked together: `_switch()` recorded `_db_open` without verifying the
+  database actually stayed open (a startup form erroring out — e.g. broken
+  backend links with `AllowBypassKey=False` defeating the SHIFT bypass — can
+  close the db during the open), and `connect()`'s health check only probed
+  `app.Visible`, which passes on an Access instance whose database was closed
+  under it. On attached instances, reconnects re-attached to the same broken
+  instance forever. Now: `_switch()` validates `CurrentDb()` after the open and
+  raises an actionable error (naming AutoExec/startup-form failure, broken
+  links, `AllowBypassKey=False`) after resetting the session via `quit()`;
+  `connect()` detects a dead db on an otherwise-alive instance and
+  auto-reconnects with a specific log message. The same post-open validation
+  was added to `access_create_database`'s reopen path (a gap the PR didn't
+  cover).
+- **Modal dialogs no longer hang VBE tool calls on ATTACHED Access instances.**
+  The v0.7.40 global dialog watchdog was disabled entirely when the session
+  attached to the user's running Access (to never dismiss an interactive
+  user's dialogs) — but that left any modal provoked by OUR blocked COM call
+  (e.g. *"Error accessing file. Network connection may have been lost."* from
+  a VBA project with a `TYPE_E_LIBNOTREGISTERED` reference) hanging the tool
+  call until a human clicked, observed for ~1 hour in the field. The watchdog
+  now also runs on attached instances but only dismisses dialogs while one of
+  our tool calls has been in flight longer than a conservative 5 s grace
+  (vs 3 s for spawned). A dialog with no tool call in flight belongs to the
+  interactive user and is never touched.
+- **`access_vbe_search_all` / `access_find_usages` / `access_find_definition`
+  no longer report a clean `total: 0` when modules are inaccessible.** Each
+  per-object failure used to be swallowed (`except: continue`) — so a VBA
+  project that fails to load returned "0 matches", a false *"it doesn't
+  exist"*. Results now include `objects_skipped`, an `errors` list (capped at
+  20) and a warning when anything was skipped.
+- **`access_list_references` no longer dies on a broken reference.** Reading
+  `FullPath` on an unregistered library raises `com_error` and killed the whole
+  call — exactly when you need the tool most. Every property is now read
+  defensively (`null` on failure, reference marked `is_broken`), and the
+  result carries `broken_count` + a warning.
+- **Unclosed `/* ...` block comment no longer slips past the destructive-SQL
+  guard.** `_sql_effective_prefix` returned `""` for an unclosed comment, so
+  `/*\nDELETE FROM t` was classified non-destructive. Now fails closed by
+  classifying the remaining text.
+- **`access_set_code` with VBA-only code for a non-existent form/report** now
+  raises a clear error ("create it first with access_create_form, or pass a
+  full definition") instead of falling through to `LoadFromText` and dying
+  with an opaque *"errors while importing"*.
+- **`access_vbe_module_info` text fallback** (used when VBE can't locate a
+  proc variant) now recognises `End Sub ' comment` — a trailing comment after
+  the End keyword no longer breaks the proc-length scan.
+
+### Improved
+
+- **`access_vbe_replace_lines`**: omitting `start_line` in single mode now
+  raises *"start_line is required (1-based)…"* instead of the cryptic
+  *"start_line 0 out of range (1-N)"*. Batch mode gained the same
+  destructive-delete note single mode already had (operations that delete
+  lines but insert nothing are called out — the misnamed-argument footgun).
+- **`access_execute_batch`**: new optional `limit` parameter for SELECT rows
+  per statement (1-10000, default 100 — previously hardcoded).
+- **`access_vbe_get_lines`**: an empty module now reports *"module is empty
+  (0 lines)"* instead of *"start_line 1 out of range (1-0)"*, and
+  `end_line < start_line` is rejected with a clear message.
+
 ## 0.7.42 — 2026-06-06
 
 VBE procedure-editing fixes from field reports (thanks to
