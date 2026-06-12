@@ -543,6 +543,7 @@ def call_tool_sync(name: str, arguments: dict) -> str:
             result = ac_eval_vba(
                 arguments["db_path"],
                 arguments["expression"],
+                timeout=arguments.get("timeout"),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 

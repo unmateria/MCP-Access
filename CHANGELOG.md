@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.7.44 — 2026-06-12
+
+Follow-ups to the attached-mode dialog hangs reported by
+[@CaptainStormfield](https://github.com/CaptainStormfield)
+([#31](https://github.com/unmateria/MCP-Access/issues/31)). The core complaint
+(global watchdog disabled on attached instances) was already fixed in v0.7.43,
+released the same day as the reported incidents — the remaining gaps are
+closed here. No new tools — tool count stays **66**.
+
+### Fixed
+
+- **`access_eval_vba` gains an optional `timeout` parameter** — same dialog
+  watchdog treatment as `access_run_vba`. With it, a MsgBox/InputBox (or any
+  modal) raised by the evaluated expression is auto-dismissed and an
+  actionable error returned, instead of relying solely on the global
+  watchdog's grace period. Covers both `Application.Eval` and the temp-module
+  fallback (which runs via `Application.Run` and is just as blockable). (#31)
+- **Stale `_mcp_eval_wrapper` temp modules no longer wedge the session.**
+  When the eval fallback's `VBComponents.Remove` failed (e.g. a modal was
+  blocking), the orphan module's dangling name broke every later call with
+  *"cannot find the procedure 'Module1._mcp_eval_wrapper'"* until a full
+  reconnect. The fallback now sweeps leftover marker-tagged std modules
+  before creating a new one (best-effort, scans only the first lines of each
+  std module). (#31)
+- **`access_delete_object` no longer triggers the *"Do you want to save
+  changes to the design of module X?"* prompt.** Dirty VBA modules (often
+  left by user code run via eval, e.g. a `VBComponents.Add`) are persisted
+  best-effort before `DoCmd.DeleteObject` — `RunCommand acCmdSaveAllModules`
+  (280), falling back to per-module `DoCmd.Save`. Deliberately NOT applied to
+  close/quit paths: on attached instances that would silently persist the
+  interactive user's half-finished VBE edits without being asked. (#31)
+- **Watchdog dismissals are now surfaced in the tool result.** Every dialog
+  auto-dismissed by any watchdog records its title; if it happened while a
+  tool call was in flight, the result gains a note naming the dialog —
+  converting a silent dismissal (whose Cancel may have altered the outcome)
+  into a traceable event. (#31)
+
 ## 0.7.43 — 2026-06-11
 
 Wedged-session detection — thanks to

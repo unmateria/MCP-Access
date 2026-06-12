@@ -948,6 +948,10 @@ TOOLS = [
                     "type": "string",
                     "description": "Expression to evaluate (e.g.: 'Forms!frmX.MARGEN_SEG', 'Date()', 'DLookup(\"Empresa\",\"Ventas\",\"numc=1\")')",
                 },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Timeout in seconds. If the expression (or its temp-module fallback) blocks on a MsgBox/InputBox or other modal dialog, it is auto-dismissed and an error is returned -- same behaviour as access_run_vba",
+                },
             },
             "required": ["db_path", "expression"],
         },

@@ -151,6 +151,11 @@ class _Session:
     # call (dismiss it) from one the interactive user is looking at (leave it)
     # on attached instances.  Plain attribute read/write — atomic under GIL.
     _tool_started: Optional[float] = None
+    # (time.monotonic(), dialog_title) of the last dialog auto-dismissed by
+    # any watchdog (all funnel through _dismiss_dialogs_by_pid).  server.call_tool
+    # compares the timestamp against the call's start to append a diagnostic
+    # note ("a modal dialog was auto-dismissed during this call") to the result.
+    _last_dismissed: Optional[tuple] = None
     # Detected Office install. Defaults are the hardcoded fallback used pre-0.7.36.
     # _detect_office_install() runs once per process and updates these in place.
     _office_version: str = "16.0"

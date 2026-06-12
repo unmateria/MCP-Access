@@ -122,6 +122,15 @@ def _dismiss_dialogs_by_pid(pid: int, screenshot_holder: Optional[list] = None) 
     if not found:
         return False
 
+    # Record what we are about to dismiss so server.call_tool can attach a
+    # diagnostic note to the tool result (issue #31: silent dismissals made
+    # wrong results impossible to trace back to the dialog).
+    try:
+        title = win32gui.GetWindowText(found[0]) or "<untitled>"
+    except Exception:
+        title = "<unknown>"
+    _Session._last_dismissed = (time.monotonic(), title)
+
     # Capture screenshot of first dialog before dismissing
     if screenshot_holder is not None:
         try:
@@ -336,9 +345,45 @@ def _invoke_app_eval(app, expression: str):
     )
 
 
+def _sweep_orphan_eval_modules(proj) -> list:
+    """Remove leftover temp standard modules from previous eval fallbacks,
+    identified by the `_mcp_eval_wrapper` marker in their first lines.
+
+    A failed `VBComponents.Remove` in `_eval_via_temp_module` (e.g. a modal
+    dialog blocking the call) leaves an orphan module whose dangling name
+    wedges later calls with "cannot find the procedure
+    'Module1._mcp_eval_wrapper'" (issue #31).  Best-effort: never raises.
+    """
+    removed: list = []
+    try:
+        comps = proj.VBComponents
+        # Reverse iteration: Remove() reindexes the 1-based collection.
+        for i in range(comps.Count, 0, -1):
+            try:
+                comp = comps.Item(i)
+                if comp.Type != 1:  # vbext_ct_StdModule
+                    continue
+                cm = comp.CodeModule
+                total = cm.CountOfLines
+                # The wrapper is inserted at line 1 -- only the first few
+                # lines need scanning, so big user modules are not read.
+                if total and "_mcp_eval_wrapper" in cm.Lines(1, min(total, 10)):
+                    name = comp.Name
+                    comps.Remove(comp)
+                    removed.append(name)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    if removed:
+        log.warning("Swept orphan eval temp module(s): %s", removed)
+    return removed
+
+
 def _eval_via_temp_module(app, expression: str, original_exc: Exception):
     """Fallback: create temp standard module with wrapper function, run it, clean up."""
     proj = _get_vb_project(app)
+    _sweep_orphan_eval_modules(proj)
     comp = None
     temp_name = "<unnamed temp module>"  # pre-bind for the finally log
     try:
@@ -371,19 +416,54 @@ def _eval_via_temp_module(app, expression: str, original_exc: Exception):
             try:
                 proj.VBComponents.Remove(comp)
             except Exception:
-                log.warning("Could not remove temp module '%s'", temp_name)
+                log.warning(
+                    "Could not remove temp module '%s' -- it will be swept "
+                    "on the next eval fallback", temp_name,
+                )
 
 
-def ac_eval_vba(db_path: str, expression: str) -> dict:
-    """Evaluates a VBA/Access expression via Application.Eval with auto-fallback."""
+def ac_eval_vba(db_path: str, expression: str, timeout: Optional[int] = None) -> dict:
+    """Evaluates a VBA/Access expression via Application.Eval with auto-fallback.
+
+    If the evaluated expression blocks on a MsgBox/InputBox (or any modal
+    dialog) and timeout is passed, the dialog is auto-dismissed and an error
+    is returned -- same watchdog treatment as ac_run_vba.  The watchdog covers
+    both Application.Eval and the temp-module fallback (which runs via
+    Application.Run and is just as blockable).
+    """
     app = _Session.connect(db_path)
 
-    # 1. Try Application.Eval first
+    stop_event = None
+    dismissed: list = []
+    dialog_screenshots: list = []
+    if timeout:
+        # Capture hwnd on main thread (COM is apartment-threaded)
+        _h = app.hWndAccessApp
+        hwnd = int(_h() if callable(_h) else _h)
+        stop_event = threading.Event()
+        watchdog = threading.Thread(
+            target=_dialog_watchdog,
+            args=[hwnd, stop_event, dismissed, dialog_screenshots, 2.0],
+            daemon=True,
+        )
+        watchdog.start()
     try:
-        result = _invoke_app_eval(app, expression)
-    except Exception as eval_exc:
-        # 2. Fallback: wrap in a temp standard module function
-        result = _eval_via_temp_module(app, expression, eval_exc)
+        # 1. Try Application.Eval first
+        try:
+            result = _invoke_app_eval(app, expression)
+        except Exception as eval_exc:
+            # 2. Fallback: wrap in a temp standard module function
+            result = _eval_via_temp_module(app, expression, eval_exc)
+    except Exception:
+        if dismissed:
+            detail = f"'{expression}' -- eval error (dialog auto-dismissed)."
+            if dialog_screenshots:
+                detail += f" Screenshot: {dialog_screenshots[0]}"
+            raise RuntimeError(detail)
+        raise
+    finally:
+        if stop_event:
+            stop_event.set()
 
     # serialize result
     if result is not None:
