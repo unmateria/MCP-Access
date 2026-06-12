@@ -331,6 +331,23 @@ The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/s
 
 ## Changelog
 
+### v0.7.44 — 2026-06-12
+
+Follow-ups to the attached-mode dialog hangs reported by
+[@CaptainStormfield](https://github.com/CaptainStormfield)
+([#31](https://github.com/unmateria/MCP-Access/issues/31)).
+
+- **Fix:** `access_eval_vba` gains an optional `timeout` parameter — same
+  dialog-watchdog treatment as `access_run_vba`, covering both
+  `Application.Eval` and the temp-module fallback.
+- **Fix:** stale `_mcp_eval_wrapper` temp modules (left behind when a modal
+  blocked their cleanup) no longer wedge the session — they are swept before
+  the next eval fallback.
+- **Fix:** `access_delete_object` saves dirty VBA modules best-effort before
+  deleting, preventing the *"save changes to the design of module X?"* prompt.
+- **DX:** any dialog auto-dismissed by a watchdog during a tool call is now
+  named in the tool result, instead of being dismissed silently.
+
 ### v0.7.43 — 2026-06-11
 
 Wedged-session detection — thanks to
