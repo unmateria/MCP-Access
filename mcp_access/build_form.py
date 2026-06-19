@@ -7,9 +7,18 @@ that whole class of error by taking the arithmetic away from the LLM. The model
 describes the form *declaratively* — a title, an ordered list of fields, a row
 of action buttons, single- or two-column — and this module computes every
 Left/Top/Width/Height from the canonical grid in :mod:`mcp_access.design_defaults`,
-applies the closed palette, assigns a sane tab order and sizes the form and its
-sections. The model never touches a coordinate (it can still fine-tune
-afterwards with ``access_set_control_props``).
+applies a palette, assigns a sane tab order and sizes the form and its sections.
+
+Themes (``theme=``)
+-------------------
+- ``light``  — default. Calibri, white fields, dark title on the themed header.
+- ``plain``  — geometry only, no colours/fonts.
+- ``polish`` — Segoe UI, more air, and the database chrome (record selectors,
+  navigation buttons, scrollbars, dividing lines) turned off.
+- ``flat``   — modern flat look on top of ``polish``: a solid accent header band
+  and flat coloured buttons (built with Rectangles + a transparent click layer,
+  the only reliable way to colour these in native Access), a bordered card
+  around the fields, grey canvas. Stays lint-clean by construction.
 
 The geometry is produced by the pure function :func:`_plan_layout` (no COM, unit
 tested); :func:`ac_build_form` just walks the plan against a single Design-view
@@ -31,6 +40,8 @@ from . import design_defaults as D
 _AC_DETAIL, _AC_HEADER, _AC_FOOTER = 0, 1, 2
 _SECTION_LABEL = {_AC_DETAIL: "Detail", _AC_HEADER: "FormHeader",
                   _AC_FOOTER: "FormFooter"}
+
+_WHITE = D.bgr(255, 255, 255)
 
 # Spec "control" keyword → (CTRL_TYPE name, flags). flags drive styling/sizing.
 _CONTROL_MAP = {
@@ -59,6 +70,56 @@ _CONTROL_MAP = {
     "datepicker": ("TextBox", {"date"}),
 }
 
+_PREFIX = {"TextBox": "txt", "ComboBox": "cbo", "ListBox": "lst",
+           "CheckBox": "chk", "Label": "lbl"}
+
+
+def _resolve_theme(name: str) -> dict:
+    """Resolve a theme name into a flat config the planner reads.
+
+    ``light``/``plain``/``polish``/``flat`` are literal branches (unchanged).
+    A name in :data:`design_defaults.DIRECTIONS` is a *curated design direction*
+    — a coherent typeface + type scale + WCAG-verified palette + density. It is
+    expanded onto the same flat keys, plus two extra keys the planner reads
+    defensively: ``palette`` (the direction's BGR dict) and ``title_font`` (the
+    display typeface for the form title).
+    """
+    name = (name or "light").lower()
+    t = {
+        "name": name, "styled": True, "font": D.BASE_FONT,
+        "title_size": D.TITLE_FONT_SIZE, "label_size": D.LABEL_FONT_SIZE,
+        "field_size": D.FIELD_FONT_SIZE,
+        "margin": D.MARGIN_X, "margin_y": D.MARGIN_Y, "row_gap": D.ROW_GAP,
+        "chrome_off": False, "header_band": False, "card": False,
+        "flat_buttons": False, "canvas": None,
+    }
+    if name in D.DIRECTIONS:
+        dr = D.DIRECTIONS[name]
+        fonts, scale, dens = dr["fonts"], dr["scale"], D.DENSITY[dr["density"]]
+        pal = dr["palette"]
+        t.update(
+            font=fonts["body"], title_font=fonts["display"],
+            title_size=scale["title"], label_size=scale["caption"],
+            field_size=scale["body"],
+            margin=dens["margin"], margin_y=dens["margin_y"],
+            row_gap=dens["row_gap"],
+            card=dr["card"], canvas=pal["form_bg"], palette=pal,
+            **D.DIRECTION_COMMON,
+        )
+    elif name == "plain":
+        t["styled"] = False
+    elif name == "polish":
+        t.update(font="Segoe UI", title_size=18, margin_y=300, row_gap=180,
+                 chrome_off=True)
+    elif name == "flat":
+        # flat_buttons (the rect+label+transparent-button hack) is OFF: native
+        # command buttons centre their caption and just look cleaner. The modern
+        # feel comes from the accent header band + card + grey canvas + no chrome.
+        t.update(font="Segoe UI", title_size=18, margin=300, margin_y=300,
+                 row_gap=180, chrome_off=True, header_band=True, card=True,
+                 flat_buttons=False, canvas=D.PALETTE["form_bg"])
+    return t
+
 
 def _ident(raw: str, prefix: str = "") -> str:
     """Turn a field caption into a safe control name (alnum, CamelCase tail)."""
@@ -80,20 +141,43 @@ def _normalise_field(f: Any) -> dict:
     return dict(f)
 
 
+def _looks_unbound(field: str) -> bool:
+    """A field name with spaces/operators isn't a plain column → leave unbound."""
+    return bool(re.search(r"[ =()\[\]!.]", field or ""))
+
+
+def _rect(name: str, section: int, left: int, top: int, width: int, height: int,
+          fill: int, border_color: Optional[int]) -> dict:
+    """A decorative Rectangle (solid fill, optional border). Rectangles honour
+    BackColor reliably, unlike theme-tinted form sections."""
+    props = {"BackStyle": 1, "BackColor": fill}
+    if border_color is not None:
+        props.update({"BorderStyle": 1, "BorderColor": border_color, "BorderWidth": 1})
+    else:
+        props["BorderStyle"] = 0
+    return {"role": "decoration", "section": section, "type_name": "Rectangle",
+            "name": name, "left": left, "top": top, "width": width,
+            "height": height, "props": props}
+
+
 def _plan_layout(fields: list, actions: list, title: Optional[str],
                  layout: str, theme: str) -> dict:
-    """Pure geometry planner. Returns form_width, section heights and a flat
-    list of control specs with computed twip rects + styling props.
+    """Pure geometry planner. Returns form_width, section heights, the canvas
+    colour and a flat, z-ordered list of control specs with computed twip rects.
 
-    No COM here — this is the deterministic core the LLM never has to reason
-    about, and it is what the unit tests exercise.
+    No COM here — this is the deterministic core the LLM never reasons about, and
+    it is what the unit tests exercise. Background decorations are emitted before
+    their foreground siblings so Access' create-order z-stacking puts them behind.
     """
-    styled = theme != "plain"
-    pal = D.PALETTE
+    T = _resolve_theme(theme)
+    styled = T["styled"]
+    pal = T.get("palette", D.PALETTE)   # a direction carries its own palette
+    font = T["font"]
+    title_font = T.get("title_font", font)   # display typeface for the title
+    MARGIN_X, MARGIN_Y, ROW_GAP = T["margin"], T["margin_y"], T["row_gap"]
+
     layout = (layout or "single").lower()
-    if layout not in ("single", "two-column", "two_column", "twocolumn"):
-        layout = "single"
-    two_col = layout != "single"
+    two_col = layout not in ("single", "")
     cols = 2 if two_col else 1
 
     fields = [_normalise_field(f) for f in (fields or [])]
@@ -101,7 +185,6 @@ def _plan_layout(fields: list, actions: list, title: Optional[str],
     need_header = bool(title)
     need_footer = bool(actions)
 
-    controls: list[dict] = []
     used_names: set[str] = set()
 
     def _unique(name: str) -> str:
@@ -115,7 +198,7 @@ def _plan_layout(fields: list, actions: list, title: Optional[str],
     def _label_style(caption: str) -> dict:
         p: dict = {"Caption": caption}
         if styled:
-            p.update({"FontName": D.BASE_FONT, "FontSize": D.LABEL_FONT_SIZE,
+            p.update({"FontName": font, "FontSize": T["label_size"],
                       "FontWeight": D.FONT_WEIGHT_NORMAL, "ForeColor": pal["text"]})
         return p
 
@@ -128,30 +211,27 @@ def _plan_layout(fields: list, actions: list, title: Optional[str],
         if fl.get("row_source"):
             p["RowSource"] = str(fl["row_source"])
         if styled and "checkbox" not in flags:
-            p.update({"FontName": D.BASE_FONT, "FontSize": D.FIELD_FONT_SIZE,
+            p.update({"FontName": font, "FontSize": T["field_size"],
                       "ForeColor": pal["text"], "BackColor": pal["field_bg"],
                       "BackStyle": 1, "BorderStyle": 1,
                       "BorderColor": pal["field_border"]})
-        # Checkboxes carry no colour props — CreateControl rejects ForeColor/
-        # BackColor on a CheckBox ("Property 'CreateControl.ForeColor' can not
-        # be set"); the box uses the theme. Leave it unstyled.
-        # Per-field escape hatch: explicit props win over computed defaults.
+        # CheckBoxes carry no colour props — CreateControl rejects ForeColor on
+        # a CheckBox; it uses the theme.
         if isinstance(fl.get("props"), dict):
             p.update(fl["props"])
         return p
 
-    # --- field geometry -----------------------------------------------------
+    # --- field geometry into a Detail list ---------------------------------
     col_w = D.LABEL_W + D.GAP_LABEL + D.FIELD_W
-    x_field0 = D.MARGIN_X + D.LABEL_W + D.GAP_LABEL
-    y = D.MARGIN_Y
-    max_right = D.MARGIN_X + col_w  # running max for single-col width
+    y = MARGIN_Y
+    max_right = MARGIN_X + col_w
+    detail: list[dict] = []
 
     def _emit_row(row_fields: list, top: int) -> int:
-        """Place a row of 1..cols (label,field) pairs at `top`; return row height."""
         nonlocal max_right
         row_h = D.ROW_H
         for ci, fl in enumerate(row_fields):
-            field = str(fl.get("field", "") or fl.get("name", "") or f"Campo{len(controls)}")
+            field = str(fl.get("field", "") or fl.get("name", "") or f"Campo{len(detail)}")
             ctl_kw = str(fl.get("control", "textbox")).lower().strip()
             type_name, flags = _CONTROL_MAP.get(ctl_kw, ("TextBox", set()))
             caption = fl.get("label")
@@ -161,7 +241,6 @@ def _plan_layout(fields: list, actions: list, title: Optional[str],
             if bound is None and fl.get("bind", True) is not False:
                 bound = field if not _looks_unbound(field) else None
 
-            # widths/heights
             if "memo" in flags:
                 fh = D.snap(fl.get("height", D.MEMO_H))
             else:
@@ -169,23 +248,23 @@ def _plan_layout(fields: list, actions: list, title: Optional[str],
             if "checkbox" in flags:
                 fw = D.CHECKBOX_W
             elif two_col:
-                fw = D.FIELD_W   # two-column keeps a strict grid; width_units ignored
+                fw = D.FIELD_W
             else:
                 units = float(fl.get("width_units", 1) or 1)
                 fw = D.snap(D.FIELD_W * units)
 
-            x0 = D.MARGIN_X + ci * (col_w + D.COL_GAP)
+            x0 = MARGIN_X + ci * (col_w + D.COL_GAP)
             x_field = x0 + D.LABEL_W + D.GAP_LABEL
             lbl_name = _unique(str(fl.get("label_name") or _ident(field, "lbl")))
             fld_name = _unique(str(fl.get("name") or _ident(field, _PREFIX.get(type_name, "ctl"))))
 
-            controls.append({
+            detail.append({
                 "role": "label", "section": _AC_DETAIL, "type_name": "Label",
                 "name": lbl_name, "left": x0, "top": top,
                 "width": D.LABEL_W, "height": D.ROW_H,
                 "props": _label_style(caption),
             })
-            controls.append({
+            detail.append({
                 "role": "field", "section": _AC_DETAIL, "type_name": type_name,
                 "name": fld_name, "left": x_field, "top": top,
                 "width": fw, "height": fh, "tab": True,
@@ -197,89 +276,140 @@ def _plan_layout(fields: list, actions: list, title: Optional[str],
 
     if two_col:
         for r in range(0, len(fields), cols):
-            row = fields[r:r + cols]
-            rh = _emit_row(row, y)
-            y += rh + D.ROW_GAP
+            y += _emit_row(fields[r:r + cols], y) + ROW_GAP
     else:
         for fl in fields:
-            rh = _emit_row([fl], y)
-            y += rh + D.ROW_GAP
+            y += _emit_row([fl], y) + ROW_GAP
 
-    detail_height = D.snap(max(y - D.ROW_GAP + D.MARGIN_Y, D.ROW_STRIDE))
+    detail_height = D.snap(max(y - ROW_GAP + MARGIN_Y, D.ROW_STRIDE))
 
-    # --- form width ---------------------------------------------------------
     if two_col:
-        form_width = D.MARGIN_X + cols * col_w + (cols - 1) * D.COL_GAP + D.MARGIN_X
+        form_width = MARGIN_X + cols * col_w + (cols - 1) * D.COL_GAP + MARGIN_X
     else:
-        form_width = max_right + D.MARGIN_X
+        form_width = max_right + MARGIN_X
     form_width = D.snap(form_width)
 
-    # --- header title -------------------------------------------------------
+    # --- assemble: Detail (card behind fields) -----------------------------
+    controls: list[dict] = []
+    if styled and T["card"]:
+        controls.append(_rect("recCard", _AC_DETAIL, 120, 120,
+                              form_width - 240, detail_height - 240,
+                              pal["field_bg"], pal["field_border"]))
+    controls.extend(detail)
+
+    # --- Header (accent band behind a centred title) -----------------------
     header_height = 0
+    header_backcolor = T["canvas"] if styled else None
     if need_header:
         header_height = D.HEADER_H
-        # Dark bold title on the form-header band. Access renders the header
-        # with a themed (light) gradient that overrides a literal section
-        # BackColor, so a white title is invisible — a dark title is readable on
-        # whatever the theme paints and always clears the contrast check.
-        tprops = {"Caption": title}
+        title_fore = pal["text"]
+        title_bg = None
+        if styled and T["header_band"]:
+            # The band is painted TWICE: the section BackColor (fills the whole
+            # document-window width, so no themed colour shows beyond the form)
+            # AND a Rectangle spanning form_width (a fallback in case a theme
+            # overrides the section colour). Same accent → seamless either way.
+            header_backcolor = pal["accent"]
+            controls.append(_rect("recHeaderBand", _AC_HEADER, 0, 0,
+                                  form_width, D.HEADER_H, pal["accent"], None))
+            title_fore = _WHITE
+            title_bg = pal["accent"]
+        tprops: dict = {"Caption": title}
         if styled:
-            tprops.update({"FontName": D.BASE_FONT, "FontSize": D.TITLE_FONT_SIZE,
-                           "FontWeight": D.FONT_WEIGHT_BOLD,
-                           "ForeColor": pal["text"]})
+            tprops.update({"FontName": title_font, "FontSize": T["title_size"],
+                           "FontWeight": D.FONT_WEIGHT_BOLD, "ForeColor": title_fore})
+            if title_bg is not None:
+                # Solid same-colour label so the lint sees white-on-accent (its
+                # own BackColor), not white-on-section — and it reads centred.
+                tprops.update({"BackStyle": 1, "BackColor": title_bg, "BorderStyle": 0})
+        # Title label must be tall enough for its font or the text clips
+        # vertically (16-18pt needs ~470-540 twips, not ROW_H=300).
+        title_h = max(D.ROW_H, D.line_height(T["title_size"])) if styled else D.ROW_H
         controls.append({
             "role": "title", "section": _AC_HEADER, "type_name": "Label",
             "name": _unique("lblTitle"),
-            "left": D.MARGIN_X, "top": D.snap((D.HEADER_H - D.ROW_H) / 2),
-            "width": max(D.LABEL_W, form_width - 2 * D.MARGIN_X), "height": D.ROW_H,
-            "props": tprops,
+            "left": MARGIN_X if not T["header_band"] else 240,
+            "top": D.snap((D.HEADER_H - title_h) / 2),
+            "width": max(D.LABEL_W, form_width - (2 * MARGIN_X if not T["header_band"] else 480)),
+            "height": title_h, "props": tprops,
         })
 
-    # --- footer action buttons ---------------------------------------------
+    # --- Footer (action buttons) -------------------------------------------
     footer_height = 0
     if need_footer:
         footer_height = D.FOOTER_H
         n = len(actions)
         total_w = n * D.BUTTON_W + (n - 1) * D.BUTTON_GAP
-        start_x = form_width - D.MARGIN_X - total_w
-        if start_x < D.MARGIN_X:
-            start_x = D.MARGIN_X          # too many buttons → left-align
+        start_x = form_width - MARGIN_X - total_w
+        if start_x < MARGIN_X:
+            start_x = MARGIN_X
         btn_top = D.snap((D.FOOTER_H - D.BUTTON_H) / 2)
         for i, act in enumerate(actions):
             if isinstance(act, str):
                 act = {"caption": act}
             caption = str(act.get("caption", f"Botón{i + 1}"))
             bname = _unique(str(act.get("name") or _ident(caption, "btn")))
-            bprops: dict = {"Caption": caption}
-            if act.get("on_click"):
-                bprops["OnClick"] = str(act["on_click"])
-            if isinstance(act.get("props"), dict):
-                bprops.update(act["props"])
-            controls.append({
-                "role": "button", "section": _AC_FOOTER, "type_name": "CommandButton",
-                "name": bname, "left": D.snap(start_x + i * (D.BUTTON_W + D.BUTTON_GAP)),
-                "top": btn_top, "width": D.BUTTON_W, "height": D.BUTTON_H,
-                "tab": True, "props": bprops,
-            })
+            bx = D.snap(start_x + i * (D.BUTTON_W + D.BUTTON_GAP))
+            on_click = act.get("on_click")
+            extra = act.get("props") if isinstance(act.get("props"), dict) else None
+
+            if styled and T["flat_buttons"]:
+                primary = (i == 0)
+                fill = pal["accent"] if primary else pal["field_bg"]
+                txt = _WHITE if primary else pal["text"]
+                border = None if primary else pal["field_border"]
+                # background rect (carries the fill + optional border)
+                controls.append(_rect(bname + "Bg", _AC_FOOTER, bx, btn_top,
+                                      D.BUTTON_W, D.BUTTON_H, fill, border))
+                # caption label: inset + solid same fill so the rect border shows
+                # and the lint reads text on its own (accent/white) background.
+                cprops = {"Caption": caption, "FontName": font,
+                          "FontSize": T["field_size"], "FontWeight": D.FONT_WEIGHT_BOLD,
+                          "ForeColor": txt, "TextAlign": 2, "BackStyle": 1,
+                          "BackColor": fill, "BorderStyle": 0}
+                controls.append({
+                    "role": "button", "section": _AC_FOOTER, "type_name": "Label",
+                    "name": bname + "Cap", "left": bx + 60,
+                    "top": D.snap(btn_top + (D.BUTTON_H - D.ROW_H) / 2),
+                    "width": D.BUTTON_W - 120, "height": D.ROW_H, "props": cprops,
+                })
+                # transparent click layer on top
+                bprops: dict = {"Transparent": True, "Caption": ""}
+                if on_click:
+                    bprops["OnClick"] = str(on_click)
+                if extra:
+                    bprops.update(extra)
+                controls.append({
+                    "role": "button", "section": _AC_FOOTER, "type_name": "CommandButton",
+                    "name": bname, "left": bx, "top": btn_top,
+                    "width": D.BUTTON_W, "height": D.BUTTON_H, "tab": True,
+                    "props": bprops,
+                })
+            else:
+                bprops = {"Caption": caption}
+                if on_click:
+                    bprops["OnClick"] = str(on_click)
+                if extra:
+                    bprops.update(extra)
+                controls.append({
+                    "role": "button", "section": _AC_FOOTER, "type_name": "CommandButton",
+                    "name": bname, "left": bx, "top": btn_top,
+                    "width": D.BUTTON_W, "height": D.BUTTON_H, "tab": True,
+                    "props": bprops,
+                })
 
     return {
         "form_width": form_width,
         "detail_height": detail_height,
         "header_height": header_height,
+        "header_backcolor": header_backcolor,
         "footer_height": footer_height,
         "need_header": need_header,
         "need_footer": need_footer,
+        "canvas": T["canvas"] if styled else None,
+        "chrome_off": T["chrome_off"],
         "controls": controls,
     }
-
-
-_PREFIX = {"TextBox": "txt", "ComboBox": "cbo", "ListBox": "lst",
-           "CheckBox": "chk", "Label": "lbl"}
-
-
-def _looks_unbound(field: str) -> bool:
-    """A field name with spaces/operators isn't a plain column → leave unbound."""
-    return bool(re.search(r"[ =()\[\]!.]", field or ""))
 
 
 def _apply_props(ctrl: Any, props: dict) -> dict:
@@ -320,9 +450,8 @@ def ac_build_form(
       row_source, width_units (single-column only), height, props (override dict).
     actions: list of strings or objects {caption, name, on_click, props} → a row
       of buttons in the footer.
-    title: a form-header band with this caption (bold dark title, readable on
-      the themed header band).
-    layout: 'single' or 'two-column'. theme: 'light' (palette) or 'plain' (geometry only).
+    title: a form-header band with this caption.
+    layout: 'single' or 'two-column'. theme: light|plain|polish|flat.
 
     All coordinates are computed from mcp_access.design_defaults and snapped to
     the 60-twip grid. Returns the geometry, the controls created, the tab order
@@ -333,7 +462,6 @@ def ac_build_form(
     plan = _plan_layout(fields, actions, title, layout, theme)
     app = _Session.connect(db_path)
 
-    # Replace an existing form only when asked.
     if overwrite:
         try:
             app.DoCmd.Close(2, form_name, 2)  # acForm, acSaveNo
@@ -359,8 +487,9 @@ def ac_build_form(
                 obj.Caption = title
             except Exception:
                 pass
+        if plan["chrome_off"]:
+            _set_form_chrome(obj)
 
-        # Create every control in this single Design session.
         for spec in plan["controls"]:
             ctype = _resolve_ctrl_type(spec["type_name"])
             try:
@@ -387,26 +516,24 @@ def ac_build_form(
                 "width": spec["width"], "height": spec["height"],
             })
 
-        # Form + section geometry (after controls so our sizes stick).
         try:
             obj.Width = plan["form_width"]
         except Exception as exc:
             log.warning("build_form: could not set form Width: %s", exc)
-        _set_section(obj, _AC_DETAIL, plan["detail_height"],
-                     D.PALETTE["form_bg"] if theme != "plain" else None)
+        _set_section(obj, _AC_DETAIL, plan["detail_height"], plan["canvas"])
         if plan["need_header"]:
-            # Keep Access' themed header band (a literal BackColor doesn't stick
-            # against the theme gradient); the dark title reads fine on it.
-            _set_section(obj, _AC_HEADER, plan["header_height"], None)
+            # Paint the header section with its own colour (accent for a band, the
+            # canvas otherwise) so the band fills the full document-window width —
+            # no themed colour bleeds past the form edge.
+            _set_section(obj, _AC_HEADER, plan["header_height"],
+                         plan["header_backcolor"])
         elif has_hf:
             _set_section(obj, _AC_HEADER, 0, None)
         if plan["need_footer"]:
-            _set_section(obj, _AC_FOOTER, plan["footer_height"],
-                         D.PALETTE["form_bg"] if theme != "plain" else None)
+            _set_section(obj, _AC_FOOTER, plan["footer_height"], plan["canvas"])
         elif has_hf:
             _set_section(obj, _AC_FOOTER, 0, None)
 
-        # Tab order: data controls + buttons, per section, in spec order.
         tab_order = _assign_tab_order(obj, plan["controls"])
     finally:
         _save_and_close(app, "form", form_name)
@@ -444,11 +571,44 @@ def _sections_summary(plan: dict) -> dict:
     return out
 
 
+def _set_form_chrome(obj: Any) -> None:
+    """Turn off the 'database' chrome for a cleaner, app-like form."""
+    for prop, val in (("NavigationButtons", False), ("RecordSelectors", False),
+                      ("ScrollBars", 0), ("DividingLines", False),
+                      ("AutoCenter", True), ("CloseButton", True)):
+        try:
+            setattr(obj, prop, val)
+        except Exception:
+            pass
+
+
+def _get_section(obj: Any, index: int) -> Any:
+    """Resolve a form section object.
+
+    The indexed ``Form.Section(i)`` accessor is NOT reliably late-bindable via
+    pywin32 — it raises ``-2147352573 'member not found'`` for every index, which
+    used to make :func:`_set_section` fail silently (so the canvas colour was
+    never painted and the header/footer kept Access' oversized default heights,
+    which is what produced the washed-out two-tone header band). The *named*
+    section properties (``Detail`` / ``FormHeader`` / ``FormFooter``) DO bind, so
+    try those first; fall back to the index for any exotic section.
+    """
+    prop = _SECTION_LABEL.get(index)
+    if prop:
+        try:
+            return getattr(obj, prop)
+        except Exception:
+            pass
+    try:
+        return obj.Section(index)
+    except Exception:
+        return None
+
+
 def _set_section(obj: Any, index: int, height: int, backcolor: Optional[int]) -> None:
     """Set a section's Height (and BackColor) defensively."""
-    try:
-        sec = obj.Section(index)
-    except Exception:
+    sec = _get_section(obj, index)
+    if sec is None:
         return
     try:
         sec.Height = int(height)

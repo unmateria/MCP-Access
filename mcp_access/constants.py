@@ -179,11 +179,12 @@ TWIPS_PER_INCH = 1440
 WIZHOOK_KEY = 51488399
 
 # Rule ids, in the canonical order used for the schema enum and "all rules".
-# The last four (v0.7.45) are deterministic *layout-quality* checks that all
-# emit at most ``info``-severity violations — they never change the PASS/REVIEW/
-# FAIL verdict (which only counts errors/warnings) and never appear in the
-# compact lint embedded in mutation results, so adding them cannot make the
-# embedded path noisier; they only enrich the full ``access_lint_form`` report.
+# The last five (grid_alignment..generic_font, v0.7.45-0.7.46) are deterministic
+# *design-quality* checks that all emit at most ``info``-severity violations —
+# they never change the PASS/REVIEW/FAIL verdict (which only counts errors/
+# warnings) and never appear in the compact lint embedded in mutation results,
+# so adding them cannot make the embedded path noisier; they only enrich the
+# full ``access_lint_form`` report.
 LINT_RULES = (
     "contrast",
     "overlap",
@@ -196,4 +197,5 @@ LINT_RULES = (
     "spacing_consistency",
     "edge_margin",
     "hierarchy",
+    "generic_font",
 )

@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.7.46 — 2026-06-19
+
+Real design taste for `access_build_form` — three curated **design directions**
+replace the ad-hoc themes, plus the fix for the washed-out two-tone header band
+they surfaced. No new tool (still **67**).
+
+### Added
+
+- **Three curated design directions** for `access_build_form` (`theme=`):
+  `despacho` (serif Constantia title on warm paper, teal accent band),
+  `panel` (Segoe UI Semibold, a white card on a cool canvas, slate band) and
+  `archivo` (serif Cambria, warm editorial, spacious, clay band). Each is a
+  *coherent bundle* — a typeface with character, an intentional modular type
+  scale, a dominant+accent palette with **WCAG-verified contrast**, a spacing
+  density and an accent header band — translating real design-system thinking
+  into what native Access can render. Each passes the lint clean by construction.
+- **Design tokens** in `mcp_access/design_defaults.py`: `type_scale(base, ratio)`
+  (a modular scale rounded to whole points), `SPACE` (a closed spacing scale;
+  the legacy `MARGIN_X`/`GAP_LABEL`/… are now aliases into it, same values),
+  `DENSITY` (compact/comfortable/spacious — margins & gaps only, never control
+  sizes) and `DIRECTIONS` (the three palettes, built with `bgr()` straight from
+  the hex so they can't drift).
+- **`access_tips('design')`** — the design guide the model reads: the three
+  directions, the principles (typeface with character, cohesive palette,
+  hierarchy, rhythm, containment, active-voice copy) and the **honest ceiling**
+  (native Access has no gradients, shadows, rounded corners, blur or animation).
+- **Two `info`-only lint rules:** `generic_font` (flags Arial/Roboto/Inter/Times
+  New Roman/MS Sans Serif — a closed list) and a `type_hierarchy` extension of
+  the `hierarchy` rule (the header title should be larger than the body text).
+  Both `info`, so they never change the verdict nor reach the embedded mutation
+  lint.
+
+### Fixed
+
+- **Two-tone header band / unpainted canvas.** `build_form`'s `_set_section`
+  resolved sections via `Form.Section(index)`, which pywin32 can't late-bind
+  (it raises *"member not found"* for every index) — so the call failed
+  **silently**: the canvas colour was never painted and the header/footer kept
+  Access' oversized default heights, leaving the themed light-blue header
+  showing past the accent rectangle (the "two-tone band"). Sections are now
+  resolved by their **named** properties (`Detail`/`FormHeader`/`FormFooter`),
+  which bind correctly, and a header band is painted on the section BackColor
+  (full document-window width) with the Rectangle kept as a fallback.
+
 ## 0.7.45 — 2026-06-19
 
 Making the LLM design **much** better Access forms — by moving the layout

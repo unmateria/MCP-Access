@@ -147,7 +147,9 @@ def _ctrl(name, type_name, left, top, width, height, **style):
         "name": name, "type_name": type_name,
         "left": left, "top": top, "width": width, "height": height,
         "visible": "", "caption": style.pop("caption", ""),
-        "control_source": "", "parent": "", "section": "Detail",
+        "control_source": "", "parent": "",
+        "section": style.pop("section", "Detail"),
+        "section_kind": style.pop("section_kind", ""),
         "style": style, "has_picture": False, "has_conditional_format": False,
     }
 
@@ -213,9 +215,161 @@ def test_hierarchy_no_explicit_font_no_flag():
 
 def test_new_rules_registered():
     from mcp_access.constants import LINT_RULES
-    for r in ("grid_alignment", "spacing_consistency", "edge_margin", "hierarchy"):
+    for r in ("grid_alignment", "spacing_consistency", "edge_margin", "hierarchy",
+              "generic_font"):
         assert r in LINT_RULES
         assert r in L._RULE_FUNCS and L._RULE_FUNCS[r] is not None
+
+
+# ---------------------------------------------------------------------------
+# Design directions (v0.7.46): type scale, spacing/density, palette anti-drift
+# and WCAG contrast — all pure, verified against the lint's own colour maths.
+# ---------------------------------------------------------------------------
+
+# The human-readable source of truth for every direction colour. The palette in
+# design_defaults is built with bgr() from exactly these hexes; the anti-drift
+# test recomputes bgr(hex) and asserts they still match.
+_DIRECTION_HEX = {
+    "despacho": {"form_bg": "#FBFAF7", "field_bg": "#FFFFFF", "text": "#1A1A2E",
+                 "accent": "#0F766E", "field_border": "#94A3B8"},
+    "panel":    {"form_bg": "#F1F5F9", "field_bg": "#FFFFFF", "text": "#1E293B",
+                 "accent": "#1E293B", "field_border": "#CBD5E1", "accent2": "#B45309"},
+    "archivo":  {"form_bg": "#F4F1EC", "field_bg": "#FFFFFF", "text": "#23211E",
+                 "accent": "#7C4A33", "field_border": "#DAD3C6"},
+}
+
+
+def _hex_rgb(h):
+    h = h.lstrip("#")
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+
+def test_type_scale_values():
+    assert D.type_scale(11, 1.25) == {"caption": 9, "body": 11, "subhead": 14,
+                                      "title": 17, "display": 21}
+    assert D.type_scale(11, 1.2) == {"caption": 9, "body": 11, "subhead": 13,
+                                     "title": 16, "display": 19}
+    # Every step is a whole number of points.
+    for v in D.type_scale(13, 1.25).values():
+        assert isinstance(v, int)
+
+
+def test_space_and_density_on_grid():
+    assert all(v % D.GRID == 0 for v in D.SPACE.values())
+    assert all(v % D.GRID == 0 for d in D.DENSITY.values() for v in d.values())
+    # Legacy aliases keep their historic values (so old layouts are unchanged).
+    assert (D.MARGIN_X, D.MARGIN_Y, D.GAP_LABEL, D.ROW_GAP, D.COL_GAP) == (
+        240, 240, 120, 120, 360)
+    # compact density == the historic light spacing.
+    assert D.DENSITY["compact"] == {"margin": 240, "margin_y": 240, "row_gap": 120}
+
+
+def test_directions_palette_anti_drift():
+    """Each declared palette Long must equal bgr() recomputed from its hex."""
+    for name, dr in D.DIRECTIONS.items():
+        for key, val in dr["palette"].items():
+            expected = D.bgr(*_hex_rgb(_DIRECTION_HEX[name][key]))
+            assert val == expected, (name, key, val, expected)
+
+
+def test_directions_contrast_wcag():
+    """Verified with the lint's own WCAG maths: body text, the white band title,
+    and the accent used as text on the paper all clear the threshold."""
+    white = L._decode_bgr(D.bgr(255, 255, 255))
+    for name, dr in D.DIRECTIONS.items():
+        pal = dr["palette"]
+        text = L._decode_bgr(pal["text"])
+        field_bg = L._decode_bgr(pal["field_bg"])
+        accent = L._decode_bgr(pal["accent"])
+        paper = L._decode_bgr(pal["form_bg"])
+        assert L._contrast_ratio(text, field_bg) >= 4.5, name      # body text
+        assert L._contrast_ratio(white, accent) >= 4.5, name       # white title on band
+        assert L._contrast_ratio(accent, paper) >= 3.0, name       # accent-as-text on paper
+    # Panel's optional amber primary accent reads on white.
+    amber = L._decode_bgr(D.DIRECTIONS["panel"]["palette"]["accent2"])
+    assert L._contrast_ratio(white, amber) >= 4.5
+
+
+def test_light_theme_regression():
+    """theme='light' is byte-for-byte unchanged by the directions work."""
+    plan = _plan_layout(
+        fields=["Nombre", {"field": "Provincia", "control": "combobox"},
+                {"field": "Notas", "control": "memo"}],
+        actions=[{"caption": "Guardar", "on_click": "[Event Procedure]"}, "Cerrar"],
+        title="Ficha", layout="single", theme="light")
+    assert plan["form_width"] == 4800
+    assert len(plan["controls"]) == 9
+    field = next(c for c in plan["controls"] if c["role"] == "field")
+    title = next(c for c in plan["controls"] if c["role"] == "title")
+    assert field["props"]["FontName"] == "Calibri"
+    assert title["props"]["FontName"] == "Calibri"   # no title_font for light
+    # No direction palette/header band leaked in.
+    assert not any(c["name"] == "recHeaderBand" for c in plan["controls"])
+
+
+def test_direction_plan_uses_palette_and_title_font():
+    for name in ("despacho", "panel", "archivo"):
+        plan = _plan_layout(fields=["Nombre", "Provincia"],
+                            actions=[{"caption": "Guardar cambios"}], title="Ficha",
+                            layout="single", theme=name)
+        pal = D.DIRECTIONS[name]["palette"]
+        fonts = D.DIRECTIONS[name]["fonts"]
+        title = next(c for c in plan["controls"] if c["role"] == "title")
+        field = next(c for c in plan["controls"] if c["role"] == "field")
+        band = next(c for c in plan["controls"] if c["name"] == "recHeaderBand")
+        # Title in the display typeface, white, on its own accent band.
+        assert title["props"]["FontName"] == fonts["display"]
+        assert title["props"]["ForeColor"] == D.bgr(255, 255, 255)
+        assert title["props"]["BackColor"] == pal["accent"]
+        assert band["props"]["BackColor"] == pal["accent"]
+        # Fields in the body typeface on the field colour.
+        assert field["props"]["FontName"] == fonts["body"]
+        assert field["props"]["BackColor"] == pal["field_bg"]
+        assert field["props"]["BorderColor"] == pal["field_border"]
+        # Title font is larger than the field font (clean hierarchy).
+        assert title["props"]["FontSize"] > field["props"]["FontSize"]
+        # Canvas is the direction's paper.
+        assert plan["canvas"] == pal["form_bg"]
+
+
+def test_panel_has_card_others_dont():
+    assert any(c["name"] == "recCard"
+               for c in _plan_layout(["A"], [], None, "single", "panel")["controls"])
+    for name in ("despacho", "archivo"):
+        assert not any(c["name"] == "recCard"
+                       for c in _plan_layout(["A"], [], None, "single", name)["controls"])
+
+
+def test_generic_font_rule():
+    m = _model([_ctrl("a", "Label", 240, 240, 1800, 300, FontName="Arial"),
+                _ctrl("b", "Label", 240, 660, 1800, 300, FontName="Segoe UI"),
+                _ctrl("c", "TextBox", 240, 1080, 2400, 300, FontName="Times New Roman")])
+    flagged = {x["control"] for x in L._rule_generic_font(m)}
+    assert flagged == {"a", "c"}
+    assert all(x["severity"] == "info" for x in L._rule_generic_font(m))
+    # A direction's fonts never trip it.
+    for name in ("despacho", "panel", "archivo"):
+        for f in D.DIRECTIONS[name]["fonts"].values():
+            assert f.strip().lower() not in L._GENERIC_FONTS, (name, f)
+
+
+def test_type_hierarchy_header_title():
+    # Title in the header at 9pt, body at 11pt → the title fails to lead.
+    m = _model([
+        _ctrl("t1", "TextBox", 240, 660, 2400, 300, FontSize="11"),
+        _ctrl("t2", "TextBox", 240, 1080, 2400, 300, FontSize="11"),
+        _ctrl("titulo", "Label", 240, 120, 3000, 400, FontSize="9",
+              section="FormHeader", section_kind="FormHeader", caption="Ficha"),
+    ])
+    flagged = [x for x in L._rule_hierarchy(m) if x["control"] == "titulo"]
+    assert flagged and flagged[0]["severity"] == "info"
+    # A 17pt title clears it.
+    m2 = _model([
+        _ctrl("t1", "TextBox", 240, 660, 2400, 300, FontSize="11"),
+        _ctrl("big", "Label", 240, 120, 3000, 400, FontSize="17",
+              section="FormHeader", section_kind="FormHeader", caption="Ficha"),
+    ])
+    assert not any(x["control"] == "big" for x in L._rule_hierarchy(m2))
 
 
 if __name__ == "__main__":

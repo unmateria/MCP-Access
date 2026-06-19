@@ -265,6 +265,53 @@ canonical grid/margin, so a `build_form` layout passes them clean. Deliberately
 conservative: `hierarchy` only fires on an explicit FontSize inversion (action
 text smaller than body), `spacing_consistency` needs ≥4 controls in a column.
 
+## Design directions for build_form (v0.7.46)
+
+The v0.7.45 themes (`light`/`polish`/`flat`) were invented by eye and looked
+soso. v0.7.46 adds three **curated design directions** that translate real
+design-system thinking into native Access. The only insertion point is
+`_resolve_theme`; `_plan_layout` changed ~2 lines (`pal = T.get("palette",
+D.PALETTE)`, title uses `T.get("title_font", font)`). `light`/`plain` stay
+literal, so the pure tests are untouched.
+
+### Pieces
+- **`design_defaults.py`** (additive): `type_scale(base, ratio)` (modular scale
+  → caption/body/subhead/title/display, whole points); `SPACE` (closed spacing
+  scale — the legacy `MARGIN_X`/`GAP_LABEL`/`COL_GAP`/… are now **aliases** into
+  it, same values, so old layouts/tests are byte-identical); `DENSITY`
+  (compact/comfortable/spacious — margins & gaps ONLY, never control sizes);
+  `DIRECTIONS` (the three bundles) + `DIRECTION_COMMON`. `PALETTE` is untouched
+  (a test pins it; `light` still uses it).
+- **The 3 directions** — `despacho` (Constantia serif title / Segoe UI body,
+  teal band, warm paper, comfortable, no card), `panel` (Segoe UI Semibold /
+  Segoe UI, slate band, white card on a cool canvas, comfortable), `archivo`
+  (Cambria serif / Corbel, clay band, warm paper, spacious, no card). Palette
+  keys are the canonical ones (`form_bg`/`field_bg`/`field_border`/`text`/
+  `accent`; `accent` doubles as the band). Colours are built with `bgr()`
+  **straight from the hex** so they can't drift — `test_directions_palette_anti_drift`
+  recomputes `bgr(hex)` and `test_directions_contrast_wcag` re-derives every
+  contrast with the lint's own WCAG maths.
+- **Two `info` lint rules** — `generic_font` (closed list: Arial/Roboto/Inter/
+  Times New Roman/MS Sans Serif) and a `type_hierarchy` extension of
+  `_rule_hierarchy` (header title must be larger than body). `_parse_geometry`
+  gained an additive `kind` per section (the `Begin` token) + `_assign_section_kind`
+  / `section_kind` on each control, so the header title is found reliably even
+  when a section exports without a `Name`.
+
+### The two-tone band fix (v0.7.46)
+The directions surfaced a latent v0.7.45 bug: `_set_section` resolved sections
+via `Form.Section(index)`, which **pywin32 cannot late-bind** (every index
+raises `-2147352573 "member not found"`). The call failed *silently* inside its
+own try/except, so the canvas colour was never painted onto Detail and the
+header/footer kept Access' oversized default heights — the themed light-blue
+header then showed past the form-width accent rectangle (the "two-tone band").
+Fix: `_get_section` resolves by the **named** property (`Detail`/`FormHeader`/
+`FormFooter`, which DO bind) with the index as fallback; and a styled header
+band is now painted on the section `BackColor` (which fills the full
+document-window width) via `plan["header_backcolor"]`, with the Rectangle kept
+as a fallback in case a theme overrides the section colour. Do NOT revert
+`_get_section` to the indexed accessor — it re-introduces the silent failure.
+
 ## Build-a-form-from-scratch recipes (v0.7.38)
 
 ### Add VBA to a form you just created with ac_create_form

@@ -331,6 +331,28 @@ The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/s
 
 ## Changelog
 
+### v0.7.46 — 2026-06-19
+
+Real design taste for `access_build_form` — three curated **design directions**
+replace the ad-hoc themes (still **67 tools**).
+
+- **New: three design directions** (`theme=despacho|panel|archivo`) — each a
+  coherent bundle of a typeface with character, a modular type scale, a
+  dominant+accent palette with **WCAG-verified contrast**, a spacing density and
+  an accent header band. `despacho` (serif on warm paper, teal), `panel`
+  (semibold sans, white card on a cool canvas, slate), `archivo` (serif, warm
+  editorial, spacious, clay). Each builds lint-clean.
+- **New: design tokens** (`type_scale`, `SPACE`, `DENSITY`, `DIRECTIONS`) and a
+  design guide at `access_tips('design')` — including the honest ceiling (native
+  Access has no gradients, shadows, rounded corners, blur or animation).
+- **Lint:** two new `info`-only rules — `generic_font` (Arial/Roboto/Inter/…) and
+  a header-title check folded into `hierarchy`. Never change the verdict.
+- **Fix: two-tone header band.** `_set_section` resolved sections via the
+  indexed `Form.Section(i)`, which pywin32 can't late-bind, so it failed
+  silently — the canvas was never painted and the header kept Access' themed
+  default, bleeding past the accent rectangle. Sections are now resolved by
+  their named properties and the band fills the full width.
+
 ### v0.7.45 — 2026-06-19
 
 Better-looking forms by construction — the layout arithmetic moves from the LLM

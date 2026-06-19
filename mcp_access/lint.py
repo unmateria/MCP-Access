@@ -281,9 +281,14 @@ def _parse_geometry(form_text: str) -> dict:
     i = form_begin + 1
     while i < len(lines):
         s = lines[i].strip()
-        if _SECTION_BEGIN_RE.match(s):
+        sm = _SECTION_BEGIN_RE.match(s)
+        if sm:
             begin_idx = i
-            sec = {"name": "", "height": 0, "backcolor": None,
+            # ``kind`` is the Begin token (FormHeader/FormFooter/Section/...) —
+            # always present, unlike the optional ``Name =`` property. It lets a
+            # rule tell a header from the detail body even when sections export
+            # without a Name. Additive: never used by the pre-v0.7.46 rules.
+            sec = {"name": "", "kind": sm.group(1), "height": 0, "backcolor": None,
                    "begin_idx": begin_idx, "end_idx": begin_idx}
             d = 1
             j = i + 1
@@ -322,6 +327,18 @@ def _assign_section(start_line_1based: int, sections: list) -> str:
     for sec in sections:
         if sec["begin_idx"] < idx <= sec["end_idx"]:
             best = sec["name"] or best
+    return best
+
+
+def _assign_section_kind(start_line_1based: int, sections: list) -> str:
+    """Return the *kind* (Begin token) of the section containing the control —
+    e.g. ``FormHeader``/``FormFooter``/``Section``. Robust where ``Name`` is
+    absent, used to distinguish the header band from the detail body."""
+    idx = start_line_1based - 1
+    best = ""
+    for sec in sections:
+        if sec["begin_idx"] < idx <= sec["end_idx"]:
+            best = sec.get("kind") or best
     return best
 
 
@@ -367,6 +384,7 @@ def _build_model(db_path: str, object_type: str, object_name: str) -> dict:
             "control_source": c.get("control_source", ""),
             "parent": c.get("parent", ""),
             "section": _assign_section(c.get("start_line", 0), geo["sections"]),
+            "section_kind": _assign_section_kind(c.get("start_line", 0), geo["sections"]),
             "style": style,
             "has_picture": has_picture,
             # Conditional formatting overrides ForeColor/BackColor at runtime,
@@ -1041,12 +1059,28 @@ def _rule_spacing_consistency(model: dict) -> list:
     return violations
 
 
-def _rule_hierarchy(model: dict) -> list:
-    """Clickable actions whose caption font is smaller than the body text (info).
+def _header_title(model: dict) -> Optional[dict]:
+    """The form's title: the largest-area Label in a header section. None if the
+    object has no header or no titled label there."""
+    cands = [c for c in model["controls"]
+             if c["type_name"] == "Label"
+             and c.get("section_kind") in ("FormHeader", "PageHeader", "ReportHeader")
+             and _has_full_geom(c)]
+    if not cands:
+        return None
+    return max(cands, key=lambda c: c["width"] * c["height"])
 
-    Objective and narrow on purpose: only fires when a CommandButton declares a
-    FontSize strictly smaller than the form's dominant body (TextBox/Label) font
-    size by more than a point — a real readability inversion, not a style call.
+
+def _rule_hierarchy(model: dict) -> list:
+    """Type hierarchy inversions, info-only (two narrow, objective checks):
+
+    1. A clickable action (CommandButton) whose caption font is strictly smaller
+       than the form's dominant body (TextBox/Label) size by more than a point.
+    2. The header title (largest Label in the header) whose FontSize is not
+       larger than the body text — a title that fails to lead the hierarchy.
+
+    Both fire only on an *explicit* FontSize so an inherited default is never
+    flagged; a form built by access_build_form (title 16-17pt > body 11pt) passes.
     """
     body_sizes = [round(float(_twips(c["style"].get("FontSize"), 11) or 11), 1)
                   for c in model["controls"]
@@ -1071,6 +1105,50 @@ def _rule_hierarchy(model: dict) -> list:
                 measured={"button_font": fs, "body_font": body},
                 suggested_fix=f"Raise this button's FontSize to >= {body:g}pt.",
             ))
+
+    title = _header_title(model)
+    if title is not None and "FontSize" in title["style"]:
+        ts = round(float(_twips(title["style"]["FontSize"], 11) or 11), 1)
+        if ts <= body:
+            violations.append(_v(
+                "hierarchy", "info", title,
+                f"Header title text ({ts:g}pt) is not larger than the body text "
+                f"({body:g}pt) — the title should set a clear visual hierarchy.",
+                measured={"title_font": ts, "body_font": body},
+                suggested_fix=f"Raise the title FontSize above {body:g}pt "
+                              f"(a build_form direction uses {int(body) + 5}-{int(body) + 6}pt).",
+            ))
+    return violations
+
+
+# Fonts that read as a generic AI/office default — a closed list so the rule
+# never second-guesses a deliberate typeface. Lower-cased for comparison.
+_GENERIC_FONTS = {
+    "arial", "roboto", "inter", "times new roman", "ms sans serif",
+}
+
+
+def _rule_generic_font(model: dict) -> list:
+    """Controls set in a generic/templated default typeface (info).
+
+    Conservative by design: fires only on a short closed list of fonts that read
+    as "AI default" (Arial / Roboto / Inter / Times New Roman / MS Sans Serif),
+    never on a font the designer might have chosen on purpose. A build_form
+    direction (Segoe UI / Constantia / Cambria / Corbel) passes clean.
+    """
+    violations = []
+    for c in model["controls"]:
+        fn = c["style"].get("FontName", "")
+        if fn and fn.strip().lower() in _GENERIC_FONTS:
+            violations.append(_v(
+                "generic_font", "info", c,
+                f"Font '{fn}' reads as a generic default — a typeface with more "
+                f"character makes the form feel intentional.",
+                measured={"font_name": fn},
+                suggested_fix="Pick a distinctive font (e.g. Segoe UI, Constantia, "
+                              "Cambria, Corbel) — see access_tips('design') or a "
+                              "build_form direction (despacho/panel/archivo).",
+            ))
     return violations
 
 
@@ -1086,6 +1164,7 @@ _RULE_FUNCS = {
     "spacing_consistency": _rule_spacing_consistency,
     "edge_margin": _rule_edge_margin,
     "hierarchy": _rule_hierarchy,
+    "generic_font": _rule_generic_font,
 }
 
 _SEVERITY_ORDER = {"error": 0, "warning": 1, "info": 2}

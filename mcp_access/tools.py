@@ -915,11 +915,12 @@ TOOLS = [
             "preferred way to create data-entry forms. You describe WHAT goes on the "
             "form (a title, an ordered list of fields, a row of action buttons, "
             "single or two-column); the tool computes every Left/Top/Width/Height from "
-            "a canonical 60-twip grid, applies a closed light palette (WCAG-safe "
-            "contrast), assigns a sane tab order and sizes the form and its header/"
-            "footer sections. You never pick a coordinate. Use this instead of many "
-            "access_create_control calls; fine-tune afterwards with access_set_control_props "
-            "if needed. See access_tips('layout') for the numbers."
+            "a canonical 60-twip grid, applies a WCAG-safe palette (or a curated "
+            "design direction via theme=despacho|panel|archivo), assigns a sane tab "
+            "order and sizes the form and its header/footer sections. You never pick a "
+            "coordinate. Use this instead of many access_create_control calls; fine-tune "
+            "afterwards with access_set_control_props if needed. See access_tips('layout') "
+            "for the numbers and access_tips('design') for the directions."
         ),
         inputSchema={
             "type": "object",
@@ -947,9 +948,20 @@ TOOLS = [
                 "default_view": {"type": "integer", "description": "Optional initial view: 0=Single, 1=Continuous, 2=Datasheet, ..."},
                 "theme": {
                     "type": "string",
-                    "enum": ["light", "plain"],
+                    "enum": ["light", "plain", "polish", "flat",
+                             "despacho", "panel", "archivo"],
                     "default": "light",
-                    "description": "light = apply the canonical palette+fonts; plain = geometry only (no colours/fonts).",
+                    "description": (
+                        "Visual style. Basics: light = palette+fonts on the default "
+                        "look; plain = geometry only; polish = Segoe UI + more air + "
+                        "chrome off; flat = accent band + card + grey canvas. "
+                        "Curated DESIGN DIRECTIONS (coherent typeface + type scale + "
+                        "WCAG-verified palette + density, all with an accent header "
+                        "band): despacho (serif Constantia title on warm paper), "
+                        "panel (Segoe UI Semibold, white card on a cool canvas), "
+                        "archivo (serif Cambria title, warm editorial, spacious). "
+                        "See access_tips('design') for the full guide."
+                    ),
                 },
                 "overwrite": {"type": "boolean", "default": False, "description": "Delete an existing form of the same name first."},
                 "skip_lint": {"type": "boolean", "description": "Suppress the embedded UI lint of the result (default false)."},
@@ -1248,7 +1260,7 @@ TOOLS = [
                 "rules": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Subset of rule ids to run; omit for all. Ids: contrast, overlap, out_of_bounds, truncation, sibling_inconsistency, misalignment, invisible_or_zero_size, grid_alignment, spacing_consistency, edge_margin, hierarchy (the last 4 are info-only layout-quality checks).",
+                    "description": "Subset of rule ids to run; omit for all. Ids: contrast, overlap, out_of_bounds, truncation, sibling_inconsistency, misalignment, invisible_or_zero_size, grid_alignment, spacing_consistency, edge_margin, hierarchy, generic_font (the last 5 are info-only design-quality checks).",
                 },
                 "measure": {
                     "type": "string",
