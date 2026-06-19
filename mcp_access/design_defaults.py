@@ -90,10 +90,9 @@ PALETTE: dict[str, int] = {
     "form_bg":      bgr(245, 245, 245),   # #F5F5F5 light grey canvas
     "field_bg":     bgr(255, 255, 255),   # #FFFFFF white data fields
     "field_border": bgr(204, 204, 204),   # #CCCCCC subtle borders
-    "text":         bgr(51, 51, 51),      # #333333 body text (not pure black)
-    "header_bg":    bgr(37, 99, 235),     # #2563EB accent band (title sits on it)
-    "header_text":  bgr(255, 255, 255),   # #FFFFFF white title (≈5.2:1 on accent)
-    "accent":       bgr(37, 99, 235),     # #2563EB shared accent
+    "text":         bgr(51, 51, 51),      # #333333 body text + header title (not pure black)
+    "accent":       bgr(37, 99, 235),     # #2563EB accent for highlights (not the header band:
+                                          # Access themes the header gradient over a literal BackColor)
 }
 
 # Built-in colour aliases the model may pass by name (resolved by build_form).

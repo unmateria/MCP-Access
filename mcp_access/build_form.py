@@ -132,8 +132,9 @@ def _plan_layout(fields: list, actions: list, title: Optional[str],
                       "ForeColor": pal["text"], "BackColor": pal["field_bg"],
                       "BackStyle": 1, "BorderStyle": 1,
                       "BorderColor": pal["field_border"]})
-        elif styled:  # checkbox: only the tick colour
-            p.update({"ForeColor": pal["text"]})
+        # Checkboxes carry no colour props — CreateControl rejects ForeColor/
+        # BackColor on a CheckBox ("Property 'CreateControl.ForeColor' can not
+        # be set"); the box uses the theme. Leave it unstyled.
         # Per-field escape hatch: explicit props win over computed defaults.
         if isinstance(fl.get("props"), dict):
             p.update(fl["props"])
@@ -217,11 +218,15 @@ def _plan_layout(fields: list, actions: list, title: Optional[str],
     header_height = 0
     if need_header:
         header_height = D.HEADER_H
+        # Dark bold title on the form-header band. Access renders the header
+        # with a themed (light) gradient that overrides a literal section
+        # BackColor, so a white title is invisible — a dark title is readable on
+        # whatever the theme paints and always clears the contrast check.
         tprops = {"Caption": title}
         if styled:
             tprops.update({"FontName": D.BASE_FONT, "FontSize": D.TITLE_FONT_SIZE,
                            "FontWeight": D.FONT_WEIGHT_BOLD,
-                           "ForeColor": pal["header_text"]})
+                           "ForeColor": pal["text"]})
         controls.append({
             "role": "title", "section": _AC_HEADER, "type_name": "Label",
             "name": _unique("lblTitle"),
@@ -315,7 +320,8 @@ def ac_build_form(
       row_source, width_units (single-column only), height, props (override dict).
     actions: list of strings or objects {caption, name, on_click, props} → a row
       of buttons in the footer.
-    title: a header band with this caption (accent background, white title).
+    title: a form-header band with this caption (bold dark title, readable on
+      the themed header band).
     layout: 'single' or 'two-column'. theme: 'light' (palette) or 'plain' (geometry only).
 
     All coordinates are computed from mcp_access.design_defaults and snapped to
@@ -389,8 +395,9 @@ def ac_build_form(
         _set_section(obj, _AC_DETAIL, plan["detail_height"],
                      D.PALETTE["form_bg"] if theme != "plain" else None)
         if plan["need_header"]:
-            _set_section(obj, _AC_HEADER, plan["header_height"],
-                         D.PALETTE["header_bg"] if theme != "plain" else None)
+            # Keep Access' themed header band (a literal BackColor doesn't stick
+            # against the theme gradient); the dark title reads fine on it.
+            _set_section(obj, _AC_HEADER, plan["header_height"], None)
         elif has_hf:
             _set_section(obj, _AC_HEADER, 0, None)
         if plan["need_footer"]:

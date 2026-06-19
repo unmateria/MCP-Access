@@ -927,7 +927,7 @@ TOOLS = [
                 "db_path": {"type": "string", "description": "Path to .accdb/.mdb file"},
                 "form_name": {"type": "string", "description": "Name of the form to create"},
                 "record_source": {"type": "string", "description": "Optional table/query to bind the form to. Fields with a matching name get a ControlSource."},
-                "title": {"type": "string", "description": "Optional. Adds a header band with this caption (accent background, white bold title) and sets the form Caption."},
+                "title": {"type": "string", "description": "Optional. Adds a form-header band with this caption (bold dark title, readable on the themed header) and sets the form Caption."},
                 "fields": {
                     "type": "array",
                     "description": "Ordered fields. Each item is a string (bound textbox) OR an object: {field, label, control(textbox|memo|combobox|listbox|checkbox|date), name, control_source, row_source, width_units (single-column only), height, props}.",

@@ -171,9 +171,11 @@ _TIPS: dict[str, str] = {
         "  Single-column form width = 240 + 1800 + 120 + 2400 + 240 = 4800.\n\n"
         "Palette (BGR Long): form_bg=16119285 (#F5F5F5), field_bg=16777215 (white),\n"
         "  field_border=13421772 (#CCCCCC), text=3355443 (#333333),\n"
-        "  accent/header_bg=15426341 (#2563EB), header_text=16777215 (white).\n"
-        "  Pick FROM this list instead of inventing colours — these pass WCAG contrast.\n\n"
-        "Typography: Calibri; labels 10pt, fields 11pt, title 16pt bold.\n"
+        "  accent=15426341 (#2563EB, available for highlights).\n"
+        "  Pick FROM this list instead of inventing colours — these pass WCAG contrast.\n"
+        "  Note: the form-header band is themed by Access (a literal BackColor doesn't\n"
+        "  stick), so the title is dark text, not white-on-accent.\n\n"
+        "Typography: Calibri; labels 10pt, fields 11pt, title 16pt bold (dark).\n"
         "Verify the result with access_lint_form (and access_screenshot for a look)."
     ),
     "subform_tabcontrol": (
