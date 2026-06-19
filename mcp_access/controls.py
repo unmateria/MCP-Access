@@ -17,6 +17,7 @@ from .constants import (
     CTRL_TYPE_BY_NAME, SECTION_MAP,
 )
 from .helpers import coerce_prop, serialize_value, read_tmp, write_tmp
+from .design_defaults import snap as _snap_grid
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +332,7 @@ def ac_create_control(
     db_path: str, object_type: str, object_name: str,
     control_type: Any, props: dict, class_name: Optional[str] = None,
     control_name: Optional[str] = None, skip_lint: bool = False,
+    snap_to_grid: bool = False,
 ) -> dict:
     """
     Creates a new control in a form/report by opening it in Design view.
@@ -379,6 +381,14 @@ def ac_create_control(
     top         = int(coerce_prop(_pop_ci(props, "top",    -1)))
     width       = int(coerce_prop(_pop_ci(props, "width",  -1)))
     height      = int(coerce_prop(_pop_ci(props, "height", -1)))
+
+    # Opt-in: round positional dimensions to the design grid (60 twips). A
+    # value of -1 means "let Access decide" — leave those untouched.
+    if snap_to_grid:
+        left   = left   if left   < 0 else _snap_grid(left)
+        top    = top    if top    < 0 else _snap_grid(top)
+        width  = width  if width  < 0 else _snap_grid(width)
+        height = height if height < 0 else _snap_grid(height)
 
     # Top-level control_name → props['Name'] (only if not already explicit).
     if control_name and not any(k.lower() == "name" for k in props):
@@ -685,15 +695,29 @@ def ac_import_text(db_path: str, object_type: str, object_name: str,
 def ac_set_control_props(
     db_path: str, object_type: str, object_name: str,
     control_name: str, props: dict, skip_lint: bool = False,
+    snap_to_grid: bool = False,
 ) -> dict:
     """
     Modifies properties of an existing control by opening the form/report in Design view.
     props: dict {property: value}. Values are automatically converted
     to int/bool when appropriate.
+    With ``snap_to_grid``, any Left/Top/Width/Height in props is rounded to the
+    60-twip design grid before being applied.
     Returns {"applied": [...], "errors": {...}}.
     """
     if object_type not in ("form", "report"):
         raise ValueError("Only 'form' or 'report'")
+
+    if snap_to_grid:
+        props = dict(props)
+        for k in list(props):
+            if k.lower() in ("left", "top", "width", "height"):
+                try:
+                    v = int(coerce_prop(props[k]))
+                except (TypeError, ValueError):
+                    continue
+                if v >= 0:
+                    props[k] = _snap_grid(v)
 
     app = _Session.connect(db_path)
     _open_in_design(app, object_type, object_name)

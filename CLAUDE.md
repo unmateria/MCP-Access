@@ -11,12 +11,12 @@ MCP server for reading and editing Microsoft Access databases (`.accdb`/`.mdb`) 
 - **Caches**: `_parsed_controls_cache` (control parsing) and `_Session._cm_cache` (CodeModule COM objects — live COM proxies). Both invalidated on DB switch, object modification, and design operations. There is **no** Python-side cache of VBE text: `_cm_all_code()` always reads via `cm.Lines(1, total)` so external edits (manual VBE edits, Ctrl+Z, add-ins) are picked up immediately. See issue #26 for the reason this cache was removed.
 - **Binary section handling**: `ac_get_code` strips PrtMip/PrtDevMode from form/report exports; `ac_set_code` restores them automatically before import.
 
-## Tools (66 total)
+## Tools (67 total)
 
 | Category | Tools |
 |----------|-------|
 | **Database** | `access_create_database`, `access_close` |
-| **Objects** | `access_list_objects`, `access_get_code`, `access_set_code`, `access_export_structure`, `access_delete_object`, `access_create_form`, `access_clone_object` |
+| **Objects** | `access_list_objects`, `access_get_code`, `access_set_code`, `access_export_structure`, `access_delete_object`, `access_create_form`, `access_build_form`, `access_clone_object` |
 | **SQL/Tables** | `access_execute_sql`, `access_execute_batch`, `access_table_info`, `access_search_queries`, `access_search_data`, `access_create_table`, `access_alter_table` |
 | **VBE line-level** | `access_vbe_get_lines`, `access_vbe_get_proc`, `access_vbe_module_info`, `access_vbe_replace_lines`, `access_vbe_find`, `access_vbe_search_all`, `access_vbe_replace_proc`, `access_vbe_patch_proc`, `access_vbe_append` |
 | **Controls** | `access_list_controls`, `access_get_control`, `access_create_control`, `access_delete_control`, `access_set_control_props`, `access_set_multiple_controls`, `access_manage_tab_order` |
@@ -217,6 +217,53 @@ during active development the ERP project is usually uncompiled, so it fails and
 falls back to the conservative heuristic (a `note` is added when `measure` was
 explicitly `wizhook`). The embedded lint always uses `heuristic` (fast, no Run
 dependency). Default everywhere leans on the heuristic for reliability.
+
+## Declarative form auto-layout (v0.7.45)
+
+The LLM is poor at emitting absolute twip coordinates blind (overlaps,
+out-of-bounds, ragged columns, invented colours). The fix is to take the
+arithmetic away from the model — the same idea as the lint, applied at
+*generation* time instead of validation time.
+
+### Pieces
+- **`mcp_access/design_defaults.py`** — the single source of truth for layout
+  tokens: the 60-twip grid (`GRID`), margins/gaps, standard control sizes
+  (`ROW_H=300`, `LABEL_W=1800`, `FIELD_W=2400`, `BUTTON_W/H`, `MEMO_H`…),
+  fonts, and a **closed BGR palette** (`PALETTE`). `bgr(r,g,b)` builds an Access
+  colour Long (BGR order, NOT RGB); `snap(v)` rounds to the grid. `lint.py`,
+  `build_form.py` and `tips('layout')` all read from here — change a number once.
+- **`access_build_form`** (`mcp_access/build_form.py`) — declarative form
+  builder. The model passes a spec (`title`, ordered `fields`, `actions`,
+  `layout` single|two-column, `theme` light|plain); `_plan_layout` (pure, unit
+  tested in `tests/test_build_form_layout.py`) computes every rect from
+  `design_defaults`; `ac_build_form` creates all controls in **one** Design-view
+  session, sets the palette, sizes the form + header/footer sections, assigns a
+  per-section tab order, then attaches the embedded lint. A form it builds passes
+  the lint clean by construction.
+- **`snap_to_grid`** (opt-in, default false) on `ac_create_control` /
+  `ac_set_control_props` — rounds Left/Top/Width/Height to `GRID`. `-1` (auto)
+  values are left untouched.
+
+### Gotchas baked in
+- `_plan_layout` references `_PREFIX` / `_looks_unbound` defined *below* it —
+  fine because both are module globals resolved at call time, not import time.
+- Two-column mode ignores `width_units` (keeps a strict grid); single-column
+  honours it. Memo fields use `MEMO_H` and advance the running `y` cursor so
+  taller rows don't overlap the next.
+- A field name with spaces/operators is left **unbound** (`_looks_unbound`) — a
+  plain column name gets a `ControlSource`. `theme="plain"` emits geometry only
+  (no colours/fonts).
+- `has_header` toggles BOTH FormHeader and FormFooter; when only one is needed
+  the other section's Height is set to 0.
+
+### New lint rules (v0.7.45) — all `info`-severity
+`grid_alignment`, `spacing_consistency`, `edge_margin`, `hierarchy`. They enrich
+the full `access_lint_form` report but **never** change the verdict (which only
+counts errors/warnings) and **never** reach `lint_compact` (errors+warnings
+only), so they can't make the embedded mutation lint noisier. Each keys off the
+canonical grid/margin, so a `build_form` layout passes them clean. Deliberately
+conservative: `hierarchy` only fires on an explicit FontSize inversion (action
+text smaller than body), `spacing_consistency` needs ≥4 controls in a column.
 
 ## Build-a-form-from-scratch recipes (v0.7.38)
 

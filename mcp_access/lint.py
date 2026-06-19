@@ -34,6 +34,7 @@ from typing import Any, Optional
 
 from .constants import CTRL_TYPE, LINT_RULES, WIZHOOK_KEY
 from .controls import _get_parsed_controls
+from .design_defaults import GRID as _GRID, MARGIN_X as _MARGIN_X, snap as _snap
 
 # Section begin tokens in the SaveAsText export. Detail is `Begin Section`;
 # the others are named blocks. Each carries `Name =` and `Height =`.
@@ -903,6 +904,176 @@ def _rule_invisible_or_zero_size(model: dict) -> list:
     return violations
 
 
+# ---------------------------------------------------------------------------
+# Layout-quality rules (v0.7.45). All emit at most `info` — they enrich the
+# full report but never flip the verdict nor reach the compact embedded lint.
+# Deterministic and conservative: each one keys off the canonical design grid
+# / margin (mcp_access.design_defaults) the build_form engine produces, so a
+# form laid out by that engine passes them clean.
+# ---------------------------------------------------------------------------
+
+def _has_pos(c: dict) -> bool:
+    """left/top present (the precondition for position-only rules)."""
+    return c["left"] is not None and c["top"] is not None
+
+
+def _rule_grid_alignment(model: dict) -> list:
+    """Controls whose Left/Top don't sit on the 60-twip design grid (info)."""
+    violations = []
+    for c in model["controls"]:
+        if c.get("parent") or c["type_name"] in _LAYOUT_EXEMPT_TYPES:
+            continue
+        if not _has_pos(c):
+            continue
+        left, top = c["left"], c["top"]
+        off_l, off_t = left % _GRID, top % _GRID
+        if not off_l and not off_t:
+            continue
+        axes = []
+        if off_l:
+            axes.append(f"Left {left}→{_snap(left)}")
+        if off_t:
+            axes.append(f"Top {top}→{_snap(top)}")
+        violations.append(_v(
+            "grid_alignment", "info", c,
+            f"Off the {_GRID}-twip design grid ({', '.join(axes)}).",
+            measured={"left": left, "top": top, "grid": _GRID},
+            suggested_fix=f"Snap Left/Top to the nearest multiple of {_GRID} "
+                          f"(e.g. Left={_snap(left)}, Top={_snap(top)}).",
+        ))
+    return violations
+
+
+def _rule_edge_margin(model: dict) -> list:
+    """Top-level controls hugging the form's left/right edge (info)."""
+    violations = []
+    form_width = model["geometry"].get("form_width", 0)
+    for c in model["controls"]:
+        if c.get("parent") or c["type_name"] in _LAYOUT_EXEMPT_TYPES:
+            continue
+        if not _has_full_geom(c):
+            continue
+        left, _t, right, _b = _rect(c)
+        if 0 <= left < _GRID:
+            violations.append(_v(
+                "edge_margin", "info", c,
+                f"Control hugs the left edge (Left={left}); no breathing room.",
+                measured={"left": left, "recommended_margin": _MARGIN_X},
+                suggested_fix=f"Indent Left to ~{_MARGIN_X} twips for a margin.",
+            ))
+            continue
+        if form_width and 0 < (form_width - right) < _GRID:
+            violations.append(_v(
+                "edge_margin", "info", c,
+                f"Right edge {right} nearly touches the form width {form_width}.",
+                measured={"right": right, "form_width": form_width,
+                          "recommended_margin": _MARGIN_X},
+                suggested_fix=f"Leave ~{_MARGIN_X} twips between the control and "
+                              f"the form's right edge.",
+            ))
+    return violations
+
+
+def _median(values: list) -> float:
+    s = sorted(values)
+    n = len(s)
+    if not n:
+        return 0.0
+    mid = n // 2
+    return s[mid] if n % 2 else (s[mid - 1] + s[mid]) / 2.0
+
+
+def _rule_spacing_consistency(model: dict) -> list:
+    """Uneven vertical gaps between controls stacked in the same column (info).
+
+    Groups by section+parent, clusters by Left (tol 60) to recover visual
+    columns, then within a column of >=4 controls flags any inter-control gap
+    that deviates sharply from the column's median gap. Needs a real population
+    and a positive median, so a form with consistent ROW_STRIDE never trips.
+    """
+    violations = []
+    groups: dict = {}
+    for c in model["controls"]:
+        if not _has_full_geom(c) or c["type_name"] in _LAYOUT_EXEMPT_TYPES:
+            continue
+        groups.setdefault(_group_key(c), []).append(c)
+
+    for ctrls in groups.values():
+        # Recover columns by clustering Left edges (tol = one grid dot).
+        by_left = sorted(ctrls, key=lambda c: c["left"])
+        col: list = []
+        columns: list = []
+        for c in by_left:
+            if col and c["left"] - col[-1]["left"] > _GRID:
+                columns.append(col)
+                col = []
+            col.append(c)
+        if col:
+            columns.append(col)
+
+        for column in columns:
+            if len(column) < 4:
+                continue
+            ordered = sorted(column, key=lambda c: c["top"])
+            pairs = []
+            for a, b in zip(ordered, ordered[1:]):
+                gap = b["top"] - (a["top"] + a["height"])
+                if gap >= 0:                 # negatives are overlaps (own rule)
+                    pairs.append((gap, b))
+            gaps = [g for g, _ in pairs]
+            if len(gaps) < 3:
+                continue
+            med = _median(gaps)
+            if med <= 0:
+                continue
+            for gap, below in pairs:
+                wide = gap > med * 1.8 and (gap - med) > _GRID
+                tight = gap < med * 0.45 and (med - gap) > _GRID
+                if wide or tight:
+                    violations.append(_v(
+                        "spacing_consistency", "info", below,
+                        f"Vertical gap above this control is {gap} twips vs the "
+                        f"column median of {int(med)} — spacing looks uneven.",
+                        measured={"gap": gap, "median_gap": int(med)},
+                        suggested_fix=f"Even out the spacing (≈{int(med)} twips "
+                                      f"between controls in this column).",
+                    ))
+    return violations
+
+
+def _rule_hierarchy(model: dict) -> list:
+    """Clickable actions whose caption font is smaller than the body text (info).
+
+    Objective and narrow on purpose: only fires when a CommandButton declares a
+    FontSize strictly smaller than the form's dominant body (TextBox/Label) font
+    size by more than a point — a real readability inversion, not a style call.
+    """
+    body_sizes = [round(float(_twips(c["style"].get("FontSize"), 11) or 11), 1)
+                  for c in model["controls"]
+                  if c["type_name"] in ("TextBox", "Label")]
+    if not body_sizes:
+        return []
+    body = _mode(body_sizes)
+    if body is None:
+        return []
+    violations = []
+    for c in model["controls"]:
+        if c["type_name"] != "CommandButton":
+            continue
+        if "FontSize" not in c["style"]:
+            continue           # inherits — no explicit inversion to flag
+        fs = round(float(_twips(c["style"]["FontSize"], 11) or 11), 1)
+        if fs < body - 1:
+            violations.append(_v(
+                "hierarchy", "info", c,
+                f"Action button text ({fs}pt) is smaller than the body text "
+                f"({body:g}pt) — actions should read at least as large.",
+                measured={"button_font": fs, "body_font": body},
+                suggested_fix=f"Raise this button's FontSize to >= {body:g}pt.",
+            ))
+    return violations
+
+
 _RULE_FUNCS = {
     "contrast": None,  # handled specially (returns notes)
     "overlap": _rule_overlap,
@@ -911,6 +1082,10 @@ _RULE_FUNCS = {
     "sibling_inconsistency": _rule_sibling_inconsistency,
     "misalignment": _rule_misalignment,
     "invisible_or_zero_size": _rule_invisible_or_zero_size,
+    "grid_alignment": _rule_grid_alignment,
+    "spacing_consistency": _rule_spacing_consistency,
+    "edge_margin": _rule_edge_margin,
+    "hierarchy": _rule_hierarchy,
 }
 
 _SEVERITY_ORDER = {"error": 0, "warning": 1, "info": 2}

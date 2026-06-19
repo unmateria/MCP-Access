@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.7.45 — 2026-06-19
+
+Making the LLM design **much** better Access forms — by moving the layout
+arithmetic out of the model and into the MCP (no skill, no hooks required, as
+requested). One new tool — tool count goes **66 → 67**.
+
+### Added
+
+- **`access_build_form` — declarative form auto-layout.** Instead of many
+  blind `access_create_control` calls with hand-picked twips, describe the form
+  declaratively: a `title`, an ordered list of `fields` (string or
+  `{field, label, control, name, control_source, row_source, width_units,
+  height, props}`), a row of `actions` (footer buttons), `layout`
+  (`single`|`two-column`) and `theme` (`light`|`plain`). The tool computes every
+  Left/Top/Width/Height from a canonical 60-twip grid, applies a closed
+  WCAG-safe palette, binds matching `record_source` columns, assigns a
+  per-section tab order, sizes the form + header/footer sections, and attaches
+  the embedded lint. A form it builds passes the lint clean by construction. The
+  geometry is a pure function (`_plan_layout`) covered by
+  `tests/test_build_form_layout.py`.
+- **Design tokens (`mcp_access/design_defaults.py`).** Single source of truth
+  for the grid, standard control sizes, margins/gaps, fonts and a closed BGR
+  palette (`bgr(r,g,b)` builds an Access colour Long; `snap(v)` rounds to the
+  grid). `lint.py`, `build_form.py` and `access_tips('layout')` all read from it.
+- **`snap_to_grid` (opt-in, default false)** on `access_create_control` and
+  `access_set_control_props` — rounds Left/Top/Width/Height to the 60-twip grid;
+  `-1` (auto) values are left untouched.
+- **`access_tips('layout')`** — the canonical numbers, the columnar/two-column
+  recipe, the palette and a `build_form` example, for hand placement.
+
+### Changed
+
+- **Four new lint rules, all `info`-severity:** `grid_alignment` (off the
+  60-twip grid), `spacing_consistency` (uneven column gaps), `edge_margin`
+  (control hugging the form edge), `hierarchy` (action text smaller than body
+  text). They enrich the full `access_lint_form` report but **never** change the
+  PASS/REVIEW/FAIL verdict (which only counts errors/warnings) and **never**
+  reach the compact lint embedded in mutation results — so the embedded path is
+  not made noisier. Each is deliberately conservative.
+
 ## 0.7.44 — 2026-06-12
 
 Follow-ups to the attached-mode dialog hangs reported by

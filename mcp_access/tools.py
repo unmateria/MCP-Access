@@ -1,5 +1,5 @@
 """
-MCP Tool definitions (66 tools) and schema utilities.
+MCP Tool definitions (67 tools) and schema utilities.
 """
 
 import mcp.types as types
@@ -401,6 +401,10 @@ TOOLS = [
                     "type": "boolean",
                     "description": "Suppress the embedded UI lint of the affected object (default false). Only for bulk programmatic edits.",
                 },
+                "snap_to_grid": {
+                    "type": "boolean",
+                    "description": "Round left/top/width/height to the 60-twip design grid (default false). Values of -1 (auto) are left untouched.",
+                },
             },
             "required": ["db_path", "object_type", "object_name", "control_type", "props"],
         },
@@ -465,6 +469,10 @@ TOOLS = [
                 "skip_lint": {
                     "type": "boolean",
                     "description": "Suppress the embedded UI lint of the affected object (default false). Only for bulk programmatic edits.",
+                },
+                "snap_to_grid": {
+                    "type": "boolean",
+                    "description": "Round any Left/Top/Width/Height in props to the 60-twip design grid (default false).",
                 },
             },
             "required": ["db_path", "object_type", "object_name", "control_name", "props"],
@@ -899,6 +907,56 @@ TOOLS = [
             "required": ["db_path", "form_name"],
         },
     ),
+    # -- Build form (auto-layout) -------------------------------------------
+    types.Tool(
+        name="access_build_form",
+        description=(
+            "Builds a complete, well-laid-out form from a DECLARATIVE spec — the "
+            "preferred way to create data-entry forms. You describe WHAT goes on the "
+            "form (a title, an ordered list of fields, a row of action buttons, "
+            "single or two-column); the tool computes every Left/Top/Width/Height from "
+            "a canonical 60-twip grid, applies a closed light palette (WCAG-safe "
+            "contrast), assigns a sane tab order and sizes the form and its header/"
+            "footer sections. You never pick a coordinate. Use this instead of many "
+            "access_create_control calls; fine-tune afterwards with access_set_control_props "
+            "if needed. See access_tips('layout') for the numbers."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Path to .accdb/.mdb file"},
+                "form_name": {"type": "string", "description": "Name of the form to create"},
+                "record_source": {"type": "string", "description": "Optional table/query to bind the form to. Fields with a matching name get a ControlSource."},
+                "title": {"type": "string", "description": "Optional. Adds a header band with this caption (accent background, white bold title) and sets the form Caption."},
+                "fields": {
+                    "type": "array",
+                    "description": "Ordered fields. Each item is a string (bound textbox) OR an object: {field, label, control(textbox|memo|combobox|listbox|checkbox|date), name, control_source, row_source, width_units (single-column only), height, props}.",
+                    "items": {"type": ["string", "object"], "additionalProperties": True},
+                },
+                "actions": {
+                    "type": "array",
+                    "description": "Footer buttons. Each item is a string (caption) OR an object {caption, name, on_click, props}.",
+                    "items": {"type": ["string", "object"], "additionalProperties": True},
+                },
+                "layout": {
+                    "type": "string",
+                    "enum": ["single", "two-column"],
+                    "default": "single",
+                    "description": "single = one label+field per row; two-column = two pairs per row (width_units ignored).",
+                },
+                "default_view": {"type": "integer", "description": "Optional initial view: 0=Single, 1=Continuous, 2=Datasheet, ..."},
+                "theme": {
+                    "type": "string",
+                    "enum": ["light", "plain"],
+                    "default": "light",
+                    "description": "light = apply the canonical palette+fonts; plain = geometry only (no colours/fonts).",
+                },
+                "overwrite": {"type": "boolean", "default": False, "description": "Delete an existing form of the same name first."},
+                "skip_lint": {"type": "boolean", "description": "Suppress the embedded UI lint of the result (default false)."},
+            },
+            "required": ["db_path", "form_name"],
+        },
+    ),
     # -- Delete object -------------------------------------------------------
     types.Tool(
         name="access_delete_object",
@@ -1190,7 +1248,7 @@ TOOLS = [
                 "rules": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Subset of rule ids to run; omit for all. Ids: contrast, overlap, out_of_bounds, truncation, sibling_inconsistency, misalignment, invisible_or_zero_size",
+                    "description": "Subset of rule ids to run; omit for all. Ids: contrast, overlap, out_of_bounds, truncation, sibling_inconsistency, misalignment, invisible_or_zero_size, grid_alignment, spacing_consistency, edge_margin, hierarchy (the last 4 are info-only layout-quality checks).",
                 },
                 "measure": {
                     "type": "string",

@@ -23,6 +23,7 @@ from .code import (
     ac_list_objects, ac_get_code, ac_set_code, ac_delete_object,
     ac_create_form, ac_export_structure, ac_clone_object,
 )
+from .build_form import ac_build_form
 from .database import (
     ac_create_database, ac_create_table, ac_alter_table, ac_table_info,
 )
@@ -261,6 +262,7 @@ def call_tool_sync(name: str, arguments: dict) -> str:
                 class_name=arguments.get("class_name"),
                 control_name=arguments.get("control_name"),
                 skip_lint=bool(arguments.get("skip_lint", False)),
+                snap_to_grid=bool(arguments.get("snap_to_grid", False)),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -298,6 +300,7 @@ def call_tool_sync(name: str, arguments: dict) -> str:
                 arguments["control_name"],
                 dict(arguments.get("props", {})),
                 skip_lint=bool(arguments.get("skip_lint", False)),
+                snap_to_grid=bool(arguments.get("snap_to_grid", False)),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -515,6 +518,22 @@ def call_tool_sync(name: str, arguments: dict) -> str:
                 has_header=bool(arguments.get("has_header", False)),
                 record_source=arguments.get("record_source"),
                 default_view=arguments.get("default_view"),
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        elif name == "access_build_form":
+            result = ac_build_form(
+                arguments["db_path"],
+                arguments["form_name"],
+                record_source=arguments.get("record_source"),
+                title=arguments.get("title"),
+                fields=arguments.get("fields"),
+                actions=arguments.get("actions"),
+                layout=arguments.get("layout", "single"),
+                default_view=arguments.get("default_view"),
+                theme=arguments.get("theme", "light"),
+                overwrite=bool(arguments.get("overwrite", False)),
+                skip_lint=bool(arguments.get("skip_lint", False)),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 

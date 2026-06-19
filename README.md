@@ -4,7 +4,7 @@
 
 **Give any AI assistant full control over Microsoft Access databases.**
 
-Create forms, write VBA, design tables, manage controls, run queries, build relationships, and edit every corner of an `.accdb` — all through natural language. 66 tools that turn Access into something you can *talk to*.
+Create forms, write VBA, design tables, manage controls, run queries, build relationships, and edit every corner of an `.accdb` — all through natural language. 67 tools that turn Access into something you can *talk to*.
 
 No Access expertise required. Just describe what you want.
 
@@ -330,6 +330,26 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/session.py` that swallows real errors and returns a generic `-32602` code with no detail. A local patch is applied to this machine that includes the actual exception and traceback in the error response. If you upgrade the `mcp` package, re-apply the patch — see `CLAUDE.md` for details.
 
 ## Changelog
+
+### v0.7.45 — 2026-06-19
+
+Better-looking forms by construction — the layout arithmetic moves from the LLM
+into the MCP (no skill, no hooks). One new tool (**67 total**).
+
+- **New: `access_build_form`** — declarative auto-layout. Describe the form
+  (title, ordered fields, action buttons, single/two-column) and it computes
+  every coordinate from a canonical 60-twip grid, applies a closed WCAG-safe
+  palette, assigns a tab order and sizes the form + header/footer. The model
+  never picks a coordinate.
+- **New: design tokens** (`mcp_access/design_defaults.py`) — single source of
+  truth for grid, sizes, spacing, fonts and the BGR palette. Documented for
+  hand-placement in `access_tips('layout')`.
+- **New: `snap_to_grid`** (opt-in) on `access_create_control` /
+  `access_set_control_props` — rounds Left/Top/Width/Height to the 60-twip grid.
+- **Lint:** four new `info`-only layout-quality rules — `grid_alignment`,
+  `spacing_consistency`, `edge_margin`, `hierarchy`. They enrich the full
+  `access_lint_form` report without changing the verdict or the embedded
+  mutation lint.
 
 ### v0.7.44 — 2026-06-12
 
