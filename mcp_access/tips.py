@@ -90,7 +90,7 @@ _TIPS: dict[str, str] = {
         "  Before compiling, check: Eval('Application.BrokenReference') — broken refs cause mysterious failures.\n"
         "  After compile error: use access_vbe_get_lines to read the problematic code, fix with access_vbe_replace_lines."
     ),
-    "design": (
+    "design_vbe": (
         "Design view + VBE conflict:\n"
         "  After design operations, the form may remain open in Design view.\n"
         "  access_vbe_replace_proc closes the form (acSaveYes) before accessing VBE.\n"

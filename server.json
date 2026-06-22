@@ -7,12 +7,12 @@
     "url": "https://github.com/unmateria/MCP-Access",
     "source": "github"
   },
-  "version": "0.7.46",
+  "version": "0.7.47",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "mcp-msaccess-database",
-      "version": "0.7.46",
+      "version": "0.7.47",
       "transport": {
         "type": "stdio"
       }

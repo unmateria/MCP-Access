@@ -331,6 +331,20 @@ The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/s
 
 ## Changelog
 
+### v0.7.47 — 2026-06-22
+
+Bugfix reported by [@jbchea](https://github.com/jbchea)
+([#32](https://github.com/unmateria/MCP-Access/issues/32)) — thanks!
+
+- **Fix: duplicate `"design"` key in `tips.py`.** The v0.7.45/46 design-system
+  work added a second `"design"` entry to the `_TIPS` dict, silently shadowing
+  the original one. Python keeps only the last assignment, so
+  `access_tips('design')` returned only the new design-direction guidance and the
+  earlier tip (Design view ↔ VBE close-ordering + SaveAsText per-object-type
+  encoding) was unreachable dead code. The original tip now lives under its own
+  key, `access_tips('design_vbe')`, so both are reachable again. No behaviour
+  change beyond the tips topic (still **67 tools**).
+
 ### v0.7.46 — 2026-06-19
 
 Real design taste for `access_build_form` — three curated **design directions**
