@@ -170,8 +170,8 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 
 | Tool | Description |
 |------|-------------|
-| `access_list_linked_tables` | List all linked tables with source table, connection string, ODBC flag |
-| `access_relink_table` | Change connection string and refresh link — auto-saves credentials (`dbAttachSavePWD`) when UID/PWD detected. `relink_all=true` updates all tables with the same original connection |
+| `access_list_linked_tables` | List linked tables with source table, connection string, ODBC flag. `name='X'` returns one table; `names_only=true` is a light listing (no connect strings — use it when hundreds of links overflow the result); `mask_password=true` masks `PWD=` |
+| `access_relink_table` | Change connection string and refresh link — auto-saves credentials (`dbAttachSavePWD`) when UID/PWD detected. `relink_all=true` updates all tables with the same original connection. `refresh=true` re-reads the schema using the table's own connect string (no `new_connect`, password never dumped) |
 
 ### Relationships
 
@@ -330,6 +330,31 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/session.py` that swallows real errors and returns a generic `-32602` code with no detail. A local patch is applied to this machine that includes the actual exception and traceback in the error response. If you upgrade the `mcp` package, re-apply the patch — see `CLAUDE.md` for details.
 
 ## Changelog
+
+### v0.7.48 — 2026-06-24
+
+Usability fixes from a real editing session against a database with many
+ODBC-linked tables. No behaviour change for existing callers (still **67 tools**).
+
+- **`access_list_linked_tables` no longer overflows on large databases.** With
+  hundreds of linked tables the tool used to dump every full connect string,
+  blowing past the per-result token cap and forcing a `grep`. New optional args:
+  `name='X'` (return just that table, exact + case-insensitive), `names_only=true`
+  (light listing, no connect strings), and `mask_password=true` (mask `PWD=` in
+  the returned connect strings). Defaults preserve the previous output.
+- **`access_relink_table refresh=true`.** Re-reads a linked table's schema using
+  its **own** current connect string (no `new_connect` needed, password never
+  dumped) — the common "I altered the table on the server, refresh the link"
+  case. `relink_all=true` refreshes every table sharing the connect string.
+- **Scoped embedded lint.** Creating/editing a control on a big inherited form
+  used to attach the whole-form lint (pre-existing warnings on unrelated
+  controls drowned out the change). `access_create_control`,
+  `access_set_control_props` and `access_set_multiple_controls` now scope the
+  `lint.violations` list to the controls they touched (the error/warning/info
+  counts stay whole-form); pass `full_lint=true` for the unfiltered list.
+- **Docs:** the `access_relink_table` description now notes that `LoginTimeout=8`
+  is injected into `new_connect`, so the returned connect string differs from the
+  one you sent.
 
 ### v0.7.47 — 2026-06-22
 

@@ -69,33 +69,73 @@ def _odbc_preflight(connect: str, timeout_seconds: int = _DEFAULT_LOGIN_TIMEOUT)
         return str(exc)
 
 
-def ac_list_linked_tables(db_path: str) -> dict:
-    """Lists all linked tables with connection information."""
+def _mask_pwd(conn: str) -> str:
+    """Masks the password in an ODBC connect string (``PWD=...`` → ``PWD=***``).
+
+    Connect strings carry the SQL Server password in the clear; masking lets a
+    caller list links without spilling credentials into logs/context. The match
+    is case-insensitive and stops at the next ``;`` (or end of string).
+    """
+    return re.sub(r'(?i)(PWD=)[^;]*', r'\1***', conn)
+
+
+def ac_list_linked_tables(
+    db_path: str,
+    name: Optional[str] = None,
+    names_only: bool = False,
+    mask_password: bool = False,
+) -> dict:
+    """Lists linked tables with connection information.
+
+    name          -- if set, return only that table (exact match, case-insensitive).
+    names_only    -- omit connect_string (light listing — fits when there are
+                     hundreds of linked tables and the full dump overflows tokens).
+    mask_password -- mask PWD=... in returned connect strings (default False).
+    """
     app = _Session.connect(db_path)
     db = app.CurrentDb()
     linked: list[dict] = []
+    want = name.casefold() if name else None
     for i in range(db.TableDefs.Count):
         td = db.TableDefs(i)
         conn = td.Connect
         if not conn:
             continue
-        name = td.Name
-        if name.startswith("~") or name.startswith("MSys"):
+        tname = td.Name
+        if tname.startswith("~") or tname.startswith("MSys"):
             continue
-        linked.append({
-            "name": name,
+        if want is not None and tname.casefold() != want:
+            continue
+        entry = {
+            "name": tname,
             "source_table": td.SourceTableName,
-            "connect_string": conn,
             "is_odbc": conn.upper().startswith("ODBC;"),
-        })
+        }
+        if not names_only:
+            entry["connect_string"] = _mask_pwd(conn) if mask_password else conn
+        linked.append(entry)
     return {"count": len(linked), "linked_tables": linked}
 
 
 def ac_relink_table(
-    db_path: str, table_name: str, new_connect: str,
-    relink_all: bool = False,
+    db_path: str, table_name: str, new_connect: Optional[str] = None,
+    relink_all: bool = False, refresh: bool = False,
 ) -> dict:
-    """Changes the connection string of a linked table and refreshes."""
+    """Changes the connection string of a linked table and refreshes.
+
+    refresh=True re-attaches the table using its OWN current connect string
+    (only refreshes the schema, e.g. after an ALTER TABLE on the server) —
+    new_connect is ignored and the password is never dumped or required.
+    """
+    if refresh:
+        return _refresh_links(db_path, table_name, relink_all)
+
+    if not new_connect:
+        raise ValueError(
+            "new_connect is required unless refresh=True "
+            "(refresh re-attaches a table with its own connect string)."
+        )
+
     # Inject LoginTimeout so a bad connect string fails fast instead of
     # opening a modal "SQL Server Login" dialog (impossible to dismiss
     # in a headless COM session and would hang the agent indefinitely).
@@ -187,6 +227,36 @@ def ac_relink_table(
         _relink_one(table_name, old)
 
     return {"relinked_count": len(relinked), "tables": relinked}
+
+
+def _refresh_links(db_path: str, table_name: str, relink_all: bool) -> dict:
+    """Refreshes a linked table's schema using its own current connect string.
+
+    Lightweight path (DAO ``RefreshLink``, no delete/TransferDatabase) for the
+    common "the server schema changed, re-read it" case — never touches or
+    exposes the stored password.
+    """
+    app = _Session.connect(db_path)
+    db = app.CurrentDb()
+    try:
+        ref_td = db.TableDefs(table_name)
+    except Exception as exc:
+        raise ValueError(f"Table '{table_name}' not found: {exc}")
+    if not ref_td.Connect:
+        raise ValueError(f"'{table_name}' is not a linked table")
+
+    if relink_all:
+        target_conn = ref_td.Connect
+        names = [db.TableDefs(i).Name for i in range(db.TableDefs.Count)
+                 if db.TableDefs(i).Connect == target_conn]
+    else:
+        names = [table_name]
+
+    refreshed: list[str] = []
+    for n in names:
+        db.TableDefs(n).RefreshLink()
+        refreshed.append(n)
+    return {"action": "refreshed", "refreshed_count": len(refreshed), "tables": refreshed}
 
 
 def ac_list_relationships(db_path: str) -> dict:

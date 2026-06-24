@@ -1386,13 +1386,29 @@ def ac_lint_form(
 # Public: compact lint embedded in design-mutation tool results
 # ---------------------------------------------------------------------------
 
+def _violation_controls(v: dict) -> set:
+    """All control names a violation refers to (its own control + an overlap's pair)."""
+    names = {v.get("control")}
+    measured = v.get("measured")
+    if isinstance(measured, dict):
+        names.update(n for n in (measured.get("a"), measured.get("b")) if n)
+    return {n for n in names if n}
+
+
 def lint_compact(db_path: str, object_type: str, object_name: str,
-                 max_items: int = 25) -> Optional[dict]:
+                 max_items: int = 25,
+                 focus_controls: Optional[set] = None) -> Optional[dict]:
     """Fast, embeddable lint for the design-mutation tools.
 
     Heuristic measurement (no WizHook/Run dependency — works on uncompiled
     projects), errors+warnings only, capped. Returns None on any failure so it
     can NEVER break the host mutation (the edit is the primary operation).
+
+    focus_controls -- if set, the returned ``violations`` list is filtered to
+    only those touching these controls (the ones the mutation just changed), so
+    pre-existing issues on unrelated controls of a big inherited form don't
+    drown out the result. The ``error``/``warning``/``info`` counts stay
+    whole-form, so the caller still sees the form has other issues.
     """
     if object_type not in ("form", "report"):
         return None
@@ -1402,14 +1418,29 @@ def lint_compact(db_path: str, object_type: str, object_name: str,
         actionable = [v for v in _sort_violations(run["violations"])
                       if v["severity"] in ("error", "warning")]
         summary = _summarize(run["violations"])
-        return {
+        focused = actionable
+        filtered_out = 0
+        if focus_controls:
+            want = {c.casefold() for c in focus_controls}
+            focused = [v for v in actionable
+                       if {n.casefold() for n in _violation_controls(v)} & want]
+            filtered_out = len(actionable) - len(focused)
+        out = {
             "verdict": summary["verdict"],
             "error": summary["error"],
             "warning": summary["warning"],
             "info": summary["info"],
-            "violations": actionable[:max_items],
-            "hint": ("Run access_lint_form for the full report and suggested fixes."
-                     if actionable else "No errors or warnings detected."),
+            "violations": focused[:max_items],
         }
+        if filtered_out:
+            out["hint"] = (
+                f"{filtered_out} more error(s)/warning(s) on other controls hidden "
+                "(pre-existing). Pass full_lint=true or run access_lint_form to see them."
+            )
+        elif focused:
+            out["hint"] = "Run access_lint_form for the full report and suggested fixes."
+        else:
+            out["hint"] = "No errors or warnings detected."
+        return out
     except Exception:
         return None

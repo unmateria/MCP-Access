@@ -429,6 +429,11 @@ start (includes the blank/comment lines above); `body_line` is the
 ### Linked tables and dbAttachSavePWD
 - `dbAttachSavePWD` = **131072** (0x20000), NOT 65536.
 - Setting `TableDef.Attributes` from Python COM before Append does not work reliably. Use `DoCmd.TransferDatabase(acLink, ..., StoreLogin:=True)` instead.
+- **`ac_list_linked_tables` filtering (v0.7.48)**: `name` (single exact/case-insensitive match), `names_only` (drop `connect_string` — a full dump of hundreds of links overflows the per-result token cap), `mask_password` (mask `PWD=` via `_mask_pwd`). All default to the pre-v0.7.48 full output so existing callers are unaffected.
+- **`ac_relink_table(refresh=True)` (v0.7.48)**: `_refresh_links` calls DAO `RefreshLink()` using the table's own connect string (no delete/TransferDatabase, password never touched) — for "the server schema changed, re-read it". `new_connect` is `Optional` and only required when `refresh=False`.
+
+### Scoped embedded lint (v0.7.48)
+`_attach_lint`/`lint_compact` take `focus_controls`: the design-mutation tools (`ac_create_control`, `ac_set_control_props`, `ac_set_multiple_controls`) pass the controls they just touched so `lint.violations` isn't buried by pre-existing issues on a big inherited form. `_violation_controls` matches a violation's own `control` **plus** an overlap pair's `measured.a`/`measured.b`. The `error`/`warning`/`info` counts stay whole-form (the model still sees there are other issues). `full_lint=true` bypasses the filter.
 
 ### ac_execute_sql / ac_execute_batch
 - Both use try/except retry with `dbSeeChanges` for ODBC linked tables with IDENTITY columns.

@@ -263,6 +263,7 @@ def call_tool_sync(name: str, arguments: dict) -> str:
                 control_name=arguments.get("control_name"),
                 skip_lint=bool(arguments.get("skip_lint", False)),
                 snap_to_grid=bool(arguments.get("snap_to_grid", False)),
+                full_lint=bool(arguments.get("full_lint", False)),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -301,6 +302,7 @@ def call_tool_sync(name: str, arguments: dict) -> str:
                 dict(arguments.get("props", {})),
                 skip_lint=bool(arguments.get("skip_lint", False)),
                 snap_to_grid=bool(arguments.get("snap_to_grid", False)),
+                full_lint=bool(arguments.get("full_lint", False)),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -329,15 +331,21 @@ def call_tool_sync(name: str, arguments: dict) -> str:
 
         # -- Linked tables ------------------------------------------------
         elif name == "access_list_linked_tables":
-            result = ac_list_linked_tables(arguments["db_path"])
+            result = ac_list_linked_tables(
+                arguments["db_path"],
+                arguments.get("name"),
+                bool(arguments.get("names_only", False)),
+                bool(arguments.get("mask_password", False)),
+            )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
         elif name == "access_relink_table":
             result = ac_relink_table(
                 arguments["db_path"],
                 arguments["table_name"],
-                arguments["new_connect"],
+                arguments.get("new_connect"),
                 bool(arguments.get("relink_all", False)),
+                bool(arguments.get("refresh", False)),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -618,6 +626,7 @@ def call_tool_sync(name: str, arguments: dict) -> str:
                 arguments["object_name"],
                 arguments["controls"],
                 skip_lint=bool(arguments.get("skip_lint", False)),
+                full_lint=bool(arguments.get("full_lint", False)),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
