@@ -10,6 +10,7 @@ import html as html_mod
 import os
 import re
 import tempfile
+import threading
 from typing import Any
 
 from .core import (
@@ -21,6 +22,51 @@ from .constants import (
     CONTROL_SEARCH_PROPS,
 )
 from .helpers import text_matches, read_tmp
+
+
+# ---------------------------------------------------------------------------
+# DoCmd.Save watchdog helper (v0.7.49 — issue #33)
+# ---------------------------------------------------------------------------
+# DoCmd.Save can pop an error dialog ("Save isn't available now") when the
+# target module/form is open in the VBE.  Access shows the dialog and waits
+# for a click before raising the COM exception — the bare except already
+# swallows the error, but nothing dismissed the dialog, so the user had to
+# click "OK" after every VBE write call.
+#
+# Fix: wrap DoCmd.Save in a lightweight watchdog thread (same pattern as
+# _call_with_dialog_watchdog in maintenance.py) with a short 0.3 s grace
+# period so the dialog is dismissed automatically and never reaches the user.
+
+def _save_vbe_module(app, obj_type_code: int, object_name: str) -> None:
+    """Call DoCmd.Save with a dialog-dismiss watchdog (best-effort)."""
+    from .vba_exec import _dismiss_access_dialogs
+    try:
+        _h = app.hWndAccessApp
+        hwnd = int(_h() if callable(_h) else _h)
+    except Exception:
+        hwnd = 0
+
+    stop_event = threading.Event()
+
+    def _watchdog():
+        if stop_event.wait(0.3):
+            return
+        while not stop_event.is_set():
+            if hwnd:
+                try:
+                    _dismiss_access_dialogs(hwnd)
+                except Exception:
+                    pass
+            stop_event.wait(0.3)
+
+    t = threading.Thread(target=_watchdog, daemon=True)
+    t.start()
+    try:
+        app.DoCmd.Save(obj_type_code, object_name)
+    except Exception:
+        pass  # best-effort; compact/close will also persist
+    finally:
+        stop_event.set()
 
 
 # ---------------------------------------------------------------------------
@@ -634,11 +680,7 @@ def ac_vbe_replace_lines(
             results.append(r)
         # Persist
         cache_key = f"{object_type}:{object_name}"
-        try:
-            obj_type_code = AC_TYPE.get(object_type, 5)
-            app.DoCmd.Save(obj_type_code, object_name)
-        except Exception:
-            pass
+        _save_vbe_module(app, AC_TYPE.get(object_type, 5), object_name)
         new_total = cm.CountOfLines
         total_deleted = sum(r["deleted"] for r in results)
         total_inserted = sum(r["inserted"] for r in results)
@@ -674,11 +716,7 @@ def ac_vbe_replace_lines(
     r = _exec_single_replace(cm, object_type, object_name, start_line, count, new_code)
     cache_key = f"{object_type}:{object_name}"
     # Persist VBE changes to .accdb — without this, changes are only in memory
-    try:
-        obj_type_code = AC_TYPE.get(object_type, 5)  # acModule=5 default
-        app.DoCmd.Save(obj_type_code, object_name)
-    except Exception:
-        pass  # save is best-effort; compact/close will also persist
+    _save_vbe_module(app, AC_TYPE.get(object_type, 5), object_name)
     new_total = cm.CountOfLines
     # Health check
     health = _check_module_health(cm, cache_key)
@@ -1169,11 +1207,7 @@ def ac_vbe_patch_proc(
 
     # Persist VBE changes to .accdb — without this, patches to form/report
     # code-behind can be lost because the object's dirty flag is not set.
-    try:
-        obj_type_code = AC_TYPE.get(object_type, 5)
-        app.DoCmd.Save(obj_type_code, object_name)
-    except Exception:
-        pass
+    _save_vbe_module(app, AC_TYPE.get(object_type, 5), object_name)
     new_total = cm.CountOfLines
     try:
         new_count = cm.ProcCountLines(proc_name, kind) if applied > 0 else 0
@@ -1226,11 +1260,7 @@ def ac_vbe_append(
     inserted = cm.CountOfLines - total
     cache_key = f"{object_type}:{object_name}"
     # Persist VBE changes to .accdb
-    try:
-        obj_type_code = AC_TYPE.get(object_type, 5)
-        app.DoCmd.Save(obj_type_code, object_name)
-    except Exception:
-        pass
+    _save_vbe_module(app, AC_TYPE.get(object_type, 5), object_name)
     new_total = cm.CountOfLines
     # Health check
     health = _check_module_health(cm, cache_key)

@@ -331,6 +331,24 @@ The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/s
 
 ## Changelog
 
+### v0.7.49 — 2026-06-25
+
+Bugfix reported by [@TvanStiphout-Home](https://github.com/TvanStiphout-Home) (Tom van Stiphout) — **thank you Tom**, once again, for the laser-precise diagnosis and repro steps. We owe you a beer (or ten).
+
+- **VBE-write tools no longer pop an Access error dialog** (`issue #33`).
+  `access_vbe_replace_lines`, `access_vbe_replace_proc`, `access_vbe_patch_proc`
+  and `access_vbe_append` all call `DoCmd.Save` to persist VBE changes to the
+  `.accdb`. When the target module or form was open in the VBE, Access popped a
+  modal "Save isn't available now" error dialog and waited for a click — one
+  dialog per write call, completely blocking the UI. The `except Exception: pass`
+  swallowed the COM error so edits landed fine, but the watchdog that covers
+  compile/eval paths was absent on the write path so nothing dismissed the dialog.
+  Fix: the four `DoCmd.Save` calls are now wrapped in a new `_save_vbe_module`
+  helper that spins up a daemon watchdog thread (0.3 s grace period, same pattern
+  as `_call_with_dialog_watchdog` in `maintenance.py`) to dismiss the dialog
+  automatically. No behaviour change: the save remains best-effort and the edit
+  always lands regardless.
+
 ### v0.7.48 — 2026-06-24
 
 Usability fixes from a real editing session against a database with many
