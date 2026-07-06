@@ -97,6 +97,27 @@ There is **no** MCP tool that turns the gate on at runtime, and there never will
 be — an injection could call it. Enabling always requires the out-of-band action
 plus a restart.
 
+### Residual code-execution vectors the gate does NOT close
+
+The gate closes the *arbitrary, imperative* execution tools. It does **not** —
+and cannot, without disabling the features — close every path by which VBA
+already present in a chosen database can run:
+
+- **Opening a form or report runs its event VBA** (`Form_Open`, `Form_Load`,
+  `Report_Open`, …). `access_screenshot` (with `open_form`/`open_report`) and
+  `access_output_report` open objects, so malicious event code in the database
+  executes even with the gate closed.
+- **`access_ui_click` / `access_ui_type`** can press buttons that run code.
+- **`access_execute_sql` / `access_execute_batch`** run through DAO under Jet's
+  expression **sandbox** (default `SandboxMode`), which blocks `Shell`/
+  `CreateObject` and user-defined VBA functions in queries — so they are not a
+  general RCE path. If an operator has lowered `SandboxMode` machine-wide, that
+  guarantee weakens (an Access-wide setting, outside this server's control).
+
+Takeaway: the gate stops an injection from *issuing* arbitrary code, but opening
+an untrusted database is still an inherent risk. **Only point the server at
+databases you trust.**
+
 ## Non-goals of this iteration
 
 - A mode system (`MCP_ACCESS_MODE` readonly/safe/full) gating whole tool families.
