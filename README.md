@@ -331,6 +331,21 @@ The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/s
 
 ## Changelog
 
+### v0.7.50 — 2026-07-06 — security fix (GHSA-9jp6-hph9-jm5f)
+
+Prompt-injection fix reported by [@nicoPadi1002](https://github.com/nicoPadi1002)
+(CobaltoSec) — **thank you** for the responsible disclosure.
+
+- **The `access-workflow` prompt template no longer reflects an untrusted
+  `db_path` verbatim.** A `db_path` argument carrying newlines could inject
+  arbitrary text (e.g. a fake `SYSTEM OVERRIDE:` block) ahead of the prompt's
+  `REQUIRED RULES` section, potentially steering an agent into calling
+  `access_run_vba` / `access_run_macro`. A real Access file path never contains
+  newlines or control characters, so `_sanitize_db_path` now collapses the value
+  to a single line at the first control character, caps it at `MAX_PATH`, and the
+  template wraps it in backticks as plain data. Legit paths are unchanged.
+  Regression tests in `tests/test_prompt_injection.py`.
+
 ### v0.7.49 — 2026-06-25
 
 Bugfix reported by [@TvanStiphout-Home](https://github.com/TvanStiphout-Home) (Tom van Stiphout) — **thank you Tom**, once again, for the laser-precise diagnosis and repro steps. We owe you a beer (or ten).

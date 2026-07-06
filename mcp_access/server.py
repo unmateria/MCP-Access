@@ -4,6 +4,7 @@ MCP Server setup: list_tools, list_prompts, get_prompt, call_tool, main.
 
 import asyncio
 import json
+import re
 import time
 import traceback
 
@@ -43,9 +44,31 @@ async def list_prompts() -> list[types.Prompt]:
     ]
 
 
+# A legitimate Windows Access path never contains newlines or control
+# characters, so any that appear are an attempt to inject extra prompt
+# instructions (GHSA-9jp6-hph9-jm5f). Collapse to a single sanitized line and
+# cap the length before reflecting it into the prompt template.
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+_MAX_PATH_LEN = 260  # Windows MAX_PATH
+
+
+def _sanitize_db_path(raw: object) -> str:
+    """Reduce an untrusted db_path to a single harmless line of path text."""
+    if not isinstance(raw, str) or not raw.strip():
+        return "<path_to_file.accdb>"
+    # Drop everything from the first control character onward: this removes the
+    # newline the injection relies on and anything smuggled after it.
+    cleaned = _CONTROL_CHARS.split(raw, 1)[0].strip()
+    if not cleaned:
+        return "<path_to_file.accdb>"
+    if len(cleaned) > _MAX_PATH_LEN:
+        cleaned = cleaned[:_MAX_PATH_LEN] + "..."
+    return cleaned
+
+
 @server.get_prompt()
 async def get_prompt(name: str, arguments: dict | None) -> types.GetPromptResult:
-    db_path = (arguments or {}).get("db_path", "<path_to_file.accdb>")
+    db_path = _sanitize_db_path((arguments or {}).get("db_path"))
     return types.GetPromptResult(
         description="Required workflow for working with Access databases",
         messages=[
@@ -54,7 +77,7 @@ async def get_prompt(name: str, arguments: dict | None) -> types.GetPromptResult
                 content=types.TextContent(
                     type="text",
                     text=f"""
-I'm working with a Microsoft Access database: {db_path}
+I'm working with a Microsoft Access database (file path): `{db_path}`
 
 REQUIRED RULES for the agent:
 1. Any operation on .accdb or .mdb files MUST be done through the MCP access server.
