@@ -405,6 +405,10 @@ TOOLS = [
                     "type": "boolean",
                     "description": "Round left/top/width/height to the 60-twip design grid (default false). Values of -1 (auto) are left untouched.",
                 },
+                "full_lint": {
+                    "type": "boolean",
+                    "description": "Return the whole-form lint instead of only the new control's violations (default false).",
+                },
             },
             "required": ["db_path", "object_type", "object_name", "control_type", "props"],
         },
@@ -474,6 +478,10 @@ TOOLS = [
                     "type": "boolean",
                     "description": "Round any Left/Top/Width/Height in props to the 60-twip design grid (default false).",
                 },
+                "full_lint": {
+                    "type": "boolean",
+                    "description": "Return the whole-form lint instead of only this control's violations (default false).",
+                },
             },
             "required": ["db_path", "object_type", "object_name", "control_name", "props"],
         },
@@ -526,27 +534,44 @@ TOOLS = [
     # -- Linked tables -------------------------------------------------------
     types.Tool(
         name="access_list_linked_tables",
-        description="Lists linked tables with source_table, connect_string, is_odbc.",
+        description=(
+            "Lists linked tables with source_table, connect_string, is_odbc. "
+            "name='X' returns only that table (exact, case-insensitive); "
+            "names_only=true gives a light listing without connect strings "
+            "(use it when there are hundreds of links and the full dump overflows); "
+            "mask_password=true masks PWD=... in the returned connect strings."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
                 "db_path": {"type": "string", "description": "Path to .accdb/.mdb file"},
+                "name": {"type": "string", "description": "If set, return only this linked table (exact match, case-insensitive)"},
+                "names_only": {"type": "boolean", "default": False, "description": "Omit connect strings (light listing)"},
+                "mask_password": {"type": "boolean", "default": False, "description": "Mask PWD=... in connect strings"},
             },
             "required": ["db_path"],
         },
     ),
     types.Tool(
         name="access_relink_table",
-        description="Changes the connect string of a linked table and refreshes. relink_all=true updates all tables with the same original connection.",
+        description=(
+            "Changes the connect string of a linked table and refreshes. "
+            "relink_all=true updates all tables with the same original connection. "
+            "refresh=true re-reads the schema using the table's OWN connect string "
+            "(no new_connect needed, password never dumped) — use after an ALTER TABLE on the server. "
+            "Note: LoginTimeout=8 is injected into new_connect so a bad string fails fast instead of "
+            "hanging on a modal login dialog, so the returned new_connect differs from the one you sent."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
                 "db_path": {"type": "string", "description": "Path to .accdb/.mdb file"},
                 "table_name": {"type": "string", "description": "Linked table name"},
-                "new_connect": {"type": "string", "description": "New connection string"},
+                "new_connect": {"type": "string", "description": "New connection string (not needed when refresh=true)"},
                 "relink_all": {"type": "boolean", "default": False, "description": "true = relink all tables with the same original connection"},
+                "refresh": {"type": "boolean", "default": False, "description": "true = refresh schema using the table's own connect string (ignores new_connect)"},
             },
-            "required": ["db_path", "table_name", "new_connect"],
+            "required": ["db_path", "table_name"],
         },
     ),
     # -- Relationships -------------------------------------------------------
@@ -1232,6 +1257,10 @@ TOOLS = [
                 "skip_lint": {
                     "type": "boolean",
                     "description": "Suppress the embedded UI lint of the affected object (default false). Only for bulk programmatic edits.",
+                },
+                "full_lint": {
+                    "type": "boolean",
+                    "description": "Return the whole-form lint instead of only the edited controls' violations (default false).",
                 },
             },
             "required": ["db_path", "object_type", "object_name", "controls"],
