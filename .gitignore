@@ -12,3 +12,9 @@ build/
 *.accdb
 *.mdb
 .pypirc
+
+# Project website (kept local, not part of the published package)
+web/
+
+# Internal working notes (may contain real DB / infra names)
+INFORME_*.md
