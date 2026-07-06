@@ -216,6 +216,10 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 
 ### VBA & macro execution
 
+> ⚠️ **Disabled by default (v0.7.51).** These three tools run arbitrary code and
+> are gated behind the `MCP_ACCESS_ALLOW_CODE_EXEC` environment variable. See
+> [Security](#security) to enable them.
+
 | Tool | Description |
 |------|-------------|
 | `access_run_macro` | Execute an Access macro by name |
@@ -307,6 +311,25 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 6. access_screenshot(db)  → verify the result
 ```
 
+## Security
+
+This is a **local stdio server** with no network surface, so there is no login
+by design — see [SECURITY.md](SECURITY.md) for the full threat model. The main
+risk is **prompt injection**: an agent tricked (via `db_path` or content it reads
+out of the database) into calling a code-execution tool.
+
+**Code execution is disabled by default (v0.7.51).** The three tools that run
+arbitrary VBA/Shell — `access_run_vba`, `access_eval_vba`, `access_run_macro` —
+are hidden and rejected unless you opt in with an environment variable. To
+re-enable, add it to this server's `env` in your MCP client config and **restart**:
+
+```json
+"env": { "MCP_ACCESS_ALLOW_CODE_EXEC": "1" }
+```
+
+Enabling grants arbitrary OS command execution; only point the server at trusted
+databases. See [SECURITY.md](SECURITY.md) for details and how to report issues.
+
 ## Notes
 
 - Access runs visible (`Visible = True`) so VBE COM access works correctly.
@@ -330,6 +353,18 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/session.py` that swallows real errors and returns a generic `-32602` code with no detail. A local patch is applied to this machine that includes the actual exception and traceback in the error response. If you upgrade the `mcp` package, re-apply the patch — see `CLAUDE.md` for details.
 
 ## Changelog
+
+### v0.7.51 — 2026-07-06 — code-execution gate (opt-in)
+
+**Behavior change:** VBA/macro execution now requires opt-in. `access_run_vba`,
+`access_eval_vba` and `access_run_macro` are **disabled by default** — they are
+no longer advertised, and a direct call is rejected before touching COM. A fresh
+PyPI install can no longer be turned into RCE by a single prompt injection.
+
+To re-enable, set `MCP_ACCESS_ALLOW_CODE_EXEC=1` in the server's `env` and restart
+(the gate is read at startup only, so it stays out of reach of an in-session
+injection). New [SECURITY.md](SECURITY.md) documents the threat model. All other
+tools are unchanged.
 
 ### v0.7.50 — 2026-07-06 — security fix (GHSA-9jp6-hph9-jm5f)
 

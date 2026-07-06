@@ -14,6 +14,7 @@ from mcp.server.stdio import stdio_server
 
 from .core import _Session, _com_executor, log
 from .tools import TOOLS, coerce_arguments
+from .security import code_exec_enabled, CODE_EXEC_TOOLS
 
 
 server = Server("access-mcp")
@@ -21,7 +22,12 @@ server = Server("access-mcp")
 
 @server.list_tools()
 async def list_tools() -> list[types.Tool]:
-    return TOOLS
+    # Hide code-execution tools unless the operator opted in. This is hygiene
+    # only (the model never sees them); the real barrier is the dispatch-time
+    # check in dispatcher.call_tool_sync, which rejects a direct call too.
+    if code_exec_enabled():
+        return TOOLS
+    return [t for t in TOOLS if t.name not in CODE_EXEC_TOOLS]
 
 
 @server.list_prompts()

@@ -6,6 +6,7 @@ import json
 import traceback
 
 from .core import _Session, log
+from .security import code_exec_enabled, CODE_EXEC_TOOLS, code_exec_denied_message
 
 from .vbe import (
     ac_vbe_get_lines, ac_vbe_get_proc, ac_vbe_module_info,
@@ -77,6 +78,12 @@ def _new_lines_to_code(val):
 def call_tool_sync(name: str, arguments: dict) -> str:
     """Synchronous tool dispatcher -- runs in a thread to avoid blocking the event loop."""
     try:
+        # Capability gate: reject code-execution tools before touching COM when
+        # the operator has not opted in. This runs first so a client that calls
+        # the name directly (without seeing it advertised) is still refused.
+        if name in CODE_EXEC_TOOLS and not code_exec_enabled():
+            return json.dumps(code_exec_denied_message(name), ensure_ascii=False, indent=2)
+
         if name == "access_list_objects":
             result = ac_list_objects(
                 arguments["db_path"],

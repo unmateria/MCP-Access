@@ -408,6 +408,41 @@ start (includes the blank/comment lines above); `body_line` is the
 `Sub`/`Function`/`Property` declaration line. Use `start_line` for whole-proc ops,
 `body_line` for body line-range edits.
 
+## Code-execution gate (v0.7.51)
+
+`mcp_access/security.py` is the single source of truth for the opt-in gate that
+closes the three code-execution sinks (`access_run_vba`, `access_eval_vba`,
+`access_run_macro` — the last one because a macro can carry a `RunCode` action).
+Controlled by the env var **`MCP_ACCESS_ALLOW_CODE_EXEC`** (truthy = `1/true/yes/on`,
+case-insensitive, `.strip()`), read on **every call** (not at import) so tests can
+`monkeypatch` it and import order is irrelevant.
+
+Two layers:
+1. **Advertise** — `server.list_tools()` omits the 3 tools when the gate is closed
+   (hygiene; the model never sees them).
+2. **Dispatch** — `dispatcher.call_tool_sync` rejects a gated tool *first thing in
+   the `try`*, before any `_Session`/COM, returning `code_exec_denied_message`.
+   This is the REAL barrier: a client can call the name directly without seeing it
+   advertised.
+
+Rationale: `confirm_*` flags stop model mistakes, not injection (injected text can
+ask for `confirm=true`). Only an out-of-band env var the model can't set defends
+against prompt injection. See `SECURITY.md`. Tool count stays 67 (nothing removed,
+3 gated). `_TOOL_SCHEMA_INDEX` is still built from the full `TOOLS` so
+`coerce_arguments` works for gated tools too — do NOT filter it.
+
+**Enable-on-request flow** (documented, NOT a tool): when the *user explicitly asks*
+to enable VBA exec, warn what it grants (arbitrary OS commands via `Shell`, treat DB
+as untrusted, trusted DBs only), edit the `env` block of this server in the MCP
+client config (e.g. `.mcp.json`) to add `"MCP_ACCESS_ALLOW_CODE_EXEC": "1"`, and tell
+the user to **restart** the server (the var is read at startup).
+
+**Critical DO NOTs for the gate:**
+- Do NOT remove the dispatch-time enforcement in `call_tool_sync`. The advertise
+  layer alone is bypassable (a client can call an unadvertised name directly).
+- Do NOT ever add an MCP tool that flips the gate on at runtime. An injection would
+  call it. Enabling MUST stay out of band (edit config + restart).
+
 ## Common Gotchas
 
 - VBE line numbers are **1-based**
