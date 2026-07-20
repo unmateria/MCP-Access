@@ -85,7 +85,7 @@ Add to your MCP config file (`.mcp.json`, `mcp.json`, or client-specific setting
 
 Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 
-## Tools (66)
+## Tools (68)
 
 ### Database
 
@@ -354,6 +354,59 @@ databases. See [SECURITY.md](SECURITY.md) for details and how to report issues.
 The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/session.py` that swallows real errors and returns a generic `-32602` code with no detail. A local patch is applied to this machine that includes the actual exception and traceback in the error response. If you upgrade the `mcp` package, re-apply the patch — see `CLAUDE.md` for details.
 
 ## Changelog
+
+### v0.7.52 — 2026-07-21 — safe VBA patching + a syntax check that costs nothing
+
+Six field requests from [@TvanStiphout-Home](https://github.com/TvanStiphout-Home)
+(Tom van Stiphout) — **thank you Tom**, every one of them tested against a real
+database before being filed, criteria included. `access_vbe_patch_proc` was the
+last write tool without a safety net.
+
+- **New tool: `access_vbe_check_syntax`** (**68** total). Static structural check
+  of the VBA project that is *already open* — no decompile, no `RunCommand`, no
+  Design view, no second Access instance, nothing discarded. `access_compile_vba`
+  cannot be used as a post-edit check: it shells out to `MSACCESS.EXE /decompile`
+  and then quits with `acQuitSaveNone` or closes the database, **losing unsaved
+  VBA**. The new tool catches unbalanced `If`/`For`/`Do`/`While`/`Select`/`With`/
+  `Type`/`Enum` blocks, code outside a procedure and misplaced `Option`
+  statements. It is **not** a compiler and says so in its own response: no
+  identifier resolution, no type checking, no references — `ok=true` is not proof
+  the project compiles. A module it could not read is reported in `skipped` and
+  forces `ok=false`, never a silent clean zero.
+- **`access_vbe_patch_proc` is atomic by default** (`atomic=true`). If any patch
+  fails to match, **nothing is written** and the module stays byte-for-byte
+  identical. Previously a batch was applied best-effort, so one stale anchor left
+  a half-edited procedure nobody wrote and nobody reviewed. The abort message
+  lists every failure at once and tells you to re-send the **entire** batch — the
+  patches that did match were discarded too. `atomic=false` restores the old
+  behaviour.
+- **Anchors match regardless of case** (`match_case=false` by default). VBA is a
+  case-insensitive language whose editor rewrites identifier casing on its own,
+  so a `find` differing only in case used to fail for no useful reason. The
+  result echoes the text as actually stored, so you can correct your copy.
+  **This changes behaviour**: anchors that find nothing today will start finding
+  something. Matching runs as a fixed ladder — literal then whitespace-normalized,
+  all case-sensitive tiers before any case-insensitive one — so every call that
+  succeeds today lands exactly where it did before.
+- **`require_unique`** refuses to patch an anchor that matches more than once,
+  reporting the count and the absolute module line numbers of every hit — before
+  writing, not after.
+- **The `(Declarations)` section is addressable.** Pass
+  `proc_name='(Declarations)'` to `access_vbe_patch_proc` /
+  `access_vbe_get_proc`, and `access_vbe_module_info` now returns a
+  `declarations: {start_line, count}` key so its boundary no longer has to be
+  guessed from the first procedure. `Option` lines are never stripped there.
+  `access_vbe_replace_proc` refuses the token on purpose — `new_code=''` would
+  wipe `Option Explicit` and every module-level `Const` in one unconfirmed call.
+- **The one-line discrepancy is gone.** `access_vbe_module_info` and
+  `access_vbe_get_lines` now report `cm.CountOfLines`, the number VBE itself
+  uses. They previously counted with `splitlines()`, which drops a module's final
+  blank line (VBE emits no trailing terminator) — so they reported one line fewer
+  than `access_vbe_patch_proc` for the same module. That blank line is also
+  readable now; it used to be rejected as out of range.
+- **Also fixed:** `access_screenshot` hung 30+ minutes on Modal/PopUp forms; an
+  unterminated `Type`/`Enum` block passed structural validation silently; an
+  unclamped line count in the patch result.
 
 ### v0.7.51 — 2026-07-06 — code-execution gate (opt-in)
 
