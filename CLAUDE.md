@@ -108,7 +108,29 @@ A DB whose startup code closes it during the open (startup-form error path + `Al
 1. Write the implementation function (e.g. `ac_new_tool()`)
 2. Add a `types.Tool(...)` entry to the `TOOLS` list
 3. Add an `elif name == "access_new_tool":` branch in `call_tool()`
-4. Update the tool count in this CLAUDE.md and README.md
+4. Update the tool count — see the release checklist below, it lives in **five**
+   places and they drift
+
+## Release checklist (the docs drift, every time)
+
+The tool count and the version live in more places than you remember, and the
+**README keeps its own changelog** — a separate `## Changelog` section with
+`### v0.7.NN` entries, independent of `CHANGELOG.md`. Updating only
+`CHANGELOG.md` means the project page shows nothing about the release. Both were
+missed in the v0.7.52 release commit and needed a follow-up.
+
+- `CHANGELOG.md` — new `## 0.7.NN — date` entry at the top.
+- `README.md` — **four** spots: the tagline count (line ~7), the `## Tools (N)`
+  heading, the tool tables themselves, and a new `### v0.7.NN` changelog entry.
+- `CLAUDE.md` — `## Tools (N total)` heading + the category table.
+- `pyproject.toml` — `version` **and** the `— N tools.` in `description`.
+  The description is baked into the published artifact and PyPI versions are
+  immutable, so a miss there can only be fixed in the NEXT release.
+- `server.json` — `version` appears **twice**.
+
+Then: commit, `git tag v0.7.NN`, `git push && git push --tags`. The tag push
+triggers `.github/workflows/publish.yml` (PyPI + MCP Registry). Check it landed
+with `gh run list --limit 3`.
 
 ## Office version autodetect (v0.7.36+)
 
