@@ -104,6 +104,30 @@ def ac_screenshot(
         if ot not in ("form", "report"):
             raise ValueError(f"object_type must be 'form' or 'report', got '{object_type}'")
 
+        # Guard: a Modal or PopUp form makes DoCmd.OpenForm BLOCK the COM thread until a
+        # human closes it (ESC usually does NOT dismiss it) -> 30+ minute hangs. Detect it
+        # via a non-blocking design-view open (Load/Open events do not fire in design) and
+        # refuse to auto-open, with an actionable message instead of hanging. Best-effort:
+        # if the check itself fails, fall through to the normal open + ESC watchdog.
+        if ot == "form":
+            _is_modal = False
+            try:
+                app.DoCmd.OpenForm(object_name, 1)  # 1 = acDesign (non-blocking)
+                try:
+                    _frm = app.Forms(object_name)
+                    _is_modal = bool(_frm.Modal) or bool(_frm.PopUp)
+                finally:
+                    app.DoCmd.Close(2, object_name, 1)  # 2 = acForm, 1 = acSaveNo
+            except Exception as e:
+                log.warning("Modal/PopUp check failed for '%s': %s", object_name, e)
+            if _is_modal:
+                raise ValueError(
+                    f"Form '{object_name}' is Modal/PopUp: opening it via DoCmd.OpenForm blocks "
+                    "the COM thread until a human closes it (ESC won't dismiss it), which hangs "
+                    "this tool. Not auto-opened. To capture it: open the form manually in Access, "
+                    "then call access_screenshot WITHOUT object_name to capture the current window."
+                )
+
         # Get hwnd before OpenForm blocks (needed by cancel thread)
         _h = app.hWndAccessApp
         _hwnd = int(_h() if callable(_h) else _h)

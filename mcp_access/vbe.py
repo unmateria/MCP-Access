@@ -393,11 +393,15 @@ def _check_module_health(cm: Any, cache_key: str, expected_total: int = 0) -> li
     return warnings
 
 
-def _ws_normalized_match(proc_code: str, find_text: str) -> tuple[int, int] | None:
+def _ws_normalized_matches(
+    proc_code: str, find_text: str, match_case: bool = True
+) -> list[tuple[int, int]]:
     """
     Whitespace-tolerant matching: strips leading whitespace from each line
     and does a sliding window search.
-    Returns (start_idx, end_idx) 0-based line indices into proc_code lines, or None.
+    Returns ALL matches as (start_idx, end_idx) 0-based line index pairs into
+    proc_code lines.  Overlapping windows are not reported — the scan skips
+    past a match, mirroring how the replacement consumes it.
     """
     proc_lines = proc_code.splitlines()
     find_lines = find_text.splitlines()
@@ -405,16 +409,107 @@ def _ws_normalized_match(proc_code: str, find_text: str) -> tuple[int, int] | No
     while find_lines and not find_lines[-1].strip():
         find_lines.pop()
     if not find_lines:
-        return None
+        return []
 
     proc_stripped = [l.lstrip() for l in proc_lines]
     find_stripped = [l.lstrip() for l in find_lines]
+    if not match_case:
+        proc_stripped = [l.lower() for l in proc_stripped]
+        find_stripped = [l.lower() for l in find_stripped]
     window = len(find_stripped)
 
-    for i in range(len(proc_stripped) - window + 1):
+    out: list[tuple[int, int]] = []
+    i = 0
+    while i <= len(proc_stripped) - window:
         if proc_stripped[i : i + window] == find_stripped:
-            return (i, i + window - 1)
-    return None
+            out.append((i, i + window - 1))
+            i += window
+        else:
+            i += 1
+    return out
+
+
+def _ws_normalized_match(
+    proc_code: str, find_text: str, match_case: bool = True
+) -> tuple[int, int] | None:
+    """First whitespace-normalized match, or None. See _ws_normalized_matches."""
+    matches = _ws_normalized_matches(proc_code, find_text, match_case)
+    return matches[0] if matches else None
+
+
+def _case_insensitive_safe(text: str) -> bool:
+    """
+    True when ``text.lower()`` preserves length, so index positions computed on
+    the lowered copy still address the original string.
+
+    ``'İ'.lower()`` (U+0130) expands to TWO characters — a single such char in a
+    VBA comment shifts every later index and would splice the replacement into
+    the middle of a line.  When this returns False the case-insensitive tiers are
+    skipped for that text rather than risking silent corruption.
+    """
+    return len(text.lower()) == len(text)
+
+
+def _find_literal(hay: str, needle: str, match_case: bool) -> int | None:
+    """Literal find. Returns the 0-based index of the first match, or None."""
+    if match_case:
+        idx = hay.find(needle)
+    else:
+        idx = hay.lower().find(needle.lower())
+    return idx if idx >= 0 else None
+
+
+def _count_literal(hay: str, needle: str, match_case: bool) -> int:
+    """Number of non-overlapping literal occurrences of *needle* in *hay*."""
+    if match_case:
+        return hay.count(needle)
+    return hay.lower().count(needle.lower())
+
+
+_DECLARATIONS_TOKEN = "(declarations)"
+
+
+def _is_declarations(proc_name: str) -> bool:
+    """
+    True when *proc_name* addresses the module's ``(Declarations)`` section —
+    the lines above the first procedure, where Option/Const/Dim/Type live.
+
+    Deliberately NOT triggered by an empty string: ``ac_vbe_find`` already reads
+    ``""`` as "the whole module", and two contradictory meanings for the same
+    value is worse than a slightly longer token.
+    """
+    return (proc_name or "").strip().lower() == _DECLARATIONS_TOKEN
+
+
+def _vbe_line_count(text: str) -> int:
+    """
+    Number of lines VBE's ``InsertLines`` will create for *text*.
+
+    VBE counts a trailing CRLF as opening a further (empty) line, which is
+    exactly why ``splitlines()`` disagrees with ``CountOfLines`` — see the
+    comment in ``_exec_single_replace``.  ``"a\\r\\nb"`` → 2, ``"a\\r\\nb\\r\\n"`` → 3.
+    """
+    if not text:
+        return 0
+    return text.count("\r\n") + 1
+
+
+def _cm_lines_list(cm: Any, cache_key: str) -> list[str]:
+    """
+    Module text as a line list whose length ALWAYS equals ``cm.CountOfLines``.
+
+    ``splitlines()`` drops the final empty line when the module ends in a blank
+    one (VBE emits no trailing terminator), so it under-reports by 1 against the
+    number VBE itself uses for InsertLines/DeleteLines addressing.  Padding to
+    ``CountOfLines`` makes ``len(lines)`` authoritative, so every existing slice
+    and bounds check keeps working while the reported total stops disagreeing
+    with ``ac_vbe_patch_proc``.
+    """
+    total = cm.CountOfLines
+    lines = _cm_all_code(cm, cache_key).splitlines()
+    if len(lines) < total:
+        lines.extend([""] * (total - len(lines)))
+    return lines
 
 
 def _closest_match_context(proc_code: str, find_text: str, proc_name: str) -> str:
@@ -455,6 +550,174 @@ def _closest_match_context(proc_code: str, find_text: str, proc_name: str) -> st
 
 
 # ---------------------------------------------------------------------------
+# Patch engine (pure — no COM)
+# ---------------------------------------------------------------------------
+# ac_vbe_patch_proc's matching loop never touched the CodeModule, so it is
+# extracted verbatim here and then extended.  Keeping it pure is what makes the
+# ``atomic`` guarantee structural rather than a promise: the simulation and the
+# commit are the SAME pass, so they cannot diverge.  A pre-pass that validated
+# every anchor against the ORIGINAL text would be wrong in both directions —
+# patch 0 can destroy (or create) the anchor patch 3 cites.
+
+def _apply_patches(
+    proc_code: str,
+    patches: list,
+    match_case: bool = False,
+    require_unique: bool = False,
+    proc_name: str = "",
+    base_line: int = 1,
+) -> dict:
+    """
+    Apply find/replace patches to *proc_code* sequentially.  No COM.
+
+    Matching is a fixed 4-tier ladder, stopping at the first tier that hits:
+
+      1. literal, case-sensitive
+      2. whitespace-normalized, case-sensitive
+      3. literal, case-insensitive          (only when ``match_case`` is False)
+      4. whitespace-normalized, case-insensitive (idem)
+
+    ALL case-sensitive tiers run before ANY case-insensitive one.  That order is
+    what guarantees byte-for-byte compatibility: any call that succeeds today
+    lands on tier 1 or 2 exactly as it did before, so relaxing the casing can
+    only rescue calls that used to fail outright.
+
+    ``base_line`` is the 1-based module line of ``proc_code``'s first line, so
+    reported line numbers are absolute.
+
+    Returns a dict with the patched ``code`` plus the report lists.  The caller
+    decides whether to write — ``atomic`` lives there, not here.
+    """
+    applied = 0
+    not_found: list[str] = []
+    unique_violations: list[str] = []
+    fallback_notes: list[str] = []
+    ambiguous_notes: list[str] = []
+    case_notes: list[str] = []
+
+    for i, patch in enumerate(patches):
+        find_text = patch["find"]
+        replace_text = patch.get("replace", "")
+        # Decode HTML entities
+        find_text = html_mod.unescape(find_text)
+        replace_text = html_mod.unescape(replace_text)
+        # Normalize line endings to CRLF (proc_code from VBE is always CRLF;
+        # callers commonly send LF — without this the exact match below
+        # always falls through to the ws-normalized fallback).
+        if "\n" in find_text:
+            find_text = find_text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+        if "\n" in replace_text:
+            replace_text = replace_text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+
+        # Unicode guard: the case-insensitive tiers index the ORIGINAL string
+        # using offsets computed on a lowered copy, which only holds when
+        # lowering preserves length.  Skip them otherwise (see
+        # _case_insensitive_safe) rather than splice at a shifted offset.
+        allow_ci = not match_case
+        if allow_ci and not (
+            _case_insensitive_safe(proc_code) and _case_insensitive_safe(find_text)
+        ):
+            allow_ci = False
+            case_notes.append(
+                f"patch[{i}]: case-insensitive matching skipped — text contains "
+                "characters whose lowercase form changes length"
+            )
+
+        hit = False
+        for tier, tier_case in (("exact", True), ("ws", True),
+                                ("exact", False), ("ws", False)):
+            if not tier_case and not allow_ci:
+                continue
+
+            if tier == "exact":
+                idx = _find_literal(proc_code, find_text, tier_case)
+                if idx is None:
+                    continue
+                occurrences = _count_literal(proc_code, find_text, tier_case)
+                line_no = base_line + proc_code[:idx].count("\n")
+                lines_hit = [line_no]
+                if occurrences > 1:
+                    # Collect the remaining occurrence line numbers for the report
+                    scan_from = idx + len(find_text)
+                    while True:
+                        nxt = _find_literal(proc_code[scan_from:], find_text, tier_case)
+                        if nxt is None:
+                            break
+                        abs_idx = scan_from + nxt
+                        lines_hit.append(base_line + proc_code[:abs_idx].count("\n"))
+                        scan_from = abs_idx + len(find_text)
+                if require_unique and occurrences > 1:
+                    unique_violations.append(
+                        f"patch[{i}]: require_unique — find_text matched "
+                        f"{occurrences} times at lines {lines_hit} "
+                        f"({'case-sensitive' if tier_case else 'case-insensitive'} "
+                        "comparison); patch NOT applied"
+                    )
+                    hit = True
+                    break
+                stored = proc_code[idx : idx + len(find_text)]
+                proc_code = proc_code[:idx] + replace_text + proc_code[idx + len(find_text):]
+            else:
+                matches = _ws_normalized_matches(proc_code, find_text, tier_case)
+                if not matches:
+                    continue
+                occurrences = len(matches)
+                lines_hit = [base_line + m[0] for m in matches]
+                if require_unique and occurrences > 1:
+                    unique_violations.append(
+                        f"patch[{i}]: require_unique — find_text matched "
+                        f"{occurrences} times at lines {lines_hit} "
+                        f"(whitespace-normalized, "
+                        f"{'case-sensitive' if tier_case else 'case-insensitive'}"
+                        "); patch NOT applied"
+                    )
+                    hit = True
+                    break
+                s_idx, e_idx = matches[0]
+                code_lines = proc_code.splitlines(keepends=True)
+                stored = "".join(code_lines[s_idx : e_idx + 1]).rstrip("\r\n")
+                # Replace matched lines with replace_text as-is
+                replace_normalized = replace_text
+                if not replace_normalized.endswith(("\r\n", "\n")) and replace_normalized:
+                    replace_normalized += "\r\n"
+                code_lines[s_idx : e_idx + 1] = [replace_normalized] if replace_normalized else []
+                proc_code = "".join(code_lines)
+
+            applied += 1
+            hit = True
+            if tier == "ws":
+                # Keep this exact wording — it predates the tier ladder.
+                fallback_notes.append(f"patch[{i}]: matched via ws-normalized fallback")
+            if not tier_case:
+                # Echo what is actually stored: the caller's mental copy has the
+                # wrong casing (the VBE rewrites it), so showing the real text is
+                # what lets them fix it.
+                fallback_notes.append(
+                    f"patch[{i}]: matched case-insensitively (stored: {stored[:80]!r})"
+                )
+            if occurrences > 1 and not require_unique:
+                ambiguous_notes.append(
+                    f"patch[{i}]: find_text matched {occurrences} times at lines "
+                    f"{lines_hit} — only first occurrence replaced"
+                )
+            break
+
+        if not hit:
+            ctx = _closest_match_context(proc_code, find_text, proc_name)
+            not_found.append(f"patch[{i}]: not found. {ctx}")
+
+    return {
+        "code": proc_code,
+        "applied": applied,
+        "not_found": not_found,
+        "unique_violations": unique_violations,
+        "fallback_notes": fallback_notes,
+        "ambiguous_notes": ambiguous_notes,
+        "case_notes": case_notes,
+    }
+
+
+# ---------------------------------------------------------------------------
 # VBE get operations
 # ---------------------------------------------------------------------------
 
@@ -477,8 +740,9 @@ def ac_vbe_get_lines(
     _close_form_design_view(app, object_type, object_name)
     cm = _get_code_module(app, object_type, object_name)
     cache_key = f"{object_type}:{object_name}"
-    all_code = _cm_all_code(cm, cache_key)
-    all_lines = all_code.splitlines()
+    # len(all_lines) == cm.CountOfLines by construction — a trailing blank line
+    # is a real, addressable line in the editor and must stay readable.
+    all_lines = _cm_lines_list(cm, cache_key)
     total = len(all_lines)
     if total == 0:
         raise ValueError(
@@ -506,19 +770,31 @@ def ac_vbe_get_proc(
         proc (use for whole-proc operations).
       - body_line: the Sub/Function/Property declaration line (use for body
         line-range edits).
+    Pass proc_name="(Declarations)" to read the module's declarations section.
     """
     app = _Session.connect(db_path)
     _close_form_design_view(app, object_type, object_name)
     cm = _get_code_module(app, object_type, object_name)
-    try:
-        start, body, count, _kind = _proc_bounds(cm, proc_name)
-    except Exception as exc:
-        raise RuntimeError(
-            f"Procedure '{proc_name}' not found in '{object_name}': {exc}"
-        )
+    if _is_declarations(proc_name):
+        start, body = 1, 1
+        count = cm.CountOfDeclarationLines
+        if count == 0:
+            raise RuntimeError(
+                f"Module '{object_name}' has no declarations section (0 lines)."
+            )
+    else:
+        try:
+            start, body, count, _kind = _proc_bounds(cm, proc_name)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Procedure '{proc_name}' not found in '{object_name}': {exc}"
+            )
     # Extract text from cache instead of an extra cm.Lines call
     cache_key = f"{object_type}:{object_name}"
-    all_lines = _cm_all_code(cm, cache_key).splitlines()
+    all_lines = _cm_lines_list(cm, cache_key)
+    # ProcCountLines can inflate the last proc past end of module (see
+    # ac_vbe_replace_proc) — clamp so `count` matches the text returned.
+    count = min(count, len(all_lines) - start + 1)
     code = "\n".join(all_lines[start - 1 : start - 1 + count])
     return {
         "proc_name":  proc_name,
@@ -542,8 +818,10 @@ def ac_vbe_module_info(
     _close_form_design_view(app, object_type, object_name)
     cm = _get_code_module(app, object_type, object_name)
     cache_key = f"{object_type}:{object_name}"
-    all_code = _cm_all_code(cm, cache_key)
-    all_lines = all_code.splitlines()
+    # Authoritative line count: len() == cm.CountOfLines by construction, so the
+    # number reported here matches what ac_vbe_patch_proc reports (it always
+    # used cm.CountOfLines) instead of being 1 short on blank-terminated modules.
+    all_lines = _cm_lines_list(cm, cache_key)
     total = len(all_lines)
     procs: list[dict] = []
     if total > 0:
@@ -588,7 +866,18 @@ def ac_vbe_module_info(
                     procs.append({"name": pname, "keyword": keyword,
                                   "start_line": i, "body_line": i,
                                   "count": count})
-    return {"total_lines": total, "procs": procs}
+    # Declarations section — addressable via proc_name="(Declarations)" in
+    # ac_vbe_get_proc / ac_vbe_patch_proc, so the caller never has to infer its
+    # boundary from the first procedure's start_line.
+    try:
+        decl_count = int(cm.CountOfDeclarationLines)
+    except Exception:
+        decl_count = 0
+    return {
+        "total_lines": total,
+        "declarations": {"start_line": 1, "count": decl_count},
+        "procs": procs,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1027,6 +1316,15 @@ def ac_vbe_replace_proc(
     insert happen below the leading blanks).
     If new_code is empty, deletes the procedure AND its leading blank separator.
     """
+    if _is_declarations(proc_name):
+        # Refused on purpose: new_code="" would wipe Option Explicit and every
+        # module-level Const in one unconfirmed call, and the leading-blank
+        # (`lead`) logic below is meaningless at start=1.
+        raise ValueError(
+            "'(Declarations)' cannot be replaced wholesale. Use "
+            "access_vbe_patch_proc(proc_name='(Declarations)') for surgical "
+            "edits, or access_vbe_replace_lines for an explicit line range."
+        )
     app = _Session.connect(db_path)
     _close_form_design_view(app, object_type, object_name)
 
@@ -1109,12 +1407,22 @@ def ac_vbe_replace_proc(
 def ac_vbe_patch_proc(
     db_path: str, object_type: str, object_name: str,
     proc_name: str, patches: list,
+    atomic: bool = True, require_unique: bool = False,
+    match_case: bool = False,
 ) -> str:
     """
     Applies surgical find/replace WITHIN a procedure without rewriting everything.
     patches: list of {find: str, replace: str}.
     More efficient than vbe_replace_proc when only a few lines change
     within a large proc (e.g.: 174 lines, only 15 change).
+
+    proc_name="(Declarations)" targets the module's declarations section.
+
+    atomic (default TRUE): if ANY patch fails, nothing is written at all.
+    require_unique: reject a patch whose find text matches more than once.
+    match_case (default FALSE): VBA is case-insensitive and the VBE rewrites
+    identifier casing on its own, so anchors are matched case-insensitively
+    unless this is set.
     """
     app = _Session.connect(db_path)
 
@@ -1124,83 +1432,88 @@ def ac_vbe_patch_proc(
     _Session._cm_cache.pop(cache_key, None)
 
     cm = _get_code_module(app, object_type, object_name)
-    try:
-        start, _body, count, kind = _proc_bounds(cm, proc_name)
-    except Exception as exc:
-        raise RuntimeError(
-            f"Procedure '{proc_name}' not found in '{object_name}': {exc}"
-        )
+
+    is_declarations = _is_declarations(proc_name)
+    kind = None
+    if is_declarations:
+        start = 1
+        count = int(cm.CountOfDeclarationLines)
+        if count == 0:
+            raise RuntimeError(
+                f"Module '{object_name}' has no declarations section (0 lines) — "
+                "there is nothing to anchor a patch to. To CREATE one, use "
+                "access_vbe_replace_lines with start_line=1, count=0 and the "
+                "new declaration lines as new_code."
+            )
+    else:
+        try:
+            start, _body, count, kind = _proc_bounds(cm, proc_name)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Procedure '{proc_name}' not found in '{object_name}': {exc}"
+            )
     total = cm.CountOfLines
     count = min(count, total - start + 1)
 
-    # Get current proc code
-    proc_code = cm.Lines(start, count)
+    # Get current proc code (cm.Lines(n, 0) raises in VBE)
+    proc_code = cm.Lines(start, count) if count > 0 else ""
     backup_code = proc_code
 
-    # Apply patches sequentially
-    applied = 0
-    not_found = []
-    ws_fallback_notes = []
-    ambiguous_notes = []
-    for i, patch in enumerate(patches):
-        find_text = patch["find"]
-        replace_text = patch.get("replace", "")
-        # Decode HTML entities
-        find_text = html_mod.unescape(find_text)
-        replace_text = html_mod.unescape(replace_text)
-        # Normalize line endings to CRLF (proc_code from VBE is always CRLF;
-        # callers commonly send LF — without this the exact match below
-        # always falls through to the ws-normalized fallback).
-        if "\n" in find_text:
-            find_text = find_text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
-        if "\n" in replace_text:
-            replace_text = replace_text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
-        if find_text in proc_code:
-            # Warn if the find string is ambiguous — only the FIRST occurrence
-            # is replaced (replace(count=1)), so multiple matches silently
-            # leaving the others alone is a common source of confusion.
-            occurrences = proc_code.count(find_text)
-            if occurrences > 1:
-                ambiguous_notes.append(
-                    f"patch[{i}]: find_text matched {occurrences} times — only first occurrence replaced"
-                )
-            proc_code = proc_code.replace(find_text, replace_text, 1)
-            applied += 1
-        else:
-            # Fallback: whitespace-normalized match
-            ws_match = _ws_normalized_match(proc_code, find_text)
-            if ws_match is not None:
-                s_idx, e_idx = ws_match
-                code_lines = proc_code.splitlines(keepends=True)
-                # Replace matched lines with replace_text as-is
-                replace_normalized = replace_text
-                if not replace_normalized.endswith(("\r\n", "\n")) and replace_normalized:
-                    replace_normalized += "\r\n"
-                code_lines[s_idx : e_idx + 1] = [replace_normalized] if replace_normalized else []
-                proc_code = "".join(code_lines)
-                applied += 1
-                ws_fallback_notes.append(f"patch[{i}]: matched via ws-normalized fallback")
-            else:
-                ctx = _closest_match_context(proc_code, find_text, proc_name)
-                not_found.append(f"patch[{i}]: not found. {ctx}")
+    report = _apply_patches(
+        proc_code, patches,
+        match_case=match_case, require_unique=require_unique,
+        proc_name=proc_name, base_line=start,
+    )
+    applied = report["applied"]
+    blocking = report["not_found"] + report["unique_violations"]
+
+    # Atomic gate — decided BEFORE any DeleteLines/InsertLines, so a rejected
+    # batch leaves the module byte-for-byte identical.
+    if atomic and blocking:
+        msg = (
+            f"ABORTED: atomic patch of '{proc_name}' — NOTHING WAS WRITTEN. "
+            f"{len(blocking)} of {len(patches)} patch(es) failed and the module "
+            f"is byte-for-byte unchanged.\n"
+            f"Re-read the current code and re-send the ENTIRE batch — the "
+            f"{applied} patch(es) that DID match were discarded too, so "
+            f"re-sending only the failures would silently drop them.\n"
+            + "\n".join(blocking)
+        )
+        if applied:
+            msg += (
+                "\nNote: failure context above reflects the in-memory text AFTER "
+                "the matching patches in this batch were applied, so it may not "
+                "line up with the module as it is on disk."
+            )
+        if report["case_notes"]:
+            msg += "\n" + "\n".join(report["case_notes"])
+        msg += "\nSet atomic=false to keep the old best-effort behaviour."
+        return msg
 
     if applied == 0:
-        return f"NOOP: no patches matched in '{proc_name}'. Errors:\n" + "\n".join(not_found)
+        return f"NOOP: no patches matched in '{proc_name}'. Errors:\n" + "\n".join(blocking)
 
-    # Strip Option lines if proc is NOT at the top of the module
+    proc_code = report["code"]
+
+    # Strip Option lines if the target is NOT at the top of the module.
+    # The (Declarations) section is EXACTLY where Option lines belong, so never
+    # strip there — do not rely on `start == 1` failing the `> 5` test.
     option_warnings = []
-    if start > 5:
+    if not is_declarations and start > 5:
         proc_code, option_warnings = _strip_option_lines(proc_code)
 
     # Replace entire proc with patched code
+    inserted_text = ""
     try:
-        cm.DeleteLines(start, count)
+        if count > 0:
+            cm.DeleteLines(start, count)
         if proc_code.strip():
-            normalized = proc_code.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
-            cm.InsertLines(start, normalized)
+            inserted_text = proc_code.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+            cm.InsertLines(start, inserted_text)
     except Exception:
         try:
-            cm.InsertLines(start, backup_code)
+            if backup_code:
+                cm.InsertLines(start, backup_code)
         except Exception:
             pass
         raise
@@ -1209,26 +1522,45 @@ def ac_vbe_patch_proc(
     # code-behind can be lost because the object's dirty flag is not set.
     _save_vbe_module(app, AC_TYPE.get(object_type, 5), object_name)
     new_total = cm.CountOfLines
-    try:
-        new_count = cm.ProcCountLines(proc_name, kind) if applied > 0 else 0
-    except Exception:
-        new_count = 0
-    # Health check
-    health = _check_module_health(cm, cache_key)
+    if is_declarations:
+        # No proc to measure — ProcCountLines would raise and report a bogus 0.
+        try:
+            new_count = int(cm.CountOfDeclarationLines)
+        except Exception:
+            new_count = 0
+    else:
+        try:
+            # Clamp like replace_proc does — ProcCountLines can inflate the last
+            # proc's count past the end of the module.
+            new_count = min(cm.ProcCountLines(proc_name, kind), new_total - start + 1)
+        except Exception:
+            new_count = 0
+    # Health check — expected_total activates Check 3 (count sanity)
+    expected_total = total - count + _vbe_line_count(inserted_text)
+    health = _check_module_health(cm, cache_key, expected_total=expected_total)
     result = (
         f"OK: {applied}/{len(patches)} patches applied in '{proc_name}' "
         f"({count} → {new_count} lines) → module now has {new_total} lines"
     )
-    if ws_fallback_notes:
-        result += f"\nWS-fallback: {'; '.join(ws_fallback_notes)}"
-    if ambiguous_notes:
-        result += f"\nAmbiguous matches: {'; '.join(ambiguous_notes)}"
+    if is_declarations and new_count < count:
+        result += (
+            "\nNote: the declarations section shrank — if the patched text "
+            "introduced a Sub/Function line, VBE moved the boundary."
+        )
+    if report["fallback_notes"]:
+        # Not "WS-fallback:" — this list now also carries case-insensitive
+        # match notes, which have nothing to do with whitespace.
+        result += f"\nMatch notes: {'; '.join(report['fallback_notes'])}"
+    if report["ambiguous_notes"]:
+        result += f"\nAmbiguous matches: {'; '.join(report['ambiguous_notes'])}"
+    if report["case_notes"]:
+        result += f"\n" + "\n".join(report["case_notes"])
     if option_warnings:
         result += f"\n" + "\n".join(option_warnings)
     if health:
         result += f"\n" + "\n".join(health)
-    if not_found:
-        result += f"\nNot found:\n" + "\n".join(not_found)
+    if blocking:
+        result += f"\nNot found:\n" + "\n".join(blocking)
     return result
 
 
@@ -1269,6 +1601,116 @@ def ac_vbe_append(
         result += f"\n" + "\n".join(option_warnings)
     if health:
         result += f"\n" + "\n".join(health)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Static syntax check — the SAFE alternative to access_compile_vba
+# (requested by @TvanStiphout-Home, thanks!)
+# ---------------------------------------------------------------------------
+# access_compile_vba is unusable as a post-edit check: its step 0 shells out to
+# MSACCESS.EXE /decompile and then either Quit(1) (= acQuitSaveNone) or closes
+# the database, discarding unsaved VBA.  This tool touches the ALREADY OPEN
+# project only: no decompile, no RunCommand, no Design view, no second Access
+# instance.  It is a structural validator, not a compiler.
+
+_CHECK_SYNTAX_NOTE = (
+    "Structural validation only — unbalanced If/For/Do/While/Select/With/"
+    "Type/Enum blocks, code outside a procedure, misplaced Option statements. "
+    "It does NOT resolve identifiers, types or references, so ok=true does not "
+    "mean the project compiles. Use access_compile_vba for a real compile "
+    "(warning: it decompiles first and can discard unsaved VBA)."
+)
+
+
+def _check_one_module_syntax(module_name: str, lines: list) -> list[dict]:
+    """Run both pure checkers over one module's lines. Returns error dicts."""
+    from .compile import _check_blocks_in_module, _check_structure_in_module
+
+    block_errors: list = []
+    _check_blocks_in_module(module_name, lines, block_errors)
+    out = [
+        {"module": e["module"], "line": e["line"], "message": e["error"]}
+        for e in block_errors
+    ]
+    struct_errors: list = []
+    _check_structure_in_module(module_name, lines, struct_errors)
+    # _check_structure_in_module emits "<module> line N: <text>" strings
+    for msg in struct_errors:
+        line_no = 0
+        m = re.search(r"\bline (\d+):", msg)
+        if m:
+            line_no = int(m.group(1))
+        out.append({"module": module_name, "line": line_no,
+                    "message": msg.split(": ", 1)[-1]})
+    return out
+
+
+def ac_vbe_check_syntax(
+    db_path: str, object_type: str = None, object_name: str = None
+) -> dict:
+    """
+    Static structural check of the VBA project that is already open.
+
+    Scope: one module when object_type/object_name are given, otherwise every
+    standard module and form/report code-behind (VBComponent types 1 and 100).
+    """
+    app = _Session.connect(db_path)
+    errors: list[dict] = []
+    modules_checked: list[str] = []
+    skipped: list[str] = []
+
+    if object_type and object_name:
+        _close_form_design_view(app, object_type, object_name)
+        cm = _get_code_module(app, object_type, object_name)
+        total = cm.CountOfLines
+        # split("\n"), not splitlines() — the pure checkers were written against
+        # the raw VBE text and their " _" continuation test sees the stray \r.
+        code = cm.Lines(1, total) if total > 0 else ""
+        errors.extend(_check_one_module_syntax(object_name, code.split("\n")))
+        modules_checked.append(object_name)
+    else:
+        # _get_vb_project, NOT VBE.ActiveVBProject — the active project can be
+        # acwzmain (the wizard library) after a decompile/compact.
+        try:
+            proj = _get_vb_project(app)
+            components = list(proj.VBComponents)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not enumerate the VBA project: {exc}. The project may "
+                "fail to load (broken reference) or VBA object-model access may "
+                "be blocked in the Trust Center."
+            )
+        for comp in components:
+            name = "<unknown>"
+            try:
+                name = comp.Name
+                if comp.Type not in (1, 100):
+                    continue
+                cm = comp.CodeModule
+                total = cm.CountOfLines
+                if total == 0:
+                    modules_checked.append(name)
+                    continue
+                code = cm.Lines(1, total)
+                errors.extend(_check_one_module_syntax(name, code.split("\n")))
+                modules_checked.append(name)
+            except Exception as exc:
+                # Never report a clean "0 errors" for a module we could not read
+                skipped.append(f"{name}: {exc}")
+
+    result = {
+        "ok": not errors and not skipped,
+        "errors": errors,
+        "modules_checked": len(modules_checked),
+        "note": _CHECK_SYNTAX_NOTE,
+    }
+    if skipped:
+        result["skipped"] = skipped
+        result["warning"] = (
+            f"{len(skipped)} module(s) could not be read — the result is "
+            "incomplete and ok=false reflects that, not a syntax error."
+        )
     return result
 
 

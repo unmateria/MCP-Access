@@ -1,5 +1,258 @@
 # Changelog
 
+## 0.7.52 — 2026-07-21
+
+**`access_vbe_patch_proc` stops being the one write tool without a safety net.**
+Six field requests from [@TvanStiphout-Home](https://github.com/TvanStiphout-Home)
+(Tom van Stiphout), every one of them tested against a real database before being
+filed — **thank you Tom**. Patches are now **all-or-nothing by default**, anchors
+match regardless of case, ambiguous anchors can be rejected outright, the
+`(Declarations)` section is addressable, and there is finally a way to check that
+what you wrote is structurally sound *without* the destructive setup
+`access_compile_vba` performs. One new tool (**68 total**).
+
+### Added
+
+- **`access_vbe_check_syntax`** — static structural check of the VBA project that
+  is **already open**: no decompile, no `RunCommand`, no Design view, no second
+  Access instance, nothing discarded. `access_compile_vba` was unusable as a
+  post-edit check because its step 0 shells out to `MSACCESS.EXE /decompile` and
+  then either quits with `acQuitSaveNone` or closes the database — **unsaved VBA
+  is lost**. The new tool catches unbalanced `If`/`For`/`Do`/`While`/`Select`/
+  `With`/`Type`/`Enum` blocks, code sitting outside a procedure and misplaced
+  `Option` statements. Scope it to one object with `object_type`/`object_name` or
+  let it walk every standard module and form/report code-behind.
+  It is **not** a compiler and says so in its own `note` field: it does not
+  resolve identifiers, types or references, so `ok=true` is not proof the project
+  compiles. It also never reports a clean zero for something it could not read —
+  per-module failures land in `skipped` and force `ok=false`.
+- **`atomic` on `access_vbe_patch_proc` (DEFAULT `true`)** — if any patch fails to
+  match, **nothing is written** and the module is left byte-for-byte identical.
+  Previously a batch was applied best-effort, so one stale anchor left the
+  procedure in a half-edited state nobody wrote and nobody reviewed. The abort
+  message lists *every* failure at once and tells the caller to re-send the
+  **entire** batch, because the patches that did match were discarded too.
+  `atomic=false` restores the old behaviour.
+- **`require_unique` on `access_vbe_patch_proc`** — refuse to patch when the
+  anchor matches more than once, reporting the count and the absolute module line
+  numbers of every hit. Default `false`: replacing the first of several
+  occurrences is a legitimate use and was already warned about.
+- **`(Declarations)` as a target** — `proc_name='(Declarations)'` now resolves to
+  the module declarations section in `access_vbe_patch_proc` and
+  `access_vbe_get_proc`, and `access_vbe_module_info` gained an additive
+  `declarations: {start_line, count}` key so the boundary no longer has to be
+  guessed from the first procedure. `Option` lines are never stripped there.
+  `access_vbe_replace_proc` **refuses** the token on purpose: `new_code=''` would
+  wipe `Option Explicit` and every module-level `Const` in one unconfirmed call.
+
+### Changed
+
+- **Anchors are matched case-insensitively by default** (`match_case`, default
+  `false`) in `access_vbe_patch_proc`. VBA is a case-insensitive language whose
+  editor rewrites identifier casing on its own, so a `find` that differed only in
+  case used to fail for no useful reason — the same reasoning `access_vbe_find`
+  already followed. **This changes behaviour**: anchors that find nothing today
+  will start finding something. `atomic=true` and the ambiguity warning bound the
+  risk, and the result echoes the text as it is actually stored so a caller can
+  correct their copy. Set `match_case=true` to demand an exact-case match.
+  Matching runs as a fixed ladder — literal then whitespace-normalized, **all
+  case-sensitive tiers before any case-insensitive one** — so every call that
+  succeeds today still lands exactly where it did before.
+- **`total_lines` is now `cm.CountOfLines`** in `access_vbe_module_info` and the
+  bounds of `access_vbe_get_lines`. VBE emits no trailing terminator, so
+  `splitlines()` silently dropped a final blank line and these tools reported one
+  line fewer than `access_vbe_patch_proc` did for the same module. A trailing
+  blank line is a real, addressable line in the editor, so `CountOfLines` wins.
+  Side effects worth knowing about: that blank line is now readable via
+  `access_vbe_get_lines` (it used to be rejected as out of range), and the `count`
+  reported for the **last** procedure of a blank-terminated module can be one
+  higher than before — that is the same off-by-one, not a regression.
+
+### Fixed
+
+- **`access_screenshot` hung for 30+ minutes on Modal/PopUp forms**
+  (`mcp_access/ui.py` `ac_screenshot`): `DoCmd.OpenForm` on a Modal/PopUp form
+  enters a blocking dialog loop the ESC watchdog could not break (observed: a
+  ~30-minute hang). The form's Modal/PopUp state is now checked up front via a
+  non-blocking design-view open, and auto-opening is refused with a message
+  telling the caller to open the form manually and call `access_screenshot`
+  WITHOUT `object_name`. Best-effort: if the property check itself fails, it falls
+  through to the previous open + ESC-watchdog path.
+- **`access_vbe_patch_proc` reported an unclamped `new_count`** (`mcp_access/vbe.py`):
+  the closing message called `ProcCountLines` raw, unlike the `count` computed
+  before the write and unlike `access_vbe_replace_proc`, so the last procedure of
+  a module could be reported longer than the module itself.
+- **`_check_module_health`'s count-sanity check was dead code on the patch path**:
+  `access_vbe_patch_proc` called it without `expected_total`, disabling Check 3.
+  It now passes `total - count + <lines inserted>`.
+- **An unterminated `Type`/`Enum` block passed validation silently**
+  (`mcp_access/compile.py` `_check_structure_in_module`): everything below the
+  opener is absorbed into the block, so no line inside the scan loop could ever
+  flag it. Reported at end of module now — this is the "Statement invalid inside
+  Type block" trap, which used to surface only as a confusing compile error on an
+  unrelated line.
+
+### Internal
+
+- The patch matching loop is extracted to a pure, COM-free `_apply_patches()`,
+  which is what makes `atomic` a structural guarantee rather than a promise: the
+  simulation and the commit are the same single pass, so they cannot diverge. A
+  pre-pass validating anchors against the original text would have been wrong in
+  both directions — an earlier patch can destroy *or* create the anchor a later
+  one cites.
+- The case-insensitive tiers are skipped, with a note, when lowercasing would
+  change the text's length (`'İ'.lower()` returns two characters): offsets
+  computed on a lowered copy would no longer address the original and the
+  replacement could be spliced into the middle of a line.
+- `_verify_module_structure` gained a pure counterpart,
+  `_check_structure_in_module`, mirroring `_check_blocks_in_module`.
+  `access_compile_vba`'s behaviour is unchanged — its wrappers just delegate.
+- New pure test suite `tests/test_vbe_feature_requests.py` (32 tests, no COM),
+  plus a live COM verification of all six acceptance scenarios against a copy of
+  a real 242-module database.
+
+## 0.7.51 — 2026-07-06
+
+**Behaviour change: VBA/macro execution is now opt-in.** The three tools that run
+arbitrary VBA/Shell — `access_run_vba`, `access_eval_vba` and `access_run_macro`
+(the last one because a macro can carry a `RunCode` action) — are **disabled by
+default**. A fresh PyPI install can no longer be turned into RCE by a single
+prompt injection. `confirm_*` flags never defended against injection (injected
+text can just ask for `confirm=true`); only an out-of-band environment variable
+the model cannot set does. No tool was removed — tool count stays **67**, three
+of them gated.
+
+### Added
+
+- **`mcp_access/security.py`** — single source of truth for the gate. Reads
+  `MCP_ACCESS_ALLOW_CODE_EXEC` (truthy = `1/true/yes/on`, case-insensitive,
+  stripped) on **every call** rather than at import, so tests can monkeypatch it
+  and import order is irrelevant. Exposes `code_exec_denied_message` for the
+  rejection text.
+- **Two enforcement layers.** `server.list_tools()` omits the three gated tools
+  when the gate is closed (hygiene — the model never sees them); `dispatcher.
+  call_tool_sync` rejects a gated tool as the first statement inside its `try`,
+  **before** any `_Session`/COM work. The dispatch layer is the real barrier: a
+  client can call an unadvertised name directly. `_TOOL_SCHEMA_INDEX` is still
+  built from the full `TOOLS` list so `coerce_arguments` keeps working for gated
+  tools.
+- **`SECURITY.md`** — the threat model written down: local stdio server, no
+  network surface, no login *by design*, prompt injection as the real risk, plus
+  how to report an issue. README gains a matching Security section and the
+  VBA-execution table is flagged.
+- **`tests/test_code_exec_gate.py`** — pure tests (no COM) covering the truthy
+  parsing, the advertise filter and the dispatch rejection.
+
+### Fixed
+
+- **Undiscoverable v0.7.48 parameters** (`mcp_access/tools.py`): the handlers
+  for `access_list_linked_tables` (`name` / `names_only` / `mask_password`),
+  `access_relink_table` (`refresh`) and the control-mutation tools (`full_lint`)
+  already accepted these arguments in v0.7.48, but the corresponding schema
+  entries were never committed — so MCP clients could not discover them. The
+  schema now matches the implementation.
+
+### Changed
+
+- **Enabling stays out of band, on purpose.** To re-enable, add
+  `"MCP_ACCESS_ALLOW_CODE_EXEC": "1"` to this server's `env` in the MCP client
+  config and **restart** the server. There is deliberately **no** MCP tool that
+  flips the gate at runtime — an injection would just call it.
+
+## 0.7.50 — 2026-07-06 — security fix (GHSA-9jp6-hph9-jm5f)
+
+Prompt-injection fix in the `access-workflow` prompt template, reported by
+[@nicoPadi1002](https://github.com/nicoPadi1002) (CobaltoSec) via responsible
+disclosure — **thank you**. No new tool (still **67**).
+
+### Fixed
+
+- **The `access-workflow` prompt no longer reflects an untrusted `db_path`
+  verbatim** (`mcp_access/server.py`, new `_sanitize_db_path`). A `db_path`
+  carrying newlines could inject arbitrary text — e.g. a fake `SYSTEM OVERRIDE:`
+  block — **ahead of** the prompt's `REQUIRED RULES` section, steering an agent
+  towards `access_run_vba` / `access_run_macro`. A real Access file path never
+  contains newlines or control characters, so the value is now collapsed to a
+  single line at the first control character, capped at `MAX_PATH`, and the
+  template wraps it in backticks as plain data. Legitimate paths are byte-for-byte
+  unchanged. Regression tests in `tests/test_prompt_injection.py`.
+
+## 0.7.49 — 2026-06-25
+
+Bugfix reported by [@TvanStiphout-Home](https://github.com/TvanStiphout-Home)
+(Tom van Stiphout) ([#33](https://github.com/unmateria/MCP-Access/issues/33)) —
+**thank you Tom**, once again, for the laser-precise diagnosis and repro steps.
+No new tool (still **67**).
+
+### Fixed
+
+- **VBE-write tools no longer pop a modal Access error dialog on every edit**
+  (`mcp_access/vbe.py`). `access_vbe_replace_lines`, `access_vbe_replace_proc`,
+  `access_vbe_patch_proc` and `access_vbe_append` all call `DoCmd.Save` to
+  persist the VBE change into the `.accdb`. When the target module or form was
+  already open in the VBE, Access answered with a modal *"Save isn't available
+  now"* dialog and waited for a click — one dialog per write call, blocking the
+  UI. The `except Exception: pass` swallowed the COM error (so the edit itself
+  landed fine), but the dialog watchdog that covers the compile/eval paths was
+  absent here, so nothing dismissed it. Fix: a new `_save_vbe_module()` helper
+  wraps `DoCmd.Save` in a daemon watchdog thread (0.3 s grace, same pattern as
+  `_call_with_dialog_watchdog` in `maintenance.py`); all four call sites now go
+  through it and the save stays best-effort.
+
+## 0.7.48 — 2026-06-24
+
+Usability fixes that came out of a real editing session against a database with
+hundreds of ODBC-linked tables, plus a scoped embedded lint so a one-control edit
+on a big inherited form stops drowning in pre-existing warnings. Every default
+preserves the pre-0.7.48 output, so existing callers see no change. No new tool
+(still **67**).
+
+### Added
+
+- **`access_list_linked_tables` filtering** (`mcp_access/relations.py`): `name='X'`
+  returns a single table (exact, case-insensitive), `names_only=true` gives a
+  light listing without `connect_string`, and `mask_password=true` masks `PWD=`
+  via `_mask_pwd`. With hundreds of links the full connect-string dump used to
+  blow past the per-result token cap and force a `grep`; all three default to the
+  previous full output.
+- **`access_relink_table refresh=true`** (`_refresh_links`): re-reads a linked
+  table's schema through DAO `RefreshLink()` using the table's **own** connect
+  string — no delete/`TransferDatabase` round-trip, the password is never touched
+  or dumped. This is the common *"I altered the table on the server, re-read it"*
+  case. `new_connect` is now optional and only required when `refresh=false`;
+  `relink_all=true` refreshes every table sharing the connect string.
+
+### Changed
+
+- **Scoped embedded lint** (`mcp_access/lint.py`, `mcp_access/controls.py`):
+  `_attach_lint` / `lint_compact` take a `focus_controls` argument, and
+  `access_create_control`, `access_set_control_props` and
+  `access_set_multiple_controls` pass the controls they just touched — so
+  `lint.violations` shows the change, not every inherited issue on the form.
+  `_violation_controls` matches a violation's own `control` **plus** an overlap
+  pair's `measured.a`/`measured.b`. The `error`/`warning`/`info` counts stay
+  whole-form (the model still sees there are other problems); `full_lint=true`
+  bypasses the filter.
+- **`access_relink_table` description** now documents the injected
+  `LoginTimeout=8`.
+
+## 0.7.47 — 2026-06-22
+
+Bugfix reported by [@jbchea](https://github.com/jbchea)
+([#32](https://github.com/unmateria/MCP-Access/issues/32)) — thanks! No new tool
+(still **67**).
+
+### Fixed
+
+- **Duplicate `"design"` key in `mcp_access/tips.py`.** The v0.7.45/0.7.46
+  design-system work added a *second* `"design"` entry to the `_TIPS` dict,
+  silently shadowing the original — Python keeps only the last assignment, so
+  `access_tips('design')` returned just the new design-direction guidance and the
+  earlier tip (Design view ↔ VBE close-ordering + `SaveAsText` per-object-type
+  encoding) became unreachable dead code. The original tip now lives under its
+  own key, `access_tips('design_vbe')`, so both are reachable again. No behaviour
+  change beyond the tips topic.
+
 ## 0.7.46 — 2026-06-19
 
 Real design taste for `access_build_form` — three curated **design directions**

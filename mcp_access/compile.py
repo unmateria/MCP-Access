@@ -151,6 +151,97 @@ def _lint_form_modules(app) -> list:
 # Compile VBA
 # ---------------------------------------------------------------------------
 
+# Regex for valid module-level statements (outside any proc)
+_MODULE_LEVEL = re.compile(
+    r"(?:Option\s|Dim\s|Private\s|Public\s|Global\s|Const\s|Declare\s|"
+    r"#If|#ElseIf|#Else|#End\s|#Const\s|Attribute\s|Implements\s|Event\s|"
+    r"Friend\s|Static\s|Sub\s|Function\s|Property\s|Type\s|Enum\s|DefInt\s|"
+    r"DefLng\s|DefSng\s|DefDbl\s|DefCur\s|DefStr\s|DefBool\s|DefDate\s|"
+    r"DefVar\s|DefObj\s|DefByte\s)",
+    re.IGNORECASE,
+)
+_PROC_START = re.compile(
+    r"(?:Private\s+|Public\s+|Friend\s+)?(?:Static\s+)?"
+    r"(?:Sub|Function|Property\s+(?:Get|Let|Set))\s",
+    re.IGNORECASE,
+)
+_BLOCK_START = re.compile(
+    r"(?:Private\s+|Public\s+)?(?:Type|Enum)\s", re.IGNORECASE
+)
+_BLOCK_END = re.compile(r"End\s+(?:Type|Enum)", re.IGNORECASE)
+_PROC_END = re.compile(
+    r"End\s+(?:Sub|Function|Property)", re.IGNORECASE
+)
+
+
+def _check_structure_in_module(module_name: str, lines: list, errors: list):
+    """Check that no executable code sits outside a proc, in a single module.
+
+    Pure counterpart of _verify_module_structure — same body, no COM, so it can
+    be reused by access_vbe_check_syntax and unit tested directly.
+    Appends error strings to *errors*.
+    """
+    in_proc = False
+    in_block = False  # Type / Enum
+    block_line = 0
+    continuation = False
+
+    for i, line in enumerate(lines, 1):
+        stripped = line.strip()
+
+        # Line continuation from previous line
+        if continuation:
+            continuation = stripped.endswith(" _")
+            continue
+        if stripped.endswith(" _"):
+            continuation = True
+            # Still process the first line of the continuation
+
+        # Skip blank / comment
+        if not stripped or stripped.startswith("'"):
+            continue
+
+        # Type/Enum blocks
+        if not in_proc and _BLOCK_START.match(stripped):
+            in_block = True
+            block_line = i
+            continue
+        if in_block:
+            if _BLOCK_END.match(stripped):
+                in_block = False
+            continue
+
+        # Proc start/end
+        if _PROC_START.match(stripped):
+            in_proc = True
+            continue
+        if _PROC_END.match(stripped):
+            in_proc = False
+            continue
+
+        # Inside a proc: anything goes
+        if in_proc:
+            continue
+
+        # Module level: only declarations/directives are valid
+        if not _MODULE_LEVEL.match(stripped):
+            errors.append(
+                f"{module_name} line {i}: code outside Sub/Function: "
+                f"{stripped[:80]}"
+            )
+            return  # one error per module is enough
+
+    # Module ended inside a Type/Enum block. Everything below the opener was
+    # silently absorbed by it (the "Statement invalid inside Type block" trap),
+    # so no line above could have flagged it.
+    if in_block:
+        errors.append(
+            f"{module_name} line {block_line}: Type/Enum block never closed "
+            "(missing End Type / End Enum) — all code below it is absorbed "
+            "into the block"
+        )
+
+
 def _verify_module_structure(app) -> list:
     """Verify structural integrity of ALL VBA modules (standard + form/report).
 
@@ -164,28 +255,6 @@ def _verify_module_structure(app) -> list:
 
     Returns list of error strings. Empty if all OK.
     """
-    # Regex for valid module-level statements (outside any proc)
-    _MODULE_LEVEL = re.compile(
-        r"(?:Option\s|Dim\s|Private\s|Public\s|Global\s|Const\s|Declare\s|"
-        r"#If|#ElseIf|#Else|#End\s|#Const\s|Attribute\s|Implements\s|Event\s|"
-        r"Friend\s|Static\s|Sub\s|Function\s|Property\s|Type\s|Enum\s|DefInt\s|"
-        r"DefLng\s|DefSng\s|DefDbl\s|DefCur\s|DefStr\s|DefBool\s|DefDate\s|"
-        r"DefVar\s|DefObj\s|DefByte\s)",
-        re.IGNORECASE,
-    )
-    _PROC_START = re.compile(
-        r"(?:Private\s+|Public\s+|Friend\s+)?(?:Static\s+)?"
-        r"(?:Sub|Function|Property\s+(?:Get|Let|Set))\s",
-        re.IGNORECASE,
-    )
-    _BLOCK_START = re.compile(
-        r"(?:Private\s+|Public\s+)?(?:Type|Enum)\s", re.IGNORECASE
-    )
-    _BLOCK_END = re.compile(r"End\s+(?:Type|Enum)", re.IGNORECASE)
-    _PROC_END = re.compile(
-        r"End\s+(?:Sub|Function|Property)", re.IGNORECASE
-    )
-
     errors = []
     try:
         vbe = app.VBE
@@ -198,55 +267,7 @@ def _verify_module_structure(app) -> list:
             if total == 0:
                 continue
             code = cm.Lines(1, total)
-
-            in_proc = False
-            in_block = False  # Type / Enum
-            continuation = False
-
-            for i, line in enumerate(code.split("\n"), 1):
-                stripped = line.strip()
-
-                # Line continuation from previous line
-                if continuation:
-                    continuation = stripped.endswith(" _")
-                    continue
-                if stripped.endswith(" _"):
-                    continuation = True
-                    # Still process the first line of the continuation
-
-                # Skip blank / comment
-                if not stripped or stripped.startswith("'"):
-                    continue
-
-                # Type/Enum blocks
-                if not in_proc and _BLOCK_START.match(stripped):
-                    in_block = True
-                    continue
-                if in_block:
-                    if _BLOCK_END.match(stripped):
-                        in_block = False
-                    continue
-
-                # Proc start/end
-                if _PROC_START.match(stripped):
-                    in_proc = True
-                    continue
-                if _PROC_END.match(stripped):
-                    in_proc = False
-                    continue
-
-                # Inside a proc: anything goes
-                if in_proc:
-                    continue
-
-                # Module level: only declarations/directives are valid
-                if not _MODULE_LEVEL.match(stripped):
-                    errors.append(
-                        f"{comp.Name} line {i}: code outside Sub/Function: "
-                        f"{stripped[:80]}"
-                    )
-                    break  # one error per module is enough
-
+            _check_structure_in_module(comp.Name, code.split("\n"), errors)
     except Exception:
         pass  # VBE not accessible -- skip
     return errors

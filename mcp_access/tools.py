@@ -296,7 +296,12 @@ TOOLS = [
         description=(
             "Surgical find/replace WITHIN a VBA procedure. "
             "More efficient than replace_proc when only a few lines change "
-            "in a large proc. patches: [{find, replace}]."
+            "in a large proc. patches: [{find, replace}]. "
+            "ATOMIC BY DEFAULT (atomic=true): if any patch fails to match, "
+            "nothing is written and you must re-send the WHOLE batch. "
+            "Anchors are matched case-insensitively by default (match_case=false), "
+            "because VBA is case-insensitive and the VBE rewrites casing on its own. "
+            "proc_name='(Declarations)' targets the module declarations section."
         ),
         inputSchema={
             "type": "object",
@@ -304,7 +309,7 @@ TOOLS = [
                 "db_path": {"type": "string", "description": "Path to .accdb/.mdb file"},
                 "object_type": {"type": "string", "enum": ["module", "form", "report"]},
                 "object_name": {"type": "string", "description": "Object name"},
-                "proc_name": {"type": "string", "description": "Sub/Function/Property name"},
+                "proc_name": {"type": "string", "description": "Sub/Function/Property name, or '(Declarations)'"},
                 "patches": {
                     "type": "array",
                     "description": "List of find/replace to apply within the proc",
@@ -317,8 +322,60 @@ TOOLS = [
                         "required": ["find"],
                     },
                 },
+                "atomic": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": (
+                        "DEFAULT TRUE. All-or-nothing: if any patch fails, the module "
+                        "is left byte-for-byte unchanged. Set false for the old "
+                        "best-effort behaviour (partial writes)."
+                    ),
+                },
+                "require_unique": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "Reject (do not apply) any patch whose find text matches more "
+                        "than once, reporting the matching line numbers."
+                    ),
+                },
+                "match_case": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "DEFAULT FALSE (case-insensitive anchors). Set true to require "
+                        "an exact-case match."
+                    ),
+                },
             },
             "required": ["db_path", "object_type", "object_name", "proc_name", "patches"],
+        },
+    ),
+    types.Tool(
+        name="access_vbe_check_syntax",
+        description=(
+            "Static structural check of the ALREADY OPEN VBA project — the safe "
+            "alternative to access_compile_vba, which decompiles first and can "
+            "discard unsaved VBA. Detects unbalanced If/For/Do/While/Select/With/"
+            "Type/Enum blocks, code outside a procedure and misplaced Option "
+            "statements. It is NOT a compiler: it does not resolve identifiers, "
+            "types or references, so ok=true does not prove the project compiles."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Path to .accdb/.mdb file"},
+                "object_type": {
+                    "type": "string",
+                    "enum": ["module", "form", "report"],
+                    "description": "Optional — limit the check to one object",
+                },
+                "object_name": {
+                    "type": "string",
+                    "description": "Optional — object name (requires object_type)",
+                },
+            },
+            "required": ["db_path"],
         },
     ),
     types.Tool(

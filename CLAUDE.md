@@ -11,7 +11,7 @@ MCP server for reading and editing Microsoft Access databases (`.accdb`/`.mdb`) 
 - **Caches**: `_parsed_controls_cache` (control parsing) and `_Session._cm_cache` (CodeModule COM objects — live COM proxies). Both invalidated on DB switch, object modification, and design operations. There is **no** Python-side cache of VBE text: `_cm_all_code()` always reads via `cm.Lines(1, total)` so external edits (manual VBE edits, Ctrl+Z, add-ins) are picked up immediately. See issue #26 for the reason this cache was removed.
 - **Binary section handling**: `ac_get_code` strips PrtMip/PrtDevMode from form/report exports; `ac_set_code` restores them automatically before import.
 
-## Tools (67 total)
+## Tools (68 total)
 
 | Category | Tools |
 |----------|-------|
@@ -30,7 +30,7 @@ MCP server for reading and editing Microsoft Access databases (`.accdb`/`.mdb`) 
 | **Screenshot & UI** | `access_screenshot`, `access_ui_click`, `access_ui_type` |
 | **Queries** | `access_manage_query` |
 | **Indexes** | `access_list_indexes`, `access_manage_index` |
-| **VBA Compilation** | `access_compile_vba` |
+| **VBA Compilation** | `access_compile_vba`, `access_vbe_check_syntax` |
 | **VBA Execution** | `access_run_macro`, `access_run_vba`, `access_eval_vba` |
 | **Export** | `access_output_report` |
 | **Data Transfer** | `access_transfer_data` |
@@ -407,6 +407,121 @@ Field-report fixes for `vbe.py`. Three behaviours to keep in mind:
 start (includes the blank/comment lines above); `body_line` is the
 `Sub`/`Function`/`Property` declaration line. Use `start_line` for whole-proc ops,
 `body_line` for body line-range edits.
+
+## VBE patching: atomic / case / (Declarations) (v0.7.52)
+
+Field requests from @TvanStiphout-Home, all tested against a real database
+before being filed. `_apply_patches` (`vbe.py`) is the pure, COM-free engine
+extracted from `ac_vbe_patch_proc`'s old inline loop.
+
+### The 4-tier match ladder — order is load-bearing
+1. literal, case-sensitive → 2. ws-normalized, case-sensitive →
+3. literal, case-insensitive → 4. ws-normalized, case-insensitive.
+Tiers 3–4 only run when `match_case=false` (the default).
+
+**ALL case-sensitive tiers run before ANY case-insensitive one.** That is what
+makes the change byte-for-byte backwards compatible: every call that succeeds
+today still lands on tier 1 or 2, exactly where it landed before. Interleaving
+them (e.g. putting literal-CI between 1 and 2) would silently relocate calls
+that currently succeed via the ws fallback. Do NOT reorder.
+
+Case-insensitive replacement **cannot use `str.replace`** (it is case-sensitive).
+It finds the index on a lowered copy and splices the ORIGINAL string by
+position, inserting the caller's replacement text with its casing untouched.
+
+### The Unicode length guard
+`'İ'.lower()` (U+0130) returns TWO characters, so offsets computed on the
+lowered copy no longer address the original — one such char in a comment would
+splice the replacement into the middle of a line. `_case_insensitive_safe()`
+checks `len(text.lower()) == len(text)` and the CI tiers are skipped (with a
+note) when it fails. `casefold()` is worse (`ß`→`ss`); do not "improve" this.
+
+### atomic is simulate-then-commit, NOT a pre-pass
+`atomic=true` (default) decides AFTER running the whole patch loop in memory and
+BEFORE any `DeleteLines`/`InsertLines`. A pre-pass validating every anchor
+against the ORIGINAL text would be wrong in both directions: patch 0 can destroy
+the anchor patch 3 cites (pre-pass says OK, real run half-writes) or create it
+(pre-pass rejects a valid batch). Because the simulation and the commit are the
+same single pass, divergence is structurally impossible.
+
+The ABORTED message MUST keep telling the caller to re-send the **entire** batch.
+A model that re-sends only the failed patches loses the ones that did match —
+that failure mode is worse than the partial write atomic exists to prevent.
+
+`require_unique` violations are collected into the same blocking list as
+not-founds, so the atomic gate covers both uniformly. Occurrence counting uses
+the same tier that produced the match, and reports absolute module line numbers
+(`base_line + offset`). Note that `match_case=false` makes `require_unique`
+*stricter* — a CI comparison can match more often than a CS one.
+
+### (Declarations) as a target
+`_is_declarations()` matches `"(declarations)"` case-insensitively after
+`.strip()`. Deliberately NOT triggered by `""` — `ac_vbe_find` already reads
+`""` as "the whole module".
+- `ac_vbe_patch_proc` / `ac_vbe_get_proc`: resolve to `start=1`,
+  `count=cm.CountOfDeclarationLines`, bypassing `_proc_bounds`.
+- `count == 0` raises an actionable error pointing at
+  `ac_vbe_replace_lines(start_line=1, count=0, ...)` — and it must, because
+  `cm.Lines(1, 0)` and `cm.DeleteLines(1, 0)` both raise in VBE.
+- `_strip_option_lines` is guarded by `not is_declarations and start > 5`. The
+  old `start > 5` alone happened to be false at `start=1`, but relying on that
+  coincidence would silently delete `Option Explicit` if the threshold ever moved.
+- The final message reads `CountOfDeclarationLines`, never `ProcCountLines`
+  (there is no proc; the bare `except` would report a bogus `0`).
+- `ac_vbe_replace_proc` REFUSES `(Declarations)`: `new_code=""` would wipe
+  `Option Explicit` plus every module-level `Const` in one unconfirmed call.
+- `ac_vbe_module_info` gained an additive `declarations: {start_line, count}`.
+
+### The off-by-one: cm.CountOfLines is the source of truth
+`patch_proc` reported `cm.CountOfLines`; `module_info`/`get_lines` reported
+`len(splitlines())`. VBE emits no trailing terminator, so a module ending in a
+blank line makes `splitlines()` drop it → the two disagreed by exactly 1.
+
+`_cm_lines_list()` splits and then **pads with `""` up to `cm.CountOfLines`**, so
+`len(lines) == cm.CountOfLines` by construction. Every existing slice and bounds
+check keeps working, the reported number becomes authoritative, and a trailing
+blank line becomes readable via `get_lines` (it was rejected as out-of-range).
+
+**Do NOT "fix" this the other way round** by switching `patch_proc` to
+`splitlines()`. Its `count = min(count, total - start + 1)` is the clamp feeding
+a destructive `DeleteLines`; changing that input to a 1-short value to make a
+cosmetic message agree turns a display bug into code loss.
+
+Related: `new_count` is now clamped like `replace_proc` does, and
+`_check_module_health` receives `expected_total = total - count +
+_vbe_line_count(inserted)` so its Check 3 stops being dead code.
+`_vbe_line_count` counts a trailing CRLF as opening a further empty line —
+`"a\r\nb\r\n"` → 3 — because that is what `InsertLines` does.
+
+## access_vbe_check_syntax (v0.7.52)
+
+The safe alternative to `access_compile_vba`, which is unusable as a post-edit
+check: its step 0 calls `_Session._decompile` → a `MSACCESS.EXE /decompile`
+subprocess, then either `Quit(1)` (= acQuitSaveNone) or `CloseCurrentDatabase()`
+on the user's instance. **Unsaved VBA is discarded.** That stays as-is; the new
+tool simply never goes near it.
+
+Checks the ALREADY OPEN project: no decompile, no `RunCommand`, no Design view,
+no second Access instance. Reuses the pure validators in `compile.py`
+(`_check_blocks_in_module`, plus `_check_structure_in_module` extracted from
+`_verify_module_structure` in this release) — `ac_compile_vba`'s behaviour is
+unchanged, its wrappers just delegate now.
+
+- Uses `_get_vb_project(app)`, **not** `VBE.ActiveVBProject`: the active project
+  can be `acwzmain` (the wizard library) after a decompile/compact.
+- Feeds the checkers `code.split("\n")`, not `splitlines()` — they were written
+  against raw VBE text and their `" _"` continuation test sees the stray `\r`.
+- **Never reports a clean 0 for something it could not read.** Per-module
+  failures land in `skipped` and force `ok=false`; a project that fails to
+  enumerate raises. Same rule as the multi-object scans.
+- The `note` field states plainly that this is structural validation, not
+  compilation: no identifier resolution, no type checking, no references. A
+  caller who reads `ok=true` as "it compiles" is the failure mode to avoid.
+
+`_check_structure_in_module` also gained an end-of-module check for an unclosed
+`Type`/`Enum` block — everything below the opener is absorbed by it, so no line
+inside the loop could ever have flagged it (the "Statement invalid inside Type
+block" trap already documented under VBA Language Gotchas).
 
 ## Code-execution gate (v0.7.51)
 

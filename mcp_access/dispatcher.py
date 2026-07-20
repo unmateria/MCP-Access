@@ -12,7 +12,7 @@ from .vbe import (
     ac_vbe_get_lines, ac_vbe_get_proc, ac_vbe_module_info,
     ac_vbe_replace_lines, ac_vbe_find, ac_vbe_search_all,
     ac_search_queries, ac_vbe_replace_proc, ac_vbe_patch_proc,
-    ac_vbe_append, ac_find_usages, ac_find_definition,
+    ac_vbe_append, ac_vbe_check_syntax, ac_find_usages, ac_find_definition,
 )
 from .controls import (
     ac_list_controls, ac_get_control, ac_create_control,
@@ -231,7 +231,20 @@ def call_tool_sync(name: str, arguments: dict) -> str:
                 arguments["object_name"],
                 arguments["proc_name"],
                 arguments["patches"],
+                # atomic defaults to TRUE — do not copy the `, False)` pattern
+                # used by the other boolean arguments in this dispatcher.
+                bool(arguments.get("atomic", True)),
+                bool(arguments.get("require_unique", False)),
+                bool(arguments.get("match_case", False)),
             )
+
+        elif name == "access_vbe_check_syntax":
+            result = ac_vbe_check_syntax(
+                arguments["db_path"],
+                arguments.get("object_type"),
+                arguments.get("object_name"),
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
 
         elif name == "access_vbe_append":
             text = ac_vbe_append(

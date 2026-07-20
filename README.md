@@ -4,7 +4,7 @@
 
 **Give any AI assistant full control over Microsoft Access databases.**
 
-Create forms, write VBA, design tables, manage controls, run queries, build relationships, and edit every corner of an `.accdb` — all through natural language. 67 tools that turn Access into something you can *talk to*.
+Create forms, write VBA, design tables, manage controls, run queries, build relationships, and edit every corner of an `.accdb` — all through natural language. 68 tools that turn Access into something you can *talk to*.
 
 No Access expertise required. Just describe what you want.
 
@@ -127,7 +127,7 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 | `access_vbe_find` | Search text in ONE specific module. To search all modules at once, use `access_vbe_search_all` |
 | `access_vbe_search_all` | Search text across ALL modules/forms/reports in the database at once |
 | `access_vbe_replace_proc` | Replace a full procedure by name (auto-calculates line bounds). Strips misplaced `Option` lines, runs structural health check |
-| `access_vbe_patch_proc` | Surgical find/replace within a procedure. Whitespace-tolerant fallback matching + contextual error messages when patches fail |
+| `access_vbe_patch_proc` | Surgical find/replace within a procedure. **Atomic by default** (a failed patch writes nothing), case-insensitive anchors, optional `require_unique`, whitespace-tolerant fallback matching + contextual error messages when patches fail. `proc_name='(Declarations)'` targets the declarations section |
 | `access_vbe_append` | Append code at the end of a module. Auto-strips `Option Explicit`/`Option Compare` to prevent misplacement |
 
 ### Form & report controls
@@ -212,7 +212,8 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 
 | Tool | Description |
 |------|-------------|
-| `access_compile_vba` | Compile and save all VBA modules. Optional `timeout` to auto-dismiss error MsgBox |
+| `access_vbe_check_syntax` | Static structural check of the already-open VBA project — no decompile, nothing discarded. The safe post-edit check. Not a compiler: it does not resolve identifiers, types or references |
+| `access_compile_vba` | Compile and save all VBA modules. Optional `timeout` to auto-dismiss error MsgBox. **Decompiles first and can discard unsaved VBA** — for a quick check use `access_vbe_check_syntax` |
 
 ### VBA & macro execution
 
