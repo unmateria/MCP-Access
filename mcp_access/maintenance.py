@@ -216,18 +216,22 @@ def ac_decompile_compact(db_path: str) -> dict:
     # escape `taskkill /T /F`.  Preserves the user's attached PID (if any).
     pids_before = _list_msaccess_pids()
 
-    # Hold SHIFT during /decompile to bypass AutoExec/startup forms
+    # Hold SHIFT during /decompile to bypass AutoExec/startup forms.
+    # Opt-in — held for ~3s on this path, and the key-down is global, so it
+    # shifts anything the human types meanwhile.  See security.shift_bypass_enabled().
     import ctypes
+    from .security import shift_bypass_enabled
     VK_SHIFT = 0x10
     KEYEVENTF_KEYUP = 0x0002
     _kbd = ctypes.windll.user32.keybd_event
     shift_held = False
-    try:
-        _kbd(VK_SHIFT, 0, 0, 0)       # Press SHIFT
-        time.sleep(0.3)                # Let key state register
-        shift_held = True
-    except Exception:
-        pass  # SHIFT simulation failed — AutoExec may run
+    if shift_bypass_enabled():
+        try:
+            _kbd(VK_SHIFT, 0, 0, 0)       # Press SHIFT
+            time.sleep(0.3)                # Let key state register
+            shift_held = True
+        except Exception:
+            pass  # SHIFT simulation failed — AutoExec may run
 
     proc = subprocess.Popen(
         [msaccess, resolved, "/decompile"],

@@ -17,6 +17,8 @@ import winreg
 from pathlib import Path
 from typing import Any, Optional
 
+from .security import shift_bypass_enabled
+
 # DPI awareness -- must be set before any window operations
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
@@ -432,17 +434,20 @@ class _Session:
         # set and MUST be preserved.
         pids_before = _list_msaccess_pids()
 
-        # Hold SHIFT while launching /decompile
+        # Hold SHIFT while launching /decompile.  Opt-in — this path holds it for
+        # ~3s (see the release at the i == 6 mark below), which is long enough to
+        # mangle real typing anywhere on the machine.
         VK_SHIFT = 0x10
         KEYEVENTF_KEYUP = 0x0002
         _kbd = ctypes.windll.user32.keybd_event
         shift_held = False
-        try:
-            _kbd(VK_SHIFT, 0, 0, 0)
-            time.sleep(0.3)
-            shift_held = True
-        except Exception:
-            pass
+        if shift_bypass_enabled():
+            try:
+                _kbd(VK_SHIFT, 0, 0, 0)
+                time.sleep(0.3)
+                shift_held = True
+            except Exception:
+                pass
 
         proc = subprocess.Popen(
             [msaccess, path, "/decompile"],
@@ -673,18 +678,27 @@ class _Session:
 
         cls._suppress_recovery_dialog()
 
-        # Hold Shift during OpenCurrentDatabase to bypass AutoExec/startup forms
+        # Hold Shift during OpenCurrentDatabase to bypass AutoExec/startup forms.
+        # Opt-in: the key-down is global, so it shifts whatever the human is typing
+        # anywhere on the machine.  See security.shift_bypass_enabled().
         VK_SHIFT = 0x10
         KEYEVENTF_KEYUP = 0x0002
         _kbd = ctypes.windll.user32.keybd_event
         shift_held = False
-        try:
-            _kbd(VK_SHIFT, 0, 0, 0)  # Press SHIFT
-            time.sleep(0.3)  # Let the key state register before COM call
-            shift_held = True
-            log.info("SHIFT held for bypass")
-        except Exception:
-            log.warning("Could not simulate Shift — AutoExec may run")
+        if shift_bypass_enabled():
+            try:
+                _kbd(VK_SHIFT, 0, 0, 0)  # Press SHIFT
+                time.sleep(0.3)  # Let the key state register before COM call
+                shift_held = True
+                log.info("SHIFT held for bypass")
+            except Exception:
+                log.warning("Could not simulate Shift — AutoExec may run")
+        else:
+            log.info(
+                "SHIFT bypass disabled via MCP_ACCESS_SHIFT_BYPASS — an unguarded "
+                "AutoExec in the target database will run; the dialog watchdog "
+                "still handles any modal it raises"
+            )
 
         # Capture Access hwnd on THIS thread (COM worker — same apartment
         # that created _app).  COM STA proxies cannot be accessed from the
