@@ -161,12 +161,51 @@ def _save_all_modules(app) -> None:
     RunCommand 280 can raise 2046 'not available now' without an applicable
     module context -- fall back to saving loaded modules one by one.
     Never raises.
+
+    The 'not available now' case does NOT always come back as a trappable
+    2046: when Access is not the foreground application (typically because
+    the VBE has focus -- e.g. straight after ac_compile_vba activated a code
+    pane) it surfaces as a MODAL dialog instead, which blocks the COM call
+    until a human clicks OK.  RunCommand is one of the blocking calls the
+    dialog watchdog exists for, so run it under one; the per-module fallback
+    below then does the actual saving.  Do NOT drop the watchdog: without it
+    a routine ac_delete_object can wedge the session behind a dialog the
+    caller never sees.
     """
+    import threading
+    from .vba_exec import _dialog_watchdog
+
+    stop_event = threading.Event()
+    dismissed: list = []
+    watchdog = None
+    try:
+        _h = app.hWndAccessApp
+        hwnd = int(_h() if callable(_h) else _h)
+        watchdog = threading.Thread(
+            target=_dialog_watchdog,
+            args=[hwnd, stop_event, dismissed, [], 0.5],
+            daemon=True,
+        )
+        watchdog.start()
+    except Exception:
+        watchdog = None
+    ran_ok = False
     try:
         app.RunCommand(280)
-        return
+        ran_ok = True
     except Exception:
         pass
+    finally:
+        stop_event.set()
+        # Join before reading `dismissed`: dismissing the dialog is what
+        # unblocks RunCommand, so the main thread can get here before the
+        # watchdog thread has recorded the dismissal.
+        if watchdog is not None:
+            watchdog.join(timeout=2)
+    # A dismissed dialog means the command did not run -- fall through to
+    # the per-module loop instead of trusting a save that never happened.
+    if ran_ok and not dismissed:
+        return
     try:
         mods = app.CurrentProject.AllModules
         for i in range(mods.Count):

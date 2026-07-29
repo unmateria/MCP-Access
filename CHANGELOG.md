@@ -34,6 +34,17 @@
     `code_pane` diagnostic fields.
   Pure-Python tests for the pane-selection logic in
   `tests/test_compile_trigger.py`.
+- **`_save_all_modules` no longer wedges `access_delete_object` behind a modal
+  dialog.** `RunCommand(280)` (`acCmdSaveAllModules`) does not always report
+  "not available now" as a trappable 2046 — when Access is not the foreground
+  application (typically because the VBE has focus, e.g. right after
+  `access_compile_vba` activated a code pane) it surfaces as a **modal dialog**
+  that blocks the COM call until a human clicks OK. Observed in the field as a
+  *"command 'SaveAllModules' isn't available"* box popping up during a routine
+  module delete. `RunCommand` is one of the blocking calls the dialog watchdog
+  exists for, so it now runs under one; a dismissed dialog means the command
+  did not run, so the per-module `DoCmd.Save` fallback executes instead of
+  trusting a save that never happened.
 
 ## 0.7.52 — 2026-07-21
 
