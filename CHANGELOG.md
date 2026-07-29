@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **`access_compile_vba` no longer misreports a failed compile *trigger* as a
+  compile *error* in the user's code.** The tool deliberately dirties the
+  project (step 0b) so `Application.IsCompiled` can serve as the success
+  signal, then triggers compilation by `Execute()`-ing the VBE *Debug >
+  Compile* menu item. That item acts on the **active** project and is only
+  reliably enabled when one of its code panes has focus — so with no pane
+  active the trigger could raise `DISP_E_EXCEPTION` (-2147352567), silently
+  no-op, or compile the wrong project entirely (after a decompile/compact the
+  active project is typically the `acwzmain` wizard library). Every one of
+  those paths left the deliberately-dirtied `IsCompiled=False` standing and
+  produced the false *"VBA project is NOT compiled … missing reference,
+  undeclared variable, or type mismatch"* — while a manual Debug > Compile of
+  the same project succeeded (repeated field reports). Now:
+  - a code pane of the **current database's** project is activated before the
+    trigger (`_ensure_code_pane`, standard modules preferred — no Design-view
+    side effects), which both enables the menu item and makes it target the
+    right project;
+  - the step-0b dirty-marking resolves the project via `_get_vb_project`
+    instead of `VBE.ActiveVBProject`, so it can no longer dirty `acwzmain`
+    while reading `IsCompiled` from the user's project;
+  - a disabled menu item falls back to `RunCommand` instead of executing a
+    control known to fail;
+  - an exception from the trigger is reported as *"could not run the compile
+    command"* — explicitly **not** a code error — and the residual
+    `IsCompiled=False`-with-no-dialog case now states both possible causes
+    (dialog-less compile error vs. trigger no-op) and tells the caller to
+    cross-check with Debug > Compile. Both results carry `trigger` and
+    `code_pane` diagnostic fields.
+  Pure-Python tests for the pane-selection logic in
+  `tests/test_compile_trigger.py`.
+
 ## 0.7.52 — 2026-07-21
 
 **`access_vbe_patch_proc` stops being the one write tool without a safety net.**

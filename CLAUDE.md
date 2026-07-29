@@ -545,6 +545,31 @@ unchanged, its wrappers just delegate now.
 inside the loop could ever have flagged it (the "Statement invalid inside Type
 block" trap already documented under VBA Language Gotchas).
 
+## access_compile_vba trigger hardening (unreleased)
+
+`ac_compile_vba` reads `Application.IsCompiled` as its success signal after
+**deliberately dirtying the project** (step 0b) — so any path where the
+Debug > Compile trigger silently fails leaves `IsCompiled=False` and used to
+be misreported as a compile error in the user's code ("missing reference,
+undeclared variable, or type mismatch") while manual Debug > Compile
+succeeded.
+
+- **`_ensure_code_pane(app)`** runs before the trigger: opens/activates a code
+  pane of the CURRENT database's project (via `_get_vb_project`, standard
+  modules preferred). Debug > Compile acts on the ACTIVE project and is only
+  reliably enabled with a code pane focused; after a decompile/compact the
+  active project is often `acwzmain`. Do NOT remove this step — without it
+  `Execute()` raises DISP_E_EXCEPTION, no-ops, or compiles the wizard library.
+- Step 0b uses `_get_vb_project`, NOT `VBE.ActiveVBProject` — same
+  wrong-project reasoning as `access_vbe_check_syntax`.
+- A disabled menu item falls back to `RunCommand(AC_CMD_COMPILE)`.
+- Trigger exception ⇒ "could not run the compile command" (NOT a code error).
+  `IsCompiled=False` with no dialog and no block mismatches ⇒ message states
+  BOTH possible causes and tells the caller to cross-check manually. Both
+  results carry `trigger` + `code_pane` diagnostics. Do NOT restore the old
+  unconditional "missing reference…" wording — it was a repeated field false
+  alarm.
+
 ## Code-execution gate (v0.7.51)
 
 `mcp_access/security.py` is the single source of truth for the opt-in gate that
