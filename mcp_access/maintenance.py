@@ -7,7 +7,10 @@ import threading
 import time
 from pathlib import Path
 
-from .core import _Session, _parsed_controls_cache, _list_msaccess_pids, log
+from .core import (
+    _Session, _parsed_controls_cache, _list_msaccess_pids, log,
+    _press_shift_bypass, _release_shift,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -216,18 +219,10 @@ def ac_decompile_compact(db_path: str) -> dict:
     # escape `taskkill /T /F`.  Preserves the user's attached PID (if any).
     pids_before = _list_msaccess_pids()
 
-    # Hold SHIFT during /decompile to bypass AutoExec/startup forms
-    import ctypes
-    VK_SHIFT = 0x10
-    KEYEVENTF_KEYUP = 0x0002
-    _kbd = ctypes.windll.user32.keybd_event
-    shift_held = False
-    try:
-        _kbd(VK_SHIFT, 0, 0, 0)       # Press SHIFT
-        time.sleep(0.3)                # Let key state register
-        shift_held = True
-    except Exception:
-        pass  # SHIFT simulation failed — AutoExec may run
+    # Hold SHIFT during /decompile to bypass AutoExec/startup forms.  Held ~3 s
+    # on this path and the key-down is global, so it shifts anything the human
+    # types meanwhile — MCP_ACCESS_SHIFT_BYPASS=0 opts out.
+    shift_held = _press_shift_bypass("decompile_compact")
 
     proc = subprocess.Popen(
         [msaccess, resolved, "/decompile"],
@@ -240,10 +235,7 @@ def ac_decompile_compact(db_path: str) -> dict:
     from .vba_exec import _dismiss_dialogs_by_pid
     for i in range(16):
         if i == 6 and shift_held:  # ~3s mark
-            try:
-                _kbd(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0)  # Release SHIFT
-            except Exception:
-                pass
+            _release_shift()
             shift_held = False
         if proc.poll() is not None:
             break
@@ -255,10 +247,7 @@ def ac_decompile_compact(db_path: str) -> dict:
 
     # Ensure SHIFT released even on early exit
     if shift_held:
-        try:
-            _kbd(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0)
-        except Exception:
-            pass
+        _release_shift()
     try:
         subprocess.run(
             ["taskkill", "/F", "/T", "/PID", str(proc.pid)],

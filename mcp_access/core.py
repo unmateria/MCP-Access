@@ -17,6 +17,8 @@ import winreg
 from pathlib import Path
 from typing import Any, Optional
 
+from .security import shift_bypass_enabled
+
 # DPI awareness -- must be set before any window operations
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
@@ -80,6 +82,42 @@ def _release_shift():
         pass
 
 atexit.register(_release_shift)
+
+
+def _press_shift_bypass(context: str) -> bool:
+    """Press SHIFT for the AutoExec/startup bypass.  Returns True if it is held.
+
+    The ONLY place in this package that synthesises a SHIFT key-down.  Every
+    caller (``_switch``, ``_Session._decompile``, ``ac_decompile_compact``) went
+    through its own copy of press/sleep/release before v0.7.53; funnelling them
+    here is what makes the ``MCP_ACCESS_SHIFT_BYPASS`` opt-out impossible to
+    half-apply.  Release with ``_release_shift()`` (idempotent).
+
+    ``keybd_event`` is a GLOBAL key-down — it is not scoped to Access, so it
+    shifts whatever the human is typing anywhere on the machine for as long as
+    it is held.  That is the whole reason the switch exists; see
+    ``security.shift_bypass_enabled``.
+
+    A False return means "not held" for both reasons — opted out, or the
+    injection failed — which is exactly what every caller needs to decide
+    whether to release later.
+    """
+    if not shift_bypass_enabled():
+        log.info(
+            "SHIFT bypass disabled via MCP_ACCESS_SHIFT_BYPASS (%s) — an "
+            "unguarded AutoExec in the target database will run; "
+            "AutomationSecurity and the dialog watchdog still apply", context,
+        )
+        return False
+    try:
+        ctypes.windll.user32.keybd_event(_VK_SHIFT, 0, 0, 0)
+        time.sleep(0.3)  # let the key state register before the blocking call
+        log.info("SHIFT held for bypass (%s)", context)
+        return True
+    except Exception as exc:
+        log.warning("Could not simulate SHIFT (%s) — AutoExec may run: %s",
+                    context, exc)
+        return False
 
 
 def _get_com_pid(app) -> Optional[int]:
@@ -432,17 +470,10 @@ class _Session:
         # set and MUST be preserved.
         pids_before = _list_msaccess_pids()
 
-        # Hold SHIFT while launching /decompile
-        VK_SHIFT = 0x10
-        KEYEVENTF_KEYUP = 0x0002
-        _kbd = ctypes.windll.user32.keybd_event
-        shift_held = False
-        try:
-            _kbd(VK_SHIFT, 0, 0, 0)
-            time.sleep(0.3)
-            shift_held = True
-        except Exception:
-            pass
+        # Hold SHIFT while launching /decompile.  This path holds it ~3 s (see
+        # the i == 6 release below) — long enough to mangle real typing, hence
+        # the MCP_ACCESS_SHIFT_BYPASS opt-out.
+        shift_held = _press_shift_bypass("/decompile")
 
         proc = subprocess.Popen(
             [msaccess, path, "/decompile"],
@@ -455,10 +486,7 @@ class _Session:
         # exits on its own.
         for i in range(16):
             if i == 6 and shift_held:  # ~3s mark
-                try:
-                    _kbd(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0)
-                except Exception:
-                    pass
+                _release_shift()
                 shift_held = False
             if proc.poll() is not None:
                 break  # subprocess already exited
@@ -471,10 +499,7 @@ class _Session:
 
         # Ensure SHIFT released even on early exit
         if shift_held:
-            try:
-                _kbd(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0)
-            except Exception:
-                pass
+            _release_shift()
         try:
             subprocess.run(
                 ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
@@ -674,17 +699,7 @@ class _Session:
         cls._suppress_recovery_dialog()
 
         # Hold Shift during OpenCurrentDatabase to bypass AutoExec/startup forms
-        VK_SHIFT = 0x10
-        KEYEVENTF_KEYUP = 0x0002
-        _kbd = ctypes.windll.user32.keybd_event
-        shift_held = False
-        try:
-            _kbd(VK_SHIFT, 0, 0, 0)  # Press SHIFT
-            time.sleep(0.3)  # Let the key state register before COM call
-            shift_held = True
-            log.info("SHIFT held for bypass")
-        except Exception:
-            log.warning("Could not simulate Shift — AutoExec may run")
+        shift_held = _press_shift_bypass("OpenCurrentDatabase")
 
         # Capture Access hwnd on THIS thread (COM worker — same apartment
         # that created _app).  COM STA proxies cannot be accessed from the
@@ -748,11 +763,8 @@ class _Session:
             except Exception:
                 pass
             if shift_held:
-                try:
-                    _kbd(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0)  # Release SHIFT
-                    log.info("SHIFT released")
-                except Exception:
-                    pass
+                _release_shift()
+                log.info("SHIFT released")
 
         if _dialog_screenshots:
             log.warning("A blocking dialog was auto-dismissed. Screenshot: %s",

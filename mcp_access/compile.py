@@ -2,12 +2,13 @@
 VBA compilation and linting.
 """
 
+import os
 import re
 import threading
 import time
 from typing import Optional
 
-from .core import _Session, log
+from .core import _Session, log, _get_vb_project
 from .constants import AC_CMD_COMPILE
 
 
@@ -474,6 +475,85 @@ def _check_blocks_in_module(module_name: str, lines: list, errors: list):
         i += 1
 
 
+def _ensure_code_pane(app) -> dict:
+    """Make a code pane of the CURRENT database's VBA project the active one.
+
+    Why this exists (the false "NOT compiled" report, @CaptainStormfield):
+    ``ac_compile_vba`` triggers compilation by ``Execute()``-ing the VBE
+    *Debug > Compile* menu item.  That item acts on the **active** project and
+    is only reliably enabled when one of its code panes has focus.  Two silent
+    failure modes follow when no pane of the target project is active:
+
+    * the item is disabled — ``Execute()`` then raises ``DISP_E_EXCEPTION``
+      (-2147352567) or simply does nothing;
+    * the active project is a *different* one — after a decompile/compact cycle
+      it is typically the ``acwzmain`` wizard library — so the wrong project
+      gets compiled.
+
+    Either way the deliberate dirty-marking in step 0b leaves
+    ``Application.IsCompiled`` False, which used to be reported as "missing
+    reference, undeclared variable, or type mismatch" in the USER's code while
+    a manual Debug > Compile of the same project succeeded.
+
+    Fast path first: if a pane of our project is already active, touch nothing —
+    a repeat compile in the same session must not keep opening code windows in
+    the user's VBE, and enumerating every component of a large project costs a
+    COM round-trip each.  Otherwise prefer a standard module (showing its pane
+    has no Design-view side effects) and fall back to any component with code.
+
+    Purely best-effort: returns ``{"ok", "project", "detail"}`` for diagnostics
+    and never raises — the caller carries on either way.
+    """
+    db_open = _Session._db_open
+
+    def _proj_of(pane):
+        # CodePane -> CodeModule -> VBComponent -> VBComponents -> VBProject
+        return pane.CodeModule.Parent.Collection.Parent
+
+    if db_open:
+        try:
+            active = app.VBE.ActiveCodePane
+            proj = _proj_of(active)
+            fname = getattr(proj, "FileName", "") or ""
+            if fname and os.path.normcase(os.path.abspath(fname)) == \
+                    os.path.normcase(os.path.abspath(db_open)):
+                return {"ok": True, "project": getattr(proj, "Name", None),
+                        "detail": "code pane already active"}
+        except Exception:
+            pass  # no active pane, or it belongs elsewhere — open one below
+
+    try:
+        proj = _get_vb_project(app)
+    except Exception as exc:
+        return {"ok": False, "project": None, "detail": f"no VBProject: {exc}"}
+    proj_name = None
+    try:
+        proj_name = proj.Name
+    except Exception:
+        pass
+    try:
+        comps = list(proj.VBComponents)
+    except Exception as exc:
+        return {"ok": False, "project": proj_name,
+                "detail": f"VBComponents not enumerable: {exc}"}
+    # Two passes: standard modules (Type 1) first, then anything with code.
+    for std_only in (True, False):
+        for comp in comps:
+            try:
+                if std_only and comp.Type != 1:
+                    continue
+                cm = comp.CodeModule
+                if cm.CountOfLines == 0:
+                    continue
+                cm.CodePane.Show()  # creates the pane if needed + activates it
+                return {"ok": True, "project": proj_name,
+                        "detail": f"code pane opened: {comp.Name}"}
+            except Exception:
+                continue
+    return {"ok": False, "project": proj_name,
+            "detail": "no component with code found"}
+
+
 def _read_dialog_text(hwnd_access: int) -> Optional[str]:
     """Read text from an Access/VBE error dialog without dismissing it.
     Returns the static text content or None if no dialog found."""
@@ -556,11 +636,18 @@ def ac_compile_vba(db_path: str, timeout: Optional[int] = None) -> dict:
 
     Uses VBE CommandBars to trigger compilation (reliable for ALL modules
     including form/report, unlike RunCommand(126) which silently skips them).
+    Before triggering, a code pane of the current database's project is made
+    active (`_ensure_code_pane`): Debug > Compile acts on the ACTIVE project
+    and is only reliably enabled with a code pane focused, so without this the
+    trigger could raise, no-op, or compile the wrong project (acwzmain after a
+    decompile) — all of which used to be reported as user compile errors.
 
     A watchdog reads the error dialog text via Win32 GetWindowText before
     dismissing it, and VBE.ActiveCodePane gives the exact error location.
 
-    Fallback: block mismatch parser + structural verification.
+    Fallback: block mismatch parser + structural verification.  A failure to
+    RUN the compile command is reported as exactly that, distinct from the code
+    failing to compile; both paths carry `trigger` + `code_pane` diagnostics.
     Returns dict with status + optional error_detail, error_location.
     """
     from pathlib import Path
@@ -574,13 +661,17 @@ def ac_compile_vba(db_path: str, timeout: Optional[int] = None) -> dict:
     app = _Session.connect(db_path)
 
     # 0b. Force project to "not compiled" state.
+    #     _get_vb_project, NOT VBE.ActiveVBProject: after the auto-decompile
+    #     above the active project is often the acwzmain wizard library, and
+    #     dirtying THAT while reading IsCompiled from ours is a guaranteed
+    #     false "not compiled" report.
     vbe_was_visible = False
     try:
         vbe_was_visible = bool(app.VBE.MainWindow.Visible)
     except Exception:
         pass
     try:
-        _proj = app.VBE.ActiveVBProject
+        _proj = _get_vb_project(app)
         for _comp in _proj.VBComponents:
             if _comp.Type == 1 and _comp.CodeModule.CountOfLines > 0:
                 _cm = _comp.CodeModule
@@ -596,8 +687,19 @@ def ac_compile_vba(db_path: str, timeout: Optional[int] = None) -> dict:
     except Exception:
         pass
 
+    # 1b. Activate a code pane of OUR project.  Debug > Compile acts on the
+    #     ACTIVE project and is only reliably enabled with a code pane focused
+    #     — without this the trigger below can raise, silently no-op, or
+    #     compile the wizard library, all of which surfaced as a false
+    #     "NOT compiled" error in the user's code.
+    pane_info = _ensure_code_pane(app)
+    if not pane_info["ok"]:
+        log.warning("Could not activate a code pane before compile: %s",
+                    pane_info["detail"])
+
     # 2. Find the Compile menu item in VBE Debug menu (ID 578).
     compile_item = None
+    compile_enabled = None
     try:
         debug_menu = app.VBE.CommandBars("Menu Bar").Controls("Debug")
         for i in range(1, debug_menu.Controls.Count + 1):
@@ -605,6 +707,11 @@ def ac_compile_vba(db_path: str, timeout: Optional[int] = None) -> dict:
             if "compil" in ctrl.Caption.lower().replace("&", ""):
                 compile_item = ctrl
                 break
+        if compile_item is not None:
+            try:
+                compile_enabled = bool(compile_item.Enabled)
+            except Exception:
+                pass
     except Exception:
         log.warning("Could not find VBE Debug > Compile menu item")
 
@@ -629,22 +736,36 @@ def ac_compile_vba(db_path: str, timeout: Optional[int] = None) -> dict:
     # can't hang the tool indefinitely or cut the watchdog before it sees
     # the dialog.
     grace = 2 if timeout is None else max(1, min(int(timeout), 30))
+
+    # Trigger chain, best first: the VBE menu item compiles ALL modules
+    # (RunCommand(126) silently skips form/report ones), so it is only skipped
+    # when Access reports the item as disabled — Execute() on a disabled
+    # control raises or no-ops.  RunCommand is the fallback for both that case
+    # and a menu Execute() that fails anyway.
+    triggers: list = []
+    if compile_item is not None and compile_enabled is not False:
+        # Lambdas, not bound methods: attribute resolution on a late-bound COM
+        # control is itself a COM call and must happen inside the try below.
+        triggers.append(("vbe_debug_menu", lambda: compile_item.Execute()))
+    triggers.append(("runcommand", lambda: app.RunCommand(AC_CMD_COMPILE)))
+
+    trigger = None
+    trigger_errors: list = []
     try:
-        if compile_item:
-            compile_item.Execute()
-        else:
-            app.RunCommand(AC_CMD_COMPILE)
+        for trigger, fire in triggers:
+            try:
+                fire()
+                break
+            except Exception as exc:
+                trigger_errors.append(f"{trigger}: {exc}")
+                if dismissed:
+                    # A real compile error surfaces as a DIALOG, which the
+                    # watchdog just dismissed — the exception is a side effect
+                    # of that, not an unavailable command.  Re-firing would
+                    # only reproduce it; let step 4 report the dialog text.
+                    break
         # Give watchdog time to catch any late async dialog.
         time.sleep(grace)
-    except Exception as exc:
-        err_loc = _get_vbe_error_location(app)
-        result = {
-            "status": "error",
-            "error_detail": f"VBA compilation error: {exc}",
-        }
-        if err_loc:
-            result["error_location"] = err_loc
-        return result
     finally:
         stop_event.set()
         if not vbe_was_visible:
@@ -654,6 +775,26 @@ def ac_compile_vba(db_path: str, timeout: Optional[int] = None) -> dict:
                 pass
 
     _Session._cm_cache.clear()
+
+    # Every trigger failed and no dialog appeared: the compile never ran.  Say
+    # so — the old wording ("VBA compilation error: ...") blamed the user's
+    # code for what is almost always an unavailable command (disabled menu
+    # item, no code pane, VBE focus lost).
+    if len(trigger_errors) == len(triggers) and not dismissed:
+        err_loc = _get_vbe_error_location(app)
+        result = {
+            "status": "error",
+            "error_detail": (
+                "Could not run the compile command (" + "; ".join(trigger_errors)
+                + "). This means the command was unavailable — NOT that the "
+                "VBA code has errors. Verify with Debug > Compile in the VBE."
+            ),
+            "trigger": trigger,
+            "code_pane": pane_info,
+        }
+        if err_loc:
+            result["error_location"] = err_loc
+        return result
 
     # 4. Check results: dialog dismissed = compile error caught.
     if dismissed:
@@ -687,11 +828,25 @@ def ac_compile_vba(db_path: str, timeout: Optional[int] = None) -> dict:
                                    + "\n".join(detail_lines),
                     "errors": block_errors[:10],
                 }
+            # No dialog, no block mismatches, yet IsCompiled is False.  That is
+            # ambiguous: either a real dialog-less compile failure, or a
+            # trigger that silently did nothing (step 0b forced the dirty
+            # state, so a no-op always lands here).  Report the ambiguity —
+            # the old message blamed the user's code unconditionally and was a
+            # repeated field false alarm.
             return {
                 "status": "error",
-                "error_detail": "VBA project is NOT compiled. "
-                                "No block mismatches found — the error may be a "
-                                "missing reference, undeclared variable, or type mismatch.",
+                "error_detail": (
+                    "IsCompiled=False after triggering compile, but no error "
+                    "dialog appeared and no block mismatches were found. "
+                    "Either the project has a dialog-less compile error "
+                    "(missing reference, undeclared variable, type mismatch) "
+                    "— or the compile command did not actually run. "
+                    "Cross-check with Debug > Compile in the VBE before "
+                    "treating this as a code error."
+                ),
+                "trigger": trigger,
+                "code_pane": pane_info,
             }
     except Exception:
         pass

@@ -113,15 +113,17 @@ A DB whose startup code closes it during the open (startup-form error path + `Al
 
 ## Release checklist (the docs drift, every time)
 
-The tool count and the version live in more places than you remember, and the
-**README keeps its own changelog** — a separate `## Changelog` section with
-`### v0.7.NN` entries, independent of `CHANGELOG.md`. Updating only
-`CHANGELOG.md` means the project page shows nothing about the release. Both were
-missed in the v0.7.52 release commit and needed a follow-up.
+The tool count and the version live in more places than you remember.
 
-- `CHANGELOG.md` — new `## 0.7.NN — date` entry at the top.
-- `README.md` — **four** spots: the tagline count (line ~7), the `## Tools (N)`
-  heading, the tool tables themselves, and a new `### v0.7.NN` changelog entry.
+**The README no longer keeps its own changelog** (removed in v0.7.53): it was a
+700-line duplicate of `CHANGELOG.md` that had to be updated in parallel and
+drifted every single release. It now just links to `CHANGELOG.md`. Do NOT
+re-add per-version entries there.
+
+- `CHANGELOG.md` — new `## 0.7.NN — date` entry at the top. This is the only
+  changelog.
+- `README.md` — **three** spots: the tagline count (line ~7), the `## Tools (N)`
+  heading, and the tool tables themselves.
 - `CLAUDE.md` — `## Tools (N total)` heading + the category table.
 - `pyproject.toml` — `version` **and** the `— N tools.` in `description`.
   The description is baked into the published artifact and PyPI versions are
@@ -544,6 +546,77 @@ unchanged, its wrappers just delegate now.
 `Type`/`Enum` block — everything below the opener is absorbed by it, so no line
 inside the loop could ever have flagged it (the "Statement invalid inside Type
 block" trap already documented under VBA Language Gotchas).
+
+## access_compile_vba trigger hardening (v0.7.53, PR #35)
+
+`ac_compile_vba` reads `Application.IsCompiled` as its success signal after
+**deliberately dirtying the project** (step 0b) — so any path where the
+Debug > Compile trigger silently fails leaves `IsCompiled=False` and used to be
+misreported as a compile error in the user's code ("missing reference,
+undeclared variable, or type mismatch") while manual Debug > Compile succeeded.
+
+- **`_ensure_code_pane(app)`** runs before the trigger: makes a code pane of the
+  CURRENT database's project active. Debug > Compile acts on the ACTIVE project
+  and is only reliably enabled with a code pane focused; after a
+  decompile/compact the active project is often `acwzmain`. Do NOT remove this
+  step — without it `Execute()` raises DISP_E_EXCEPTION, no-ops, or compiles the
+  wizard library. It short-circuits when a pane of our project is already
+  active: re-`Show()`ing on every compile piles code windows into the user's VBE
+  and costs a COM round-trip per component on a large project.
+- Step 0b uses `_get_vb_project`, NOT `VBE.ActiveVBProject` — same wrong-project
+  reasoning as `access_vbe_check_syntax`.
+- **The trigger is a chain**, not an if/else: VBE menu item (unless Access
+  reports `Enabled=False`) → `RunCommand(AC_CMD_COMPILE)`. The menu item is
+  first because `RunCommand(126)` silently skips form/report modules. Keep the
+  menu item first if you touch this.
+- **`if dismissed: break` inside the chain is load-bearing.** A real compile
+  error surfaces as a dialog; the watchdog dismisses it and `Execute()` can then
+  raise as a side effect. Without the break we would re-fire the compile and,
+  worse, report "command unavailable" for what is a genuine code error — the
+  exact false alarm inverted. A trigger exception with a dismissed dialog must
+  fall through to step 4.
+- All triggers failed + no dialog ⇒ "could not run the compile command" (NOT a
+  code error). `IsCompiled=False` with no dialog and no block mismatches ⇒ the
+  message states BOTH possible causes and says to cross-check manually. Both
+  carry `trigger` + `code_pane` diagnostics. Do NOT restore the old
+  unconditional "missing reference…" wording — it was a repeated field false
+  alarm.
+
+`_save_all_modules` (`code.py`) runs `RunCommand(280)` under a dialog watchdog:
+when Access is not foreground (VBE has focus, e.g. right after a compile
+activated a code pane) "not available now" arrives as a MODAL dialog instead of
+a trappable 2046, wedging `ac_delete_object`. `ran_ok and not dismissed` is the
+success test — a dismissed dialog means the command never ran, so the per-module
+`DoCmd.Save` loop must still execute. The watchdog waits `_SAVE_MODULES_GRACE`
+(1.5 s) before dismissing anything: a working RunCommand returns in
+milliseconds, so this keeps the attached-instance policy intact (a modal with
+nothing blocking belongs to the interactive user). The `join()` before reading
+`dismissed` is also load-bearing — dismissing the dialog is what unblocks the
+COM call, so the main thread can otherwise win the race.
+
+## SHIFT AutoExec bypass opt-out (v0.7.53, PR #34)
+
+`security.shift_bypass_enabled()` gates the synthetic SHIFT hold behind
+**`MCP_ACCESS_SHIFT_BYPASS`**. `keybd_event` is a global key-down: it shifts
+whatever the human types anywhere on the machine while held (~0.3 s per open,
+~3 s per decompile).
+
+**Opposite polarity to the code-exec gate, on purpose.** That one is security
+and fails CLOSED (only an explicit truthy value opens it). This one is
+ergonomics and fails OPEN (only an explicit `0/false/no/off` disables it), so a
+typo can't quietly let AutoExec run on someone's database. Hence no `ALLOW_`
+prefix (implies default-off) and no `DISABLE_` (double negative). Do NOT flip
+the default: turning the bypass off for everyone would change behaviour with no
+error message pointing at the cause.
+
+**`core._press_shift_bypass()` is the only place in the package that presses
+SHIFT** (`core._release_shift()`, the pre-existing `atexit` safety net, releases
+it — idempotent, so callers just guard with their own `shift_held` flag). The
+three call sites (`_switch`, `_Session._decompile`,
+`maintenance.ac_decompile_compact`) each carried their own copy before v0.7.53,
+which is exactly how a gate gets half-applied. `test_shift_bypass_gate.py` fails
+if `keybd_event` reappears outside `core.py`. (`ui.py` legitimately synthesises
+keys for `access_ui_type` and is excluded.)
 
 ## Code-execution gate (v0.7.51)
 

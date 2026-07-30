@@ -1,5 +1,98 @@
 # Changelog
 
+## 0.7.53 — 2026-07-30
+
+**Two community bug reports, both reproduced on real databases before being
+filed.** Thanks to [@CaptainStormfield](https://github.com/CaptainStormfield)
+(PR #35) and [@CustomDataNZ](https://github.com/CustomDataNZ) (PR #34) — the
+analysis, the reproductions and the test conventions here are theirs; the
+implementations below are reworked versions of their patches.
+
+### Fixed
+
+- **`access_compile_vba` no longer misreports a failed compile *trigger* as a
+  compile *error* in your code** (reported and diagnosed by
+  [@CaptainStormfield](https://github.com/CaptainStormfield), PR #35). The tool
+  deliberately dirties the project (step 0b) so `Application.IsCompiled` can
+  serve as the success signal, then triggers compilation by `Execute()`-ing the
+  VBE *Debug > Compile* menu item. That item acts on the **active** project and
+  is only reliably enabled when one of its code panes has focus — so with no
+  pane active the trigger could raise `DISP_E_EXCEPTION` (-2147352567), silently
+  no-op, or compile the wrong project entirely (after a decompile/compact the
+  active project is typically the `acwzmain` wizard library). Every one of those
+  paths left the deliberately-dirtied `IsCompiled=False` standing and produced
+  the false *"VBA project is NOT compiled … missing reference, undeclared
+  variable, or type mismatch"* while a manual Debug > Compile of the same
+  project succeeded. Now:
+  - a code pane of the **current database's** project is made active before the
+    trigger (`_ensure_code_pane`), which both enables the menu item and points
+    it at the right project. Standard modules are preferred (no Design-view side
+    effects), and a pane of our project that is *already* active short-circuits
+    the whole thing — a repeat compile no longer opens code windows in your VBE;
+  - the step-0b dirty-marking resolves the project via `_get_vb_project` instead
+    of `VBE.ActiveVBProject`, so it can no longer dirty `acwzmain` while
+    `IsCompiled` is read from your project;
+  - the trigger is now a **chain**: the VBE menu item (which compiles form and
+    report modules too) unless Access reports it disabled, then `RunCommand` as
+    a fallback. A menu `Execute()` that fails no longer ends the attempt;
+  - failing to *run* the command is reported as exactly that — *"could not run
+    the compile command … NOT that the VBA code has errors"* — and the residual
+    `IsCompiled=False`-with-no-dialog case now states both possible causes and
+    tells you to cross-check with Debug > Compile. Both carry `trigger` and
+    `code_pane` diagnostics;
+  - an exception raised *after* the compile-error dialog was auto-dismissed is
+    no longer mistaken for an unavailable command: the dialog text wins, so a
+    real compile error is still reported as one.
+- **`access_delete_object` no longer wedges behind an invisible modal**
+  (reported by [@CaptainStormfield](https://github.com/CaptainStormfield), PR
+  #35). `RunCommand(280)` (`acCmdSaveAllModules`) in `_save_all_modules` does
+  not always report "not available now" as a trappable 2046 — when Access is not
+  the foreground application (typically because the VBE has focus, e.g. straight
+  after `access_compile_vba` activated a code pane) it surfaces as a **modal
+  dialog** that blocks the COM call until a human clicks OK. Seen in the field
+  as a *"command 'SaveAllModules' isn't available"* box during a routine module
+  delete. It now runs under a dialog watchdog, and a dismissed dialog means the
+  command did not run, so the per-module `DoCmd.Save` fallback executes instead
+  of trusting a save that never happened. The watchdog waits out a 1.5 s grace
+  period first: a working `RunCommand` returns in milliseconds, so a modal that
+  appears with nothing blocking still belongs to the interactive user and is
+  never clicked away.
+
+### Added
+
+- **`MCP_ACCESS_SHIFT_BYPASS` — opt out of the global SHIFT AutoExec bypass**
+  (reported and designed by [@CustomDataNZ](https://github.com/CustomDataNZ),
+  PR #34). `OpenCurrentDatabase` and `MSACCESS /decompile` hold SHIFT to skip a
+  target database's AutoExec macro and startup form, but `keybd_event(VK_SHIFT,
+  …)` is a **global** OS-level key-down: it is not scoped to Access, so every
+  keystroke the human types anywhere on the machine during the hold arrives
+  shifted — ~0.3 s on every database switch, ~3 s per decompile. On a box where
+  someone is working while the server runs, that is a repeated and fairly
+  baffling nuisance with nothing on screen to explain it.
+
+  **Nothing changes by default.** With the variable unset the bypass behaves
+  exactly as before; set it to `0` / `false` / `no` / `off` to turn it off. It
+  is the mirror image of `MCP_ACCESS_ALLOW_CODE_EXEC`: that one is a security
+  gate and fails **closed**, this one is ergonomics and fails **open**, so a
+  typo or an empty value keeps the bypass rather than quietly letting AutoExec
+  run on someone's database. Turning it off is the right move for databases that
+  guard their own startup with `If Not Application.UserControl Then Exit
+  Function`, which is the cleaner fix and belongs in the database rather than in
+  a global input hack. `access_tips('vba')` and the README now say so.
+
+### Changed
+
+- **The SHIFT press/release sequence is no longer copy-pasted into three call
+  sites.** `core._press_shift_bypass()` is now the only place in the package
+  that synthesises a SHIFT key-down (`core._release_shift()`, which already
+  existed as the `atexit` safety net, handles the release). `_switch`,
+  `_Session._decompile` and `ac_decompile_compact` all route through it, which
+  is what makes the opt-out impossible to half-apply — a structural test fails
+  if a second synthesis site ever reappears.
+- **The changelog now lives only in `CHANGELOG.md`.** The README carried a
+  duplicate copy of the entire release history (700+ lines) that had to be
+  updated in parallel and drifted every release; it now links here.
+
 ## 0.7.52 — 2026-07-21
 
 **`access_vbe_patch_proc` stops being the one write tool without a safety net.**

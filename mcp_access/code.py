@@ -5,6 +5,7 @@ Object management: list, get, set, delete objects, create form, export structure
 import os
 import re
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -150,6 +151,12 @@ def ac_list_objects(db_path: str, object_type: str = "all") -> dict:
 # Delete object
 # ---------------------------------------------------------------------------
 
+# Grace before the _save_all_modules watchdog starts dismissing dialogs.  A
+# working RunCommand(280) returns in milliseconds; anything still blocked after
+# this is the modal we are here for.
+_SAVE_MODULES_GRACE = 1.5
+
+
 def _save_all_modules(app) -> None:
     """Best-effort: persist dirty VBA modules so DoCmd.DeleteObject does not
     pop 'Do you want to save changes to the design of module X?' (issue #31 —
@@ -161,12 +168,66 @@ def _save_all_modules(app) -> None:
     RunCommand 280 can raise 2046 'not available now' without an applicable
     module context -- fall back to saving loaded modules one by one.
     Never raises.
+
+    'Not available now' does NOT always come back as a trappable 2046: when
+    Access is not the foreground application (typically because the VBE has
+    focus -- e.g. straight after ac_compile_vba activated a code pane) it
+    surfaces as a MODAL dialog instead, which blocks the COM call until a human
+    clicks OK, wedging a routine ac_delete_object behind a box the caller never
+    sees (@CaptainStormfield).  RunCommand is one of the blocking calls the
+    dialog watchdog exists for, so run it under one.
+
+    The watchdog waits out a grace period before it starts dismissing: a
+    RunCommand that works returns in milliseconds, so only a genuinely blocked
+    call ever reaches the dismissal loop.  That is deliberate -- on an attached
+    instance a modal that appears with nothing blocking belongs to the
+    interactive user and must not be clicked away (see the attached-instance
+    policy in CLAUDE.md).
     """
+    from .vba_exec import _dismiss_access_dialogs  # lazy -- circular
+
+    done = threading.Event()
+    dismissed: list = []
+    watchdog = None
+    try:
+        _h = app.hWndAccessApp
+        hwnd = int(_h() if callable(_h) else _h)
+    except Exception:
+        hwnd = 0
+
+    def _watch():
+        if done.wait(_SAVE_MODULES_GRACE):
+            return
+        while not done.is_set():
+            try:
+                if _dismiss_access_dialogs(hwnd):
+                    dismissed.append(True)
+            except Exception:
+                pass
+            done.wait(0.5)
+
+    if hwnd:
+        watchdog = threading.Thread(target=_watch, daemon=True)
+        watchdog.start()
+
+    ran_ok = False
     try:
         app.RunCommand(280)
-        return
+        ran_ok = True
     except Exception:
         pass
+    finally:
+        done.set()
+        # Join before reading `dismissed`: dismissing the dialog is exactly what
+        # unblocks the COM call, so without the join this thread can win the
+        # race and read an empty list.
+        if watchdog is not None:
+            watchdog.join(timeout=2)
+
+    # A dismissed dialog means the command did not run -- fall through to the
+    # per-module loop instead of trusting a save that never happened.
+    if ran_ok and not dismissed:
+        return
     try:
         mods = app.CurrentProject.AllModules
         for i in range(mods.Count):

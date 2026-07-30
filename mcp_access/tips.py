@@ -43,7 +43,10 @@ _TIPS: dict[str, str] = {
         "  ListBox AddItem — column separator is \";\", never use Format \"#,##0.00\" (comma breaks columns)\n"
         "  GetClipboardFilePath() can throw — always wrap in On Error Resume Next\n\n"
         "Startup:\n"
-        "  SHIFT bypass is automatic — OpenCurrentDatabase and /decompile always hold SHIFT to skip AutoExec/startup forms.\n"
+        "  SHIFT bypass is ON by default — OpenCurrentDatabase and /decompile hold SHIFT to skip AutoExec/startup forms.\n"
+        "    The key-down is global: it shifts whatever the user types anywhere on the machine while held (~0.3s per open, ~3s per decompile).\n"
+        "    Set MCP_ACCESS_SHIFT_BYPASS=0 in the server env to turn it off once the databases guard their own startup:\n"
+        "    `If Not Application.UserControl Then Exit Function` opts a database out under COM automation and needs no bypass at all.\n"
         "  Any auto-opened forms are closed automatically after opening the database."
     ),
     "sql": (
