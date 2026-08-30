@@ -384,6 +384,16 @@ sessions holding it in the error. A stale lock file left by a crashed Access is
 not mistaken for a live one. With the switch on the server also stops attaching
 to an already-running Access instance, which would hold the file shared.
 
+**When the switch is off, you still get told (v0.7.56).** The default stays
+shared and nothing is refused, but if the database is already open in another
+Access session the server says so on the result of the call that opened it,
+naming the sessions holding it. Design work is what silently half-lands in that
+state, and the person most likely to point the server at a live front-end is the
+one least likely to know that. A database another process holds *exclusively* is
+also reported as a lock conflict now — Access refuses that open without an error
+and it used to be diagnosed as a broken AutoExec, which sent people hunting
+through startup code for a locking problem.
+
 ## Notes
 
 - Access runs visible (`Visible = True`) so VBE COM access works correctly.

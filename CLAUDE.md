@@ -690,6 +690,27 @@ exclusively over it, so the file is probed with `CreateFileW(dwShareMode=0)` —
 `ERROR_SHARING_VIOLATION` means a live session. Holder names come from its
 64-byte entries (32 computer + 32 security name).
 
+### Shared opens are reported, not refused (v0.7.56)
+`MCP_ACCESS_EXCLUSIVE` is off by default, so the common case is still a shared
+open onto a database somebody else may have open. `_switch` reads the lock file
+BEFORE closing/opening anything (our own entry would otherwise be in it) and
+parks `_Session._shared_open_warning = (monotonic, msg)`; `server.call_tool`
+appends it to the result of that call, same timestamp gate as
+`_last_dismissed`. Skipped when `_already_open(path)` — attaching to the user's
+Access must not report the user to themselves.
+
+It must stay a warning. Turning it into a refusal is what the env var is for,
+and a default-on refusal would break every existing shared workflow.
+
+`_db_file_in_use()` (probe the `.accdb` with `dwShareMode=0`) exists because
+`_lock_file_in_use` answers only for SHARED occupants: a database held
+**exclusively** by another process has NO lock file at all. In shared mode that
+open leaves the session with no database and no exception, and the post-open
+failure used to be reported as an AutoExec/startup-form problem — the same
+wrong diagnosis the exclusive path already avoids. The file probe runs first,
+the AutoExec message is the fallback. Only valid after our own session has been
+torn down (otherwise we are an occupant ourselves).
+
 ### Linked tables and dbAttachSavePWD
 - `dbAttachSavePWD` = **131072** (0x20000), NOT 65536.
 - Setting `TableDef.Attributes` from Python COM before Append does not work reliably. Use `DoCmd.TransferDatabase(acLink, ..., StoreLogin:=True)` instead.

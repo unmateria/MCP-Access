@@ -176,6 +176,34 @@ def _lock_file_in_use(db_path: str) -> bool:
     return False
 
 
+def _db_file_in_use(db_path: str) -> bool:
+    """True when another process holds the database FILE itself.
+
+    The lock file only answers for SHARED sessions: a database somebody opened
+    exclusively has no ``.laccdb`` at all (tested), so `_lock_file_in_use` says
+    False for the very case that locks everyone else out. Probing the .accdb
+    with ``dwShareMode = 0`` catches both — shared occupants and an exclusive
+    one — because either keeps a handle open on the file.
+
+    Only meaningful once OUR session has let go of it (i.e. after a failed
+    open): while we have the database open we are an occupant ourselves.
+    False on anything unexpected — this only picks which diagnosis a failure
+    message carries.
+    """
+    if not os.path.exists(db_path):
+        return False
+    try:
+        handle = _kernel32.CreateFileW(
+            db_path, _GENERIC_READ, 0, None, _OPEN_EXISTING, 0, None,
+        )
+    except Exception:
+        return False
+    if handle == _INVALID_HANDLE_VALUE:
+        return ctypes.get_last_error() == 32   # ERROR_SHARING_VIOLATION
+    _kernel32.CloseHandle(handle)
+    return False
+
+
 def _lock_file_holders(db_path: str) -> list[str]:
     """Best-effort "who has this database open", read from its lock file.
 
@@ -229,6 +257,32 @@ def _exclusive_open_failure(path: str, reason: str) -> str:
         "NOT open and nothing ran. Close the other sessions and retry, or remove "
         "MCP_ACCESS_EXCLUSIVE from this server's env and restart to work shared "
         "(design-lock work may then fail silently, per table)."
+    )
+
+
+def _shared_open_advisory(path: str, holders: list) -> str:
+    """Warning for a SHARED open onto a database somebody else already has open.
+
+    Not a failure: shared is the default mode and plenty of read-only work is
+    fine that way. But it is the exact situation where design work silently
+    half-lands — Access drops a design lock it cannot take and reports success
+    per table — and the person most likely to be pointed at a live production
+    front-end is the one least likely to know that (issue #36, @GPGeorge).
+
+    So it is surfaced on the tool result rather than only in the log, and it
+    names the occupants. It never blocks: turning this into a refusal is what
+    MCP_ACCESS_EXCLUSIVE is for, and that has to stay an explicit choice.
+    """
+    who = "; ".join(holders) if holders else "could not read the lock file"
+    return (
+        f"'{path}' is already open in another Access session, and this server "
+        f"opened it SHARED. Sessions holding it: {who}. "
+        "Design changes (table/form/report design, Data Macros, anything "
+        "routing through Design view) can be dropped WITHOUT an error while "
+        "another session holds the object — a run can report success and have "
+        "changed nothing. Read-only work is unaffected. Work on a private copy "
+        "on a build machine, or set MCP_ACCESS_EXCLUSIVE=1 in this server's env "
+        "and restart to make this a hard failure at open time instead."
     )
 
 
@@ -306,6 +360,12 @@ class _Session:
     # compares the timestamp against the call's start to append a diagnostic
     # note ("a modal dialog was auto-dismissed during this call") to the result.
     _last_dismissed: Optional[tuple] = None
+    # (time.monotonic(), message) of the last SHARED open onto a database that
+    # another Access session already had open.  Set by _switch, read by
+    # server.call_tool the same way as _last_dismissed, so the advisory reaches
+    # the model on the call that opened the database instead of dying in the
+    # log.  Only ever a warning — refusing is what MCP_ACCESS_EXCLUSIVE does.
+    _shared_open_warning: Optional[tuple] = None
     # Detected Office install. Defaults are the hardcoded fallback used pre-0.7.36.
     # _detect_office_install() runs once per process and updates these in place.
     _office_version: str = "16.0"
@@ -810,6 +870,21 @@ class _Session:
             log.warning("Could not set Resiliency flags: %s", e)
 
     @classmethod
+    def _already_open(cls, path: str) -> bool:
+        """True when the live Access instance already has THIS file open.
+
+        Its own entry is in the lock file, so without this check attaching to a
+        user's Access (or a redundant reopen) would report the user's own
+        session back to them as a foreign occupant.  Never raises: a False here
+        only costs a warning that is one word wrong about who is holding it.
+        """
+        try:
+            current = cls._app.CurrentProject.FullName
+        except Exception:
+            return False
+        return bool(current) and os.path.normcase(str(current)) == os.path.normcase(path)
+
+    @classmethod
     def _switch(cls, path: str) -> None:
         if not os.path.isfile(path):
             raise FileNotFoundError(f"File not found: {path}")
@@ -824,6 +899,19 @@ class _Session:
         if exclusive and _lock_file_in_use(path):
             raise RuntimeError(_exclusive_open_failure(
                 path, "the database is already open in another session"))
+
+        # Shared-mode advisory: the switch above refuses; with it off we still
+        # know the answer, and staying silent is how someone ends up doing
+        # design work on a live front-end and believing it landed.  Read the
+        # lock file BEFORE closing/opening anything, so our own session is not
+        # one of the holders — except when this very instance already has the
+        # file open (attached to the user's Access), which is not a warning.
+        cls._shared_open_warning = None
+        if not exclusive and _lock_file_in_use(path) and not cls._already_open(path):
+            holders = _lock_file_holders(path)
+            msg = _shared_open_advisory(path, holders)
+            log.warning("Shared open onto a database in use: %s", holders or "?")
+            cls._shared_open_warning = (time.monotonic(), msg)
 
         if cls._db_open is not None:
             log.info("Closing previous DB: %s", cls._db_open)
@@ -958,6 +1046,26 @@ class _Session:
                     path, "Access refused the open and left the session with no "
                           "database (another session most likely holds it "
                           "exclusively)"))
+            # Same wrong-diagnosis trap the exclusive path already avoids, one
+            # level down: a database another process holds EXCLUSIVELY refuses
+            # to open with no exception and no database, and blaming AutoExec
+            # sends the user hunting through startup code for a lock problem
+            # (observed live: a second Access opening a db a first one created).
+            # The lock file cannot answer this — an exclusive holder writes
+            # none — so the .accdb itself is probed. Our own session has
+            # already been torn down above, so a live handle is somebody else.
+            if _db_file_in_use(path):
+                holders = _lock_file_holders(path)
+                who = ("; ".join(holders) if holders
+                       else "no lock file — most likely a single session "
+                            "holding it exclusively")
+                raise RuntimeError(
+                    f"Could not open '{path}': another process has the file "
+                    f"open and Access refused the open without an error. "
+                    f"Sessions holding it: {who}. Close the other session and "
+                    "retry. (Set MCP_ACCESS_EXCLUSIVE=1 in this server's env "
+                    "to make lock conflicts a hard failure at open time.)"
+                )
             raise RuntimeError(
                 f"Database closed itself while opening: {path}. Its startup "
                 "code (AutoExec / startup form) most likely failed and closed "

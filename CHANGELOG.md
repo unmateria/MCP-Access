@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.7.56 — 2026-08-30
+
+**Lock conflicts are reported in shared mode too.** Follow-up to
+[@GPGeorge](https://github.com/GPGeorge)'s issue #36: `MCP_ACCESS_EXCLUSIVE`
+turns "somebody else has this open" into a refusal, but it is off by default,
+and the person he is trying to protect — a newcomer pointed at a live
+production front-end — is the one least likely to switch it on. So the default
+path stops being silent.
+
+### Added
+
+- **Shared-open advisory.** When the session opens a database another Access
+  session already has open, the result of that tool call now carries a warning
+  naming the sessions holding it, and saying what is at risk: design changes
+  (table/form/report design, Data Macros, anything routing through Design view)
+  can be dropped *without an error* while another session holds the object — a
+  run reports success and changed nothing. Read-only work is unaffected, and
+  nothing is refused; refusing is what `MCP_ACCESS_EXCLUSIVE` is for.
+  Surfaced the same way as the auto-dismissed-dialog note (timestamp-gated, so
+  it appears once, on the call that actually opened the database).
+- The advisory is skipped when the live Access instance already has that file
+  open — attaching to the user's own Access must not report the user to
+  themselves as a foreign occupant.
+
+### Fixed
+
+- **A database another process holds exclusively is no longer diagnosed as a
+  broken AutoExec.** In shared mode that open is refused by Access with *no
+  exception and no database*, and the resulting message blamed the startup
+  form — sending the user through startup code for what is a lock problem. The
+  lock file cannot answer this (an exclusive holder writes none), so the
+  `.accdb` itself is probed with `dwShareMode = 0` after the failed open. This
+  is the same silent-failure class the exclusive switch already handles, one
+  level down; it was found by running the v0.7.55 verification against two live
+  Access processes rather than reasoning about it.
+
+Verified live on Access 2016, three scenarios: occupant holding the file
+exclusively (lock conflict reported, no AutoExec blame), occupant holding it
+shared (open succeeds, advisory set, holder named), and nobody holding it (open
+succeeds, no advisory). A stale lock file from a crashed Access still counts as
+free.
+
 ## 0.7.55 — 2026-08-30
 
 **Opt-in exclusive opens.** Requested by

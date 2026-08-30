@@ -148,6 +148,12 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             "auto-dismissed by the dialog watchdog during this call. "
             "If the result looks wrong, the dialog is the likely cause."
         )
+    # This call opened a database somebody else already had open, in SHARED
+    # mode.  Design work can be dropped silently in that state (#36), so the
+    # advisory rides on the result rather than staying in the log.
+    w = _Session._shared_open_warning
+    if w and w[0] >= started:
+        text += "\n\n[mcp-access] Warning: " + w[1]
     return [types.TextContent(type="text", text=text)]
 
 
