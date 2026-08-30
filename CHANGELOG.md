@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.7.54 — 2026-08-30
+
+### Added
+
+- **`access_screenshot` now accepts a `view` parameter** (`normal`, `design`,
+  `preview`, `datasheet`). Default is `normal` (unchanged behaviour). `design`
+  opens the form/report in Design View, which never fires `Form_Open` or
+  `Form_Load` events — so it cannot block on login dialogs, slow recordsets, or
+  Modal/PopUp forms. The modal guard and ESC-timeout watchdog are skipped
+  entirely in design mode (they are not needed). The error messages for modal
+  and timeout failures now suggest `view='design'` as an alternative.
+
 ## 0.7.53 — 2026-07-30
 
 **Two community bug reports, both reproduced on real databases before being
