@@ -671,6 +671,25 @@ the user to **restart** the server (the var is read at startup).
 - `AutomationSecurity = 3` is set as defence-in-depth but does NOT suppress AutoExec macro objects (tested).
 - `_Session.reopen(path)` always applies SHIFT bypass.
 
+### Exclusive opens are a request, not a guarantee (v0.7.55)
+`MCP_ACCESS_EXCLUSIVE` (off by default, fails closed) passes `Exclusive:=True`
+as the 2nd positional arg of `OpenCurrentDatabase(filepath, Exclusive,
+bstrPassword)`. Access reports **none** of the failure modes, so `_switch()`
+verifies instead of trusting (measured on Access 2016):
+- file free -> exclusive, and **no lock file is written**;
+- file already open -> opened **shared**, no exception, `CurrentDb` valid, our
+  entry appended to the lock file;
+- file held exclusively by another -> no exception, session left with **no
+  database** (this is what reaches the existing `CurrentDb() is None` check —
+  in exclusive mode it must NOT blame AutoExec).
+
+Hence `_lock_file_in_use()` before the open (refuse, session untouched) and
+again after (downgrade -> `CloseCurrentDatabase`). Existence of `.laccdb` alone
+proves nothing: an orphan from a crashed Access stays on disk and Access opens
+exclusively over it, so the file is probed with `CreateFileW(dwShareMode=0)` —
+`ERROR_SHARING_VIOLATION` means a live session. Holder names come from its
+64-byte entries (32 computer + 32 security name).
+
 ### Linked tables and dbAttachSavePWD
 - `dbAttachSavePWD` = **131072** (0x20000), NOT 65536.
 - Setting `TableDef.Attributes` from Python COM before Append does not work reliably. Use `DoCmd.TransferDatabase(acLink, ..., StoreLogin:=True)` instead.
@@ -706,7 +725,7 @@ the user to **restart** the server (the var is read at startup).
 
 ## Critical DO NOTs
 
-- **Do NOT remove the `DispatchEx` fallback** in `_Session._launch()`. `_launch()` tries `GetActiveObject("Access.Application")` first to attach to a user's running Access (avoids spawning a second process); on failure it falls back to `DispatchEx`, which is required after `/decompile` kills to bypass stale ROT entries. Do NOT swap `DispatchEx` for `Dispatch` in the fallback — `Dispatch` latches onto the stale ROT entry.
+- **Do NOT remove the `DispatchEx` fallback** in `_Session._launch()`. `_launch()` tries `GetActiveObject("Access.Application")` first to attach to a user's running Access (avoids spawning a second process); on failure it falls back to `DispatchEx`, which is required after `/decompile` kills to bypass stale ROT entries. Do NOT swap `DispatchEx` for `Dispatch` in the fallback — `Dispatch` latches onto the stale ROT entry. Under `MCP_ACCESS_EXCLUSIVE` the attach is skipped entirely (a running instance holds the file shared) and `DispatchEx` is the only path — do NOT "restore" attaching there.
 - **Do NOT call `cls._app.Quit()` unconditionally in `_decompile()` / `ac_decompile_compact()`**. Check `_Session._attached` first — when True we attached to the user's Access and must only `CloseCurrentDatabase()`, keeping the instance alive. Only when `_attached=False` (we spawned via `DispatchEx`) is `Quit(1)` safe. Same applies to the `atexit` handler `_Session.quit()`.
 - **Do NOT use `EnsureDispatch`** — it changes binding for all 61 tools and adds `gen_py` cache dependency.
 - **Do NOT run `OpenCurrentDatabase` in a separate thread** — COM STA objects can only be used from the thread that created them.

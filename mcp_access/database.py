@@ -11,6 +11,7 @@ from .core import (
     invalidate_all_caches,
 )
 from .constants import FIELD_TYPE_MAP, DB_AUTO_INCR_FIELD, DAO_FIELD_TYPE
+from .security import exclusive_open_enabled
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +67,13 @@ def ac_create_database(db_path: str) -> dict:
     # FIX: Close and reopen to ensure CurrentDb() works reliably
     try:
         app.CloseCurrentDatabase()
-        app.OpenCurrentDatabase(resolved)
+        # Honour MCP_ACCESS_EXCLUSIVE here too: _db_open is recorded below and
+        # connect() will not re-open a path it already holds, so a shared reopen
+        # would leave the whole session shared after a create.
+        if exclusive_open_enabled():
+            app.OpenCurrentDatabase(resolved, True)
+        else:
+            app.OpenCurrentDatabase(resolved)
     except Exception:
         pass  # If reopen fails, at least the file was created
     # Same post-open validation as _Session._switch(): never record _db_open

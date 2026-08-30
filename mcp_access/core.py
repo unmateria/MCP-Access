@@ -17,7 +17,7 @@ import winreg
 from pathlib import Path
 from typing import Any, Optional
 
-from .security import shift_bypass_enabled
+from .security import exclusive_open_enabled, shift_bypass_enabled
 
 # DPI awareness -- must be set before any window operations
 try:
@@ -118,6 +118,118 @@ def _press_shift_bypass(context: str) -> bool:
         log.warning("Could not simulate SHIFT (%s) — AutoExec may run: %s",
                     context, exc)
         return False
+
+
+# ---------------------------------------------------------------------------
+# Lock file reader — "who has this database open" for exclusive-open failures
+# ---------------------------------------------------------------------------
+_LOCK_ENTRY = 64   # bytes per entry in an Access lock file
+_LOCK_FIELD = 32   # first 32 = computer name, second 32 = security name
+_LOCK_MAX = 255 * _LOCK_ENTRY   # Access caps concurrent users at 255 (16 KB)
+
+_GENERIC_READ = 0x80000000
+_OPEN_EXISTING = 3
+_INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_kernel32.CreateFileW.restype = ctypes.c_void_p
+_kernel32.CreateFileW.argtypes = (
+    ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
+    ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
+)
+_kernel32.CloseHandle.restype = ctypes.c_int
+_kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+
+
+def _lock_file_path(db_path: str) -> str:
+    """The lock file Access keeps beside a database: .laccdb, or .ldb for .mdb."""
+    base, ext = os.path.splitext(db_path)
+    return base + (".ldb" if ext.lower() == ".mdb" else ".laccdb")
+
+
+def _lock_file_in_use(db_path: str) -> bool:
+    """True when the database's lock file exists AND a process still holds it.
+
+    Existence alone does not mean the database is in use: an Access that died
+    without closing leaves an orphan behind, and Access opens exclusively right
+    over one, leaving the stale file untouched (tested). Opening it with
+    ``dwShareMode = 0`` separates the two — a live shared session (ours
+    included) makes Windows answer ERROR_SHARING_VIOLATION, an orphan opens.
+
+    False on any error we can't interpret: this decides whether to refuse an
+    open, and refusing on a permission quirk would be worse than the shared
+    session it is meant to catch — the post-open `CurrentDb()` check still
+    stands behind it.
+    """
+    path = _lock_file_path(db_path)
+    if not os.path.exists(path):
+        return False
+    try:
+        handle = _kernel32.CreateFileW(
+            path, _GENERIC_READ, 0, None, _OPEN_EXISTING, 0, None,
+        )
+    except Exception:
+        return False
+    if handle == _INVALID_HANDLE_VALUE:
+        return ctypes.get_last_error() == 32   # ERROR_SHARING_VIOLATION
+    _kernel32.CloseHandle(handle)
+    return False
+
+
+def _lock_file_holders(db_path: str) -> list[str]:
+    """Best-effort "who has this database open", read from its lock file.
+
+    Access keeps a sibling ``.laccdb`` (``.ldb`` for ``.mdb``) while a database
+    is open for shared use, with one 64-byte entry per user: 32 bytes of
+    computer name then 32 bytes of security name, both NUL-padded. Format and
+    the 255-user cap are documented by Microsoft:
+    https://learn.microsoft.com/troubleshoot/microsoft-365-apps/access/lock-files-introduction
+
+    Returns ``["COMPUTER (user)", ...]``, de-duplicated in file order — one
+    session can own several entries. Returns an empty list if the file is
+    absent, unreadable or malformed: this only ever decorates an error message,
+    so it must never raise one of its own.
+    """
+    try:
+        with open(_lock_file_path(db_path), "rb") as fh:
+            raw = fh.read(_LOCK_MAX)
+    except Exception:
+        return []
+
+    def _field(chunk: bytes) -> str:
+        return chunk.split(b"\x00")[0].decode("latin-1", "replace").strip()
+
+    holders: list[str] = []
+    for off in range(0, len(raw) - _LOCK_ENTRY + 1, _LOCK_ENTRY):
+        entry = raw[off:off + _LOCK_ENTRY]
+        machine = _field(entry[:_LOCK_FIELD])
+        user = _field(entry[_LOCK_FIELD:])
+        if not machine and not user:
+            continue
+        who = f"{machine} ({user})" if machine and user else (machine or user)
+        if who not in holders:
+            holders.append(who)
+    return holders
+
+
+def _exclusive_open_failure(path: str, reason: str) -> str:
+    """Message for an exclusive open that did not end up exclusive.
+
+    Access reports none of these three outcomes as an error, so the reason has
+    to be spelled out or the user is left with a bare COM failure at best and
+    silence at worst. Name the occupants when the lock file can tell us.
+    """
+    holders = _lock_file_holders(path)
+    who = ("; ".join(holders) if holders
+           else "could not tell (the lock file is unreadable or already gone)")
+    return (
+        f"Could not open '{path}' exclusively: {reason}\n"
+        f"Sessions holding it: {who}\n"
+        "MCP_ACCESS_EXCLUSIVE is on, so this is all-or-nothing: the database is "
+        "NOT open and nothing ran. Close the other sessions and retry, or remove "
+        "MCP_ACCESS_EXCLUSIVE from this server's env and restart to work shared "
+        "(design-lock work may then fail silently, per table)."
+    )
 
 
 def _get_com_pid(app) -> Optional[int]:
@@ -353,24 +465,38 @@ class _Session:
         # for interactive debugging). Fall back to DispatchEx only when none
         # is running — DispatchEx remains required after /decompile kills to
         # bypass stale ROT entries, but in that path no live instance exists.
-        try:
-            candidate = win32com.client.GetActiveObject("Access.Application")
-            # Sanity check: round-trip a cheap property to catch marshalled
-            # zombie references from a dying process. If this raises, we
-            # treat it as "no running instance" and fall through.
-            _ = candidate.Visible  # noqa: F841
-            cls._app = candidate
-            cls._attached = True
-            log.info("Attached to existing Access.Application instance")
+        # Attaching is skipped entirely under MCP_ACCESS_EXCLUSIVE: a running
+        # instance holds its database SHARED, and connect() does not re-open a
+        # path that is already recorded in _db_open — so attaching would leave
+        # the session shared while reporting itself exclusive, which is the
+        # silent-success failure the switch exists to remove.
+        cls._app = None   # the DispatchEx below is keyed on this, not on the caller
+        if exclusive_open_enabled():
+            log.info(
+                "MCP_ACCESS_EXCLUSIVE is on — not attaching to a running "
+                "Access instance (it would hold the database shared)"
+            )
+        else:
             try:
-                current_db = cls._app.CurrentDb()
-                db_name = current_db.Name if current_db is not None else None
-                cls._db_open = str(Path(db_name).resolve()) if db_name else None
-                if cls._db_open:
-                    log.info("Existing Access has DB open: %s", cls._db_open)
+                candidate = win32com.client.GetActiveObject("Access.Application")
+                # Sanity check: round-trip a cheap property to catch marshalled
+                # zombie references from a dying process. If this raises, we
+                # treat it as "no running instance" and fall through.
+                _ = candidate.Visible  # noqa: F841
+                cls._app = candidate
+                cls._attached = True
+                log.info("Attached to existing Access.Application instance")
+                try:
+                    current_db = cls._app.CurrentDb()
+                    db_name = current_db.Name if current_db is not None else None
+                    cls._db_open = str(Path(db_name).resolve()) if db_name else None
+                    if cls._db_open:
+                        log.info("Existing Access has DB open: %s", cls._db_open)
+                except Exception:
+                    cls._db_open = None
             except Exception:
-                cls._db_open = None
-        except Exception:
+                pass
+        if cls._app is None:
             log.info("Launching new Access.Application...")
             cls._app = win32com.client.DispatchEx("Access.Application")
             cls._attached = False
@@ -688,13 +814,24 @@ class _Session:
         if not os.path.isfile(path):
             raise FileNotFoundError(f"File not found: {path}")
 
+        exclusive = exclusive_open_enabled()   # read once — used either side of the open
+
+        # Refuse before touching the session, not after: asking for an exclusive
+        # open on a database somebody else has open does NOT fail — Access opens
+        # it shared and says nothing (tested), which would silently break the
+        # promise of the switch AND add us to the lock file. Checked again after
+        # the open, which is what actually guarantees it.
+        if exclusive and _lock_file_in_use(path):
+            raise RuntimeError(_exclusive_open_failure(
+                path, "the database is already open in another session"))
+
         if cls._db_open is not None:
             log.info("Closing previous DB: %s", cls._db_open)
             try:
                 cls._app.CloseCurrentDatabase()
             except Exception as e:
                 log.warning("Error closing previous DB: %s", e)
-        log.info("Opening DB: %s", path)
+        log.info("Opening DB%s: %s", " EXCLUSIVELY" if exclusive else "", path)
 
         cls._suppress_recovery_dialog()
 
@@ -750,8 +887,22 @@ class _Session:
         except Exception:
             pass
         try:
-            cls._app.OpenCurrentDatabase(path)
+            if exclusive:
+                # OpenCurrentDatabase(filepath, Exclusive, bstrPassword) — the
+                # mode is the second positional argument and defaults to False.
+                cls._app.OpenCurrentDatabase(path, True)
+            else:
+                cls._app.OpenCurrentDatabase(path)
         except Exception as e:
+            if exclusive:
+                # Nothing is swallowed on this path: the point of the switch is
+                # that a refused lock is one visible failure at open time rather
+                # than a silent partial one per table later. The previous
+                # database was already closed above, so record that nothing is
+                # open before unwinding — a stale _db_open would wedge every
+                # later CurrentDb call.
+                cls._db_open = None
+                raise RuntimeError(_exclusive_open_failure(path, str(e))) from e
             if "already have the database open" in str(e).lower():
                 log.info("DB was already open — syncing state")
             else:
@@ -798,6 +949,15 @@ class _Session:
             except Exception as e_q:
                 log.warning("Session teardown after failed open: %s", e_q)
                 cls._force_cleanup()
+            if exclusive:
+                # An exclusive open onto a database somebody else holds
+                # exclusively lands here: no exception, no database, no
+                # explanation. Blaming AutoExec would send the user hunting
+                # through startup code for a lock problem.
+                raise RuntimeError(_exclusive_open_failure(
+                    path, "Access refused the open and left the session with no "
+                          "database (another session most likely holds it "
+                          "exclusively)"))
             raise RuntimeError(
                 f"Database closed itself while opening: {path}. Its startup "
                 "code (AutoExec / startup form) most likely failed and closed "
@@ -806,6 +966,23 @@ class _Session:
                 "session has been reset; open the file manually in Access "
                 "while holding SHIFT to investigate."
             )
+
+        # The open reported success — but "exclusive" is a request, not a
+        # guarantee: with the file already in use Access downgrades to shared
+        # without a word, and the only visible difference is that it joins the
+        # lock file instead of leaving none behind (tested). A live lock file
+        # here means we are shared, so close it rather than let design work run
+        # against a session that only believes it is exclusive.
+        if exclusive and _lock_file_in_use(path):
+            log.error("Exclusive open silently downgraded to shared: %s", path)
+            try:
+                cls._app.CloseCurrentDatabase()
+            except Exception as e_c:
+                log.warning("Could not close the downgraded session: %s", e_c)
+            cls._db_open = None
+            raise RuntimeError(_exclusive_open_failure(
+                path, "Access downgraded the open to shared mode because the "
+                      "database was already in use"))
 
         cls._db_open = path
 

@@ -1,5 +1,75 @@
 # Changelog
 
+## 0.7.55 — 2026-08-30
+
+**Opt-in exclusive opens.** Requested by
+[@GPGeorge](https://github.com/GPGeorge) (issue #36), whose analysis of *where*
+it belongs is the design used here.
+
+### Added
+
+- **`MCP_ACCESS_EXCLUSIVE` — open the session's database exclusively.** Shared
+  opens cannot take a **design lock**, so attaching Data Macros through
+  `SaveAsText`/`LoadFromText`, or anything routing through
+  `DoCmd.OpenTable acViewDesign`, is refused for any table another Access
+  session has open. The refusal is per table and easy to miss: the run finishes,
+  reports success, and changed nothing. This turns that into one visible failure
+  at open time.
+
+  There is no explicit open tool — the open is implicit in
+  `_Session.connect()` — so a per-call argument would have to be threaded
+  through every tool taking `db_path` and kept consistent across all of them. A
+  session either wants exclusive or it doesn't, so it is one server-level
+  switch, read per call like the other two:
+
+  ```json
+  "env": { "MCP_ACCESS_EXCLUSIVE": "1" }
+  ```
+
+  **Default off, fails closed** (like `MCP_ACCESS_ALLOW_CODE_EXEC`, unlike
+  `MCP_ACCESS_SHIFT_BYPASS`). Not because exclusivity endangers the file, but
+  because the COM session holds the database open between tool calls: while the
+  server is connected nobody else can get in. On a shared front-end that locks
+  a whole workgroup out for as long as the session lives, so a typo must not be
+  able to switch it on. `access_close` releases without stopping the server.
+
+- **The switch verifies what it asked for, because Access doesn't.** Passing
+  `Exclusive:=True` is a *request*, and on its own it would have delivered a new
+  silent failure in place of the old one. Measured against Access 2016:
+
+  | Situation | What Access does |
+  |---|---|
+  | File free | Opens exclusive, writes **no** lock file |
+  | File already open by someone else | Opens it **shared**, no exception, `CurrentDb` valid, adds our own entry to the lock file |
+  | File held exclusively by someone else | No exception either — leaves the session with **no database at all** |
+
+  So the open is checked rather than assumed. Before opening, a live lock file
+  means the database is busy and the call is refused without touching the
+  session. After opening, a lock file that exists *and is held* means Access
+  downgraded us to shared, and the database is closed again rather than left to
+  run design work under a false assumption. The `CurrentDb() is None` case now
+  reports the lock, not the AutoExec/startup-form diagnosis that used to be the
+  only explanation offered there.
+
+  Occupants are named in the error, read from the lock file's 64-byte entries
+  (32 bytes computer name, 32 bytes security name — [documented by
+  Microsoft](https://learn.microsoft.com/troubleshoot/microsoft-365-apps/access/lock-files-introduction)).
+  Mere *existence* of that file is not evidence: an Access that died without
+  closing leaves an orphan, and Access opens exclusively right over one and
+  leaves it untouched — so the file is probed with `dwShareMode = 0`, which
+  separates a live session from a stale file.
+
+- **With the switch on, the server no longer attaches to a running Access
+  instance** (`_Session._launch`). That instance holds its database shared, and
+  `connect()` does not re-open a path already recorded in `_db_open` — so
+  attaching would have left the session shared while reporting itself
+  exclusive, the same silent-success problem one level up. `DispatchEx`
+  (unchanged, and still the `/decompile` fallback) spawns a dedicated instance
+  instead. Unaffected with the switch off, which is the default.
+
+- `access_create_database` honours the switch on its post-create reopen, so a
+  session doesn't silently fall back to shared after creating a database.
+
 ## 0.7.54 — 2026-08-30
 
 ### Added

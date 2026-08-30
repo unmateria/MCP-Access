@@ -1,9 +1,10 @@
 """
-Environment switches: the code-execution gate and the SHIFT-bypass opt-out.
+Environment switches: the code-execution gate, the SHIFT-bypass opt-out and the
+exclusive-open switch.
 
-Both are read from the environment on every call so import order is irrelevant
-and tests can flip them, but they are opposites by design — see
-``shift_bypass_enabled`` for why one fails closed and the other fails open.
+All three are read from the environment on every call so import order is
+irrelevant and tests can flip them, but they are not all alike — see
+``shift_bypass_enabled`` for why one fails open while the other two fail closed.
 
 Single source of truth for the ``MCP_ACCESS_ALLOW_CODE_EXEC`` gate. The three
 tools that can run arbitrary VBA (and therefore ``Shell "cmd /c ..."`` -> RCE)
@@ -102,3 +103,41 @@ def shift_bypass_enabled() -> bool:
     if raw is None:
         return True
     return raw.strip().lower() not in _FALSY
+
+
+def exclusive_open_enabled() -> bool:
+    """True when the operator wants the session's database opened exclusively.
+
+    ``OpenCurrentDatabase(filepath, Exclusive, bstrPassword)`` takes the mode as
+    its second argument and defaults to shared. Shared is the right default for
+    reading and for most edits, but it cannot take a **design lock**: attaching
+    Data Macros through ``SaveAsText``/``LoadFromText``, or anything that routes
+    through ``DoCmd.OpenTable acViewDesign``, needs one. When another Access
+    session has that table open the lock is refused, the change is dropped for
+    that table alone, and the run can still finish and report success. An
+    exclusive open turns that into one visible failure at open time instead
+    (requested by @GPGeorge, issue #36).
+
+    There is no explicit open tool — the open is implicit in
+    ``_Session.connect()`` — so a per-call argument would have to be threaded
+    through every tool that takes ``db_path`` and kept consistent across all of
+    them. A session either wants exclusive or it doesn't, so it is one
+    server-level switch: ``MCP_ACCESS_EXCLUSIVE`` set to ``1``/``true``/``yes``/
+    ``on``.
+
+    **Default OFF, and it fails CLOSED** like ``MCP_ACCESS_ALLOW_CODE_EXEC``
+    (and unlike ``MCP_ACCESS_SHIFT_BYPASS``, which is ergonomics and fails
+    open). Not because exclusivity is dangerous to the file — it isn't — but
+    because it is *exclusive*: the COM session holds the database open between
+    tool calls, so while the server is connected nobody else can get in. On a
+    shared front-end that locks out every other user for as long as the session
+    lives. Falling closed on a typo costs a design lock; falling open on one
+    would throw a workgroup off their database with nothing on screen to say
+    why. ``access_close`` releases it without stopping the server.
+
+    Turning it on also stops the server attaching to an already-running Access
+    instance (``_Session._launch``): that instance holds the file shared, and
+    reusing it would report an exclusive session that is nothing of the sort —
+    the same silent-success problem one level up.
+    """
+    return os.environ.get("MCP_ACCESS_EXCLUSIVE", "").strip().lower() in _TRUTHY

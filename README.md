@@ -333,13 +333,14 @@ databases. See [SECURITY.md](SECURITY.md) for details and how to report issues.
 
 ## Environment variables
 
-Both are read from the server process, so they go in the `env` block of your MCP
-client config and take effect on **restart**.
+All three are read from the server process, so they go in the `env` block of
+your MCP client config and take effect on **restart**.
 
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `MCP_ACCESS_ALLOW_CODE_EXEC` | *off* | Set to `1`/`true`/`yes`/`on` to enable `access_run_vba`, `access_eval_vba` and `access_run_macro`. Fails **closed**: anything else keeps them disabled. |
 | `MCP_ACCESS_SHIFT_BYPASS` | *on* | Set to `0`/`false`/`no`/`off` to stop holding SHIFT during `OpenCurrentDatabase` and `/decompile`. Fails **open**: anything else keeps the bypass. |
+| `MCP_ACCESS_EXCLUSIVE` | *off* | Set to `1`/`true`/`yes`/`on` to open the session's database exclusively. Fails **closed**: anything else stays shared. |
 
 **About the SHIFT bypass (v0.7.53).** Holding SHIFT is how the server skips a
 database's AutoExec macro and startup form, but the key-down is a *global* OS
@@ -358,6 +359,30 @@ End If
 database opts itself out under automation and needs no bypass at all. With the
 bypass off, `AutomationSecurity` and the dialog watchdog still apply — but an
 unguarded AutoExec *macro object* will run.
+
+**About exclusive opens (v0.7.55).** Shared opens — the default, and what every
+version before this one did — cannot take a **design lock**. Attaching Data
+Macros via `SaveAsText`/`LoadFromText`, or anything routing through
+`DoCmd.OpenTable acViewDesign`, is refused for any table another Access session
+has open, one table at a time and without stopping the run: it finishes,
+reports success, and nothing changed. Turn the switch on and that becomes a
+single visible failure when the database is opened.
+
+It is off by default because it is genuinely exclusive: the session holds the
+database between tool calls, so while the server is connected **nobody else can
+open it**. That is right for a build or a development machine and wrong for a
+shared front-end. `access_close` releases the database without stopping the
+server.
+
+The switch also verifies the mode instead of trusting it. Access treats
+`Exclusive:=True` as a request: with the file already in use it opens it
+*shared* without a word, and when someone else holds it exclusively it raises
+nothing and leaves the session with no database at all. So the server checks
+the lock file before opening (refusing without touching the session), checks it
+again afterwards (closing the database if Access downgraded it), and names the
+sessions holding it in the error. A stale lock file left by a crashed Access is
+not mistaken for a live one. With the switch on the server also stops attaching
+to an already-running Access instance, which would hold the file shared.
 
 ## Notes
 
