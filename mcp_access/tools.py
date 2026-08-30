@@ -1412,6 +1412,12 @@ TOOLS = [
                     "default": 30,
                     "description": "Max seconds waiting for OpenForm/OpenReport. If Form_Load takes longer (slow OpenRecordset), ESC is sent and error is raised. Default 30.",
                 },
+                "view": {
+                    "type": "string",
+                    "enum": ["normal", "design", "preview", "datasheet"],
+                    "default": "normal",
+                    "description": "View mode: 'normal' (default, fires events), 'design' (no events fire, safe for Modal/PopUp forms), 'preview' (print preview), 'datasheet'.",
+                },
             },
             "required": ["db_path"],
         },

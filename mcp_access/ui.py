@@ -79,6 +79,7 @@ def ac_screenshot(
     wait_ms: int = 300,
     max_width: int = 1920,
     open_timeout_sec: int = 30,
+    view: str = "normal",
 ) -> dict:
     """Capture the Access window as PNG. Optionally opens a form/report first.
 
@@ -95,6 +96,13 @@ def ac_screenshot(
     import win32api
     import win32con
 
+    # Resolve view mode: normal (0), design (1), preview (2), datasheet (5)
+    _view_str = view.lower() if view else "normal"
+    _VIEW_MAP = {"normal": 0, "design": 1, "preview": 2, "datasheet": 5}
+    if _view_str not in _VIEW_MAP:
+        raise ValueError(f"view must be one of {list(_VIEW_MAP.keys())}, got '{view}'")
+    _view_mode = _VIEW_MAP[_view_str]
+
     app = _Session.connect(db_path)
     object_opened = False
 
@@ -104,65 +112,76 @@ def ac_screenshot(
         if ot not in ("form", "report"):
             raise ValueError(f"object_type must be 'form' or 'report', got '{object_type}'")
 
-        # Guard: a Modal or PopUp form makes DoCmd.OpenForm BLOCK the COM thread until a
-        # human closes it (ESC usually does NOT dismiss it) -> 30+ minute hangs. Detect it
-        # via a non-blocking design-view open (Load/Open events do not fire in design) and
-        # refuse to auto-open, with an actionable message instead of hanging. Best-effort:
-        # if the check itself fails, fall through to the normal open + ESC watchdog.
-        if ot == "form":
-            _is_modal = False
-            try:
-                app.DoCmd.OpenForm(object_name, 1)  # 1 = acDesign (non-blocking)
-                try:
-                    _frm = app.Forms(object_name)
-                    _is_modal = bool(_frm.Modal) or bool(_frm.PopUp)
-                finally:
-                    app.DoCmd.Close(2, object_name, 1)  # 2 = acForm, 1 = acSaveNo
-            except Exception as e:
-                log.warning("Modal/PopUp check failed for '%s': %s", object_name, e)
-            if _is_modal:
-                raise ValueError(
-                    f"Form '{object_name}' is Modal/PopUp: opening it via DoCmd.OpenForm blocks "
-                    "the COM thread until a human closes it (ESC won't dismiss it), which hangs "
-                    "this tool. Not auto-opened. To capture it: open the form manually in Access, "
-                    "then call access_screenshot WITHOUT object_name to capture the current window."
-                )
-
-        # Get hwnd before OpenForm blocks (needed by cancel thread)
-        _h = app.hWndAccessApp
-        _hwnd = int(_h() if callable(_h) else _h)
-
-        # Background thread: send ESC after timeout to cancel hanging Load events
-        _done = threading.Event()
-        _timed_out = threading.Event()
-
-        def _cancel_if_hung():
-            if not _done.wait(open_timeout_sec):
-                _timed_out.set()
-                log.warning(
-                    "OpenForm '%s' timeout after %ds — sending ESC to cancel",
-                    object_name, open_timeout_sec,
-                )
-                win32api.PostMessage(_hwnd, win32con.WM_KEYDOWN, win32con.VK_ESCAPE, 0)
-                win32api.PostMessage(_hwnd, win32con.WM_KEYUP, win32con.VK_ESCAPE, 0)
-
-        _t = threading.Thread(target=_cancel_if_hung, daemon=True)
-        _t.start()
-        try:
+        # Design view never fires Load/Open events, so it never blocks.
+        # Skip the modal guard and the ESC watchdog when opening in design.
+        if _view_mode == 1:  # acDesign
             if ot == "form":
-                app.DoCmd.OpenForm(object_name, 0)  # acNormal
+                app.DoCmd.OpenForm(object_name, 1)  # acDesign
             else:
-                app.DoCmd.OpenReport(object_name, 2)  # acPreview
-        finally:
-            _done.set()
+                app.DoCmd.OpenReport(object_name, 1)  # acDesign
+            object_opened = True
+        else:
+            # Guard: a Modal or PopUp form makes DoCmd.OpenForm BLOCK the COM thread until a
+            # human closes it (ESC usually does NOT dismiss it) -> 30+ minute hangs. Detect it
+            # via a non-blocking design-view open (Load/Open events do not fire in design) and
+            # refuse to auto-open, with an actionable message instead of hanging. Best-effort:
+            # if the check itself fails, fall through to the normal open + ESC watchdog.
+            if ot == "form":
+                _is_modal = False
+                try:
+                    app.DoCmd.OpenForm(object_name, 1)  # 1 = acDesign (non-blocking)
+                    try:
+                        _frm = app.Forms(object_name)
+                        _is_modal = bool(_frm.Modal) or bool(_frm.PopUp)
+                    finally:
+                        app.DoCmd.Close(2, object_name, 1)  # 2 = acForm, 1 = acSaveNo
+                except Exception as e:
+                    log.warning("Modal/PopUp check failed for '%s': %s", object_name, e)
+                if _is_modal:
+                    raise ValueError(
+                        f"Form '{object_name}' is Modal/PopUp: opening it via DoCmd.OpenForm blocks "
+                        "the COM thread until a human closes it (ESC won't dismiss it), which hangs "
+                        "this tool. Not auto-opened. To capture it: open the form manually in Access, "
+                        "then call access_screenshot WITHOUT object_name to capture the current window. "
+                        "Or use view='design' to open in design view (no events fire)."
+                    )
 
-        if _timed_out.is_set():
-            raise TimeoutError(
-                f"OpenForm '{object_name}' did not complete within {open_timeout_sec}s. "
-                "Form_Load event may have a slow/blocked OpenRecordset. "
-                "ESC was sent to cancel. Increase open_timeout_sec if the form is intentionally slow."
-            )
-        object_opened = True
+            # Get hwnd before OpenForm blocks (needed by cancel thread)
+            _h = app.hWndAccessApp
+            _hwnd = int(_h() if callable(_h) else _h)
+
+            # Background thread: send ESC after timeout to cancel hanging Load events
+            _done = threading.Event()
+            _timed_out = threading.Event()
+
+            def _cancel_if_hung():
+                if not _done.wait(open_timeout_sec):
+                    _timed_out.set()
+                    log.warning(
+                        "OpenForm '%s' timeout after %ds — sending ESC to cancel",
+                        object_name, open_timeout_sec,
+                    )
+                    win32api.PostMessage(_hwnd, win32con.WM_KEYDOWN, win32con.VK_ESCAPE, 0)
+                    win32api.PostMessage(_hwnd, win32con.WM_KEYUP, win32con.VK_ESCAPE, 0)
+
+            _t = threading.Thread(target=_cancel_if_hung, daemon=True)
+            _t.start()
+            try:
+                if ot == "form":
+                    app.DoCmd.OpenForm(object_name, _view_mode)
+                else:
+                    app.DoCmd.OpenReport(object_name, _view_mode if _view_mode != 0 else 2)  # reports: preview instead of normal
+            finally:
+                _done.set()
+
+            if _timed_out.is_set():
+                raise TimeoutError(
+                    f"OpenForm '{object_name}' did not complete within {open_timeout_sec}s. "
+                    "Form_Load event may have a slow/blocked OpenRecordset. "
+                    "ESC was sent to cancel. Increase open_timeout_sec if the form is intentionally slow. "
+                    "Or use view='design' to bypass Form_Load."
+                )
+            object_opened = True
 
     if wait_ms > 0:
         import pythoncom

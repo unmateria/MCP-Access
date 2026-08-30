@@ -677,6 +677,7 @@ def call_tool_sync(name: str, arguments: dict) -> str:
                 wait_ms=int(arguments.get("wait_ms", 300)),
                 max_width=int(arguments.get("max_width", 1920)),
                 open_timeout_sec=int(arguments.get("open_timeout_sec", 30)),
+                view=arguments.get("view", "normal"),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
