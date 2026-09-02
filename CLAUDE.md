@@ -750,6 +750,31 @@ message is the fallback. Valid only after our own session is torn down.
 - **Do NOT change schemas to strict `"type": "integer"`** — MCP clients can't be trusted to send correct types.
 - **Do NOT auto-decompile on DB open** — only on first compile. Auto-decompile on open caused SHIFT key stuck issues and process accumulation on MCP reconnect.
 
+## The `mcp<2` pin (v0.7.57)
+
+`pyproject.toml` pins `mcp>=1.0.0,<2`. **Do NOT drop the upper bound** unless
+the v2 migration lands in the same change. Without it a clean `pip`/`uvx`
+install resolves to the v2 SDK and the package never finishes importing:
+`tools.py` reads `_tool.inputSchema`, and v2 renamed the field to
+`input_schema` (constructing with `inputSchema=` still works through the
+camelCase alias; reading it back does not).
+
+What v2 changes here, verified against a clean 2.1.1 install:
+- the four `@server.*` decorators are gone. The low-level `Server` takes
+  `on_list_tools` / `on_call_tool` / `on_list_prompts` / `on_get_prompt`
+  constructor callbacks with `(context, params)` signatures, returning the
+  `ListToolsResult` / `CallToolResult` / `ListPromptsResult` wrappers;
+- `mcp.shared.session` no longer exists, so the local patch described below
+  has no target there;
+- `stdio_server` and `create_initialization_options` are unchanged.
+
+Migration is tracked in issue #37 and deferred on purpose. v2 serves both
+protocol eras from one server, so it would break no client, but 1.x still
+receives security fixes and this server uses nothing v2 adds (stdio only, no
+auth, no HTTP, no extensions). Revisit when a client requires the 2026-07-28
+protocol revision (the 1.x SDK tops out at 2025-11-25), or when a security fix
+is not backported to the `v1.x` branch.
+
 ## MCP SDK Patch (local to this machine)
 
 The MCP Python SDK (`mcp/shared/session.py`) swallows all exceptions with a generic `-32602` error. A local patch at `c:\program files\python310\lib\site-packages\mcp\shared\session.py` adds full traceback to `ErrorData.message` and `ErrorData.data`. Re-apply after `pip install --upgrade mcp`.
