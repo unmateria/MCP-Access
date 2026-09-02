@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.7.57 — 2026-09-02
+
+**The dependency floor had no ceiling, and MCP SDK v2 walked through it.**
+Reported as issue #37 by [@JMarchesoniAF](https://github.com/JMarchesoniAF).
+`mcp>=1.0.0` meant a clean `pip install` / `uvx` resolved to the v2 SDK
+(2.0.0 landed 2026-07-28, 2.1.1 on 2026-08-25), where the server does not even
+finish importing.
+
+### Fixed
+
+- **Pinned `mcp>=1.0.0,<2`.** Verified against a clean 2.1.1 install: the
+  import dies at `tools.py` with `AttributeError: 'Tool' object has no
+  attribute 'inputSchema'` (v2 renamed the field to `input_schema`), and had it
+  got past that, `@server.list_tools()` and the three other decorators no
+  longer exist — the low-level `Server` takes `on_list_tools` / `on_call_tool`
+  / `on_list_prompts` / `on_get_prompt` constructor callbacks with
+  `(context, params)` signatures instead. `mcp.shared.session` is gone too, so
+  the local SDK patch documented in `CLAUDE.md` no longer applies there.
+
+This release only restores installability. The v2 migration itself is tracked
+in issue #37 and is deliberately not bundled here: it changes the handler
+interface, the prompt/tool result types and the direct-callback tests, and it
+deserves its own release rather than riding along in a one-line pin.
+
 ## 0.7.56 — 2026-08-30
 
 **Lock conflicts are reported in shared mode too.** Follow-up to
