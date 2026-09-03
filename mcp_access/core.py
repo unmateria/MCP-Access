@@ -404,7 +404,7 @@ class _Session:
                         )
                         cls._force_cleanup()
         if cls._app is None:
-            cls._launch()
+            cls._launch(resolved)
         if cls._db_open != resolved:
             cls._switch(resolved)
         return cls._app
@@ -512,7 +512,14 @@ class _Session:
         cls._wd_stop = None
 
     @classmethod
-    def _launch(cls) -> None:
+    def _launch(cls, target_path: Optional[str] = None) -> None:
+        """Bring up the COM session.
+
+        `target_path` is the database we are about to open, when the caller
+        knows it.  It decides whether attaching to a running Access instance is
+        acceptable — see the attach block below.  None keeps the historical
+        attach-anything behaviour for callers with no destination.
+        """
         cls._suppress_recovery_dialog()
         try:
             import win32com.client
@@ -521,10 +528,10 @@ class _Session:
                 "pywin32 not installed. Run: pip install pywin32"
             )
         # Prefer attaching to an already-running Access instance so we don't
-        # spawn a second process when the user already has Access open (e.g.
-        # for interactive debugging). Fall back to DispatchEx only when none
-        # is running — DispatchEx remains required after /decompile kills to
-        # bypass stale ROT entries, but in that path no live instance exists.
+        # spawn a second process when the user already has Access open on the
+        # database we are about to work on. Fall back to DispatchEx otherwise —
+        # it is also required after /decompile kills to bypass stale ROT
+        # entries, but in that path no live instance exists.
         # Attaching is skipped entirely under MCP_ACCESS_EXCLUSIVE: a running
         # instance holds its database SHARED, and connect() does not re-open a
         # path that is already recorded in _db_open — so attaching would leave
@@ -543,17 +550,48 @@ class _Session:
                 # zombie references from a dying process. If this raises, we
                 # treat it as "no running instance" and fall through.
                 _ = candidate.Visible  # noqa: F841
-                cls._app = candidate
-                cls._attached = True
-                log.info("Attached to existing Access.Application instance")
                 try:
-                    current_db = cls._app.CurrentDb()
+                    current_db = candidate.CurrentDb()
                     db_name = current_db.Name if current_db is not None else None
-                    cls._db_open = str(Path(db_name).resolve()) if db_name else None
-                    if cls._db_open:
-                        log.info("Existing Access has DB open: %s", cls._db_open)
+                    candidate_db = str(Path(db_name).resolve()) if db_name else None
                 except Exception:
-                    cls._db_open = None
+                    candidate_db = None
+                # Attaching to an instance that holds a DIFFERENT database means
+                # we close that database out from under whoever is using it:
+                # ac_create_database calls CloseCurrentDatabase on whatever it
+                # finds, and _switch reopens the instance elsewhere.  Issue #38:
+                # that shut down the database whose own VBA was driving this
+                # server.  So attach only to an idle instance, or to one that
+                # already holds our target.
+                #
+                # GetActiveObject returns a single ROT entry, so with several
+                # Access windows open we can only inspect one of them and may
+                # spawn a process even though another window had the target
+                # open.  Worse than ideal, better than hijacking whichever
+                # instance answered.
+                if (
+                    target_path is not None
+                    and candidate_db is not None
+                    and os.path.normcase(candidate_db)
+                    != os.path.normcase(str(Path(target_path).resolve()))
+                ):
+                    # Nothing to release: dropping the reference is all we can
+                    # do (Quit would close the user's Access, which is the very
+                    # thing this branch exists to prevent).
+                    candidate = None
+                    cls._attached = False
+                    log.info(
+                        "Not attaching to the running Access instance: it has "
+                        "%s open and we need %s — launching our own instead",
+                        candidate_db, target_path,
+                    )
+                else:
+                    cls._app = candidate
+                    cls._attached = True
+                    cls._db_open = candidate_db
+                    log.info("Attached to existing Access.Application instance")
+                    if candidate_db:
+                        log.info("Existing Access has DB open: %s", candidate_db)
             except Exception:
                 pass
         if cls._app is None:
@@ -720,7 +758,7 @@ class _Session:
         # and only relaunch on failure.
         if cls._app is None:
             time.sleep(1)  # let Windows evict the dead process's ROT entry
-            cls._launch()
+            cls._launch(path)
         else:
             try:
                 _ = cls._app.Visible
@@ -729,7 +767,7 @@ class _Session:
                 cls._app = None
                 cls._attached = False
                 time.sleep(1)
-                cls._launch()
+                cls._launch(path)
 
     @classmethod
     def _detect_office_install(cls) -> None:

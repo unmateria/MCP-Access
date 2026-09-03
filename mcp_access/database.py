@@ -49,9 +49,13 @@ def ac_create_database(db_path: str) -> dict:
         raise FileExistsError(
             f"'{resolved}' already exists. Use access_execute_sql to modify it."
         )
-    # Ensure Access is running
+    # Ensure Access is running.  Passing the target keeps _launch from
+    # attaching to an Access instance that has a different database open —
+    # the CloseCurrentDatabase below would otherwise shut down the user's
+    # own work (issue #38).  The file does not exist yet, so a running
+    # instance can never match it: we always get our own process here.
     if _Session._app is None:
-        _Session._launch()
+        _Session._launch(resolved)
     app = _Session._app
     # Close any previously open DB
     if _Session._db_open is not None:

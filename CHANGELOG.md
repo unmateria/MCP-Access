@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.7.58 — 2026-09-03
+
+**The server hijacked whichever Access instance answered the phone.**
+Reported as issue #38 by [@Access-Abraxas](https://github.com/Access-Abraxas),
+who drives this server from VBA running inside their own database:
+`access_create_database` attached to that instance and closed the database out
+from under it, stopping the code that made the call.
+
+### Fixed
+
+- **`_Session._launch()` no longer attaches to an Access instance that has a
+  different database open.** It now takes the database we are about to open and
+  keeps the candidate only when that instance is idle (`CurrentDb()` is `None`)
+  or already holds our target (`os.path.normcase` comparison, the same rule as
+  `_already_open`). Otherwise the reference is dropped and we spawn our own
+  process through the existing `DispatchEx` fallback. Attach-first is kept for
+  the case it was written for — the user has Access open on the database we are
+  going to work on — and `_launch(None)` still attaches to anything, so callers
+  with no known destination are unaffected.
+- **`access_create_database` passes its target path.** The file does not exist
+  yet, so a running instance can never match it: with the user's Access busy we
+  always get a second window, and the `CloseCurrentDatabase()` that caused the
+  report never reaches their session. No other change was needed there — the
+  fresh instance has no database open, so that branch is simply skipped.
+
+### Known limitation
+
+`GetActiveObject` returns a single entry from the running-object table. With
+several Access windows open we can inspect only one of them, so we may spawn a
+process even though another window already had the target database open. Worse
+than ideal, better than closing somebody's work.
+
+### Not adopted
+
+The report also suggested one Access instance per database. `_Session` is a
+singleton by design — one COM session, one dedicated STA thread, one open
+database — and per-database instances would be a different server. Marking who
+opened a database so `_switch` leaves a foreign one alone was rejected too: the
+database would stay open in the user's instance and we would reopen it shared
+later, which brings the v0.7.56 lock warning and design-lock conflicts to the
+normal workflow.
+
+### Tests
+
+- `tests/test_attach_policy.py` — pure Python, no COM: `win32com.client` is
+  imported inside `_launch`, so a stub in `sys.modules` covers all five cases
+  (foreign database, target database, idle instance, `target_path=None`, and
+  `MCP_ACCESS_EXCLUSIVE`, which still never looks at the candidate).
+
 ## 0.7.57 — 2026-09-02
 
 **The dependency floor had no ceiling, and MCP SDK v2 walked through it.**
