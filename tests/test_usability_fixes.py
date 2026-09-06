@@ -83,6 +83,57 @@ def test_replace_lines_negative_start_line():
                              start_line=0, count=1, new_code="x")
 
 
+def test_access_tips_schema_lists_every_topic():
+    """The tool description enumerates the topics by hand and had drifted twice
+    (layout and design_vbe were missing). Keep it honest automatically."""
+    from mcp_access.tips import _TIPS
+    from mcp_access.tools import TOOLS
+    desc = [t for t in TOOLS if t.name == "access_tips"][0].description
+    listed = desc.split("Topics: ")[1].split(".")[0].split(", ")
+    assert set(listed) == set(_TIPS), set(listed) ^ set(_TIPS)
+
+
+def test_control_type_numbers_in_tips_match_the_real_map():
+    """The 'controls' topic used to hand out numbers belonging to other controls
+    (e.g. it called 106 a ComboBox — 106 is CheckBox)."""
+    import re
+    from mcp_access.tips import _TIPS
+    from mcp_access.constants import CTRL_TYPE
+    for num, name in re.findall(r"(\d{3})=([A-Za-z]+)", _TIPS["controls"]):
+        if int(num) in CTRL_TYPE:
+            assert CTRL_TYPE[int(num)] == name, f"{num} is {CTRL_TYPE[int(num)]}, not {name}"
+
+
+def test_coord_keeps_the_string_minus_one_as_automatic():
+    """coerce_prop maps "-1" to True (in Access -1 IS True) and int(True) is 1,
+    so a client that serialises every argument as a string used to ask for the
+    automatic position and get coordinate 1."""
+    from mcp_access.controls import _coord
+    from mcp_access.helpers import coerce_prop
+    assert int(coerce_prop("-1")) == 1          # the trap this exists to avoid
+    assert _coord("-1") == -1
+    assert _coord(-1) == -1
+
+
+def test_coord_handles_the_other_shapes_a_client_may_send():
+    from mcp_access.controls import _coord
+    assert _coord("1200") == 1200 and _coord(1200) == 1200
+    assert _coord("2.0") == 2
+    assert _coord(True) == -1 and _coord(False) == 0   # Access booleans: -1/0
+    for junk in ("", "  ", "abc", None, [], {}):
+        assert _coord(junk) == -1, junk
+
+
+def test_geometry_args_no_longer_go_through_coerce_prop():
+    """Structural guard: the four CreateControl geometry arguments and the
+    snap_to_grid loop must use _coord."""
+    import inspect
+    from mcp_access import controls
+    src = inspect.getsource(controls)
+    assert "int(coerce_prop(_pop_ci" not in src
+    assert src.count("_coord(_pop_ci") == 4
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

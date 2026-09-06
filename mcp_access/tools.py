@@ -1368,11 +1368,11 @@ TOOLS = [
     # -- Tips / knowledge base -----------------------------------------------
     types.Tool(
         name="access_tips",
-        description="Tips and gotchas for working with Access via MCP. Topics: eval, controls, gotchas, sql, vbe, compile, design, lint, macros, subform_tabcontrol. Without topic returns the list.",
+        description="Tips and gotchas for working with Access via MCP. Topics: eval, controls, gotchas, sql, vbe, compile, design_vbe, macros, lint, layout, design, subform_tabcontrol. Without topic returns the list.",
         inputSchema={
             "type": "object",
             "properties": {
-                "topic": {"type": "string", "description": "Topic: eval, controls, gotchas, sql, vbe, compile, design (empty = list of topics)"},
+                "topic": {"type": "string", "description": "Topic name, or empty for the list of topics"},
             },
         },
     ),

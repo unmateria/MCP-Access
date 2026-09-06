@@ -1,18 +1,12 @@
 # CLAUDE.md — mcp-access MCP Server
 
-## 🔴 NEXT UP: the three safety nets in `NEXT-STEPS.md`
+## Done in v0.7.59 — the `NEXT-STEPS.md` safety nets
 
-That is the agreed next piece of work. All three came out of real production use
-and they share one shape: **the server does the right thing but
-stays quiet when the caller gets it wrong**, so the damage only surfaces later, in a
-diff or in a form that looks broken.
-
-1. Warn when a new control lands inside a tab page without `parent` — the most
-   valuable of the three.
-2. Warn when writing code changes modules nobody touched (the VBA editor unifies
-   identifier casing project-wide).
-3. Document that injecting code rewrites the form's design-window geometry, and the
-   minor `control_type: -1` in `access_get_control`.
+Items 1, 3 and 4 are implemented; see the CHANGELOG. Item 2 (warn when writing
+code changes modules nobody touched) was **deliberately left as documentation**
+in `access_tips('vbe')`: fingerprinting every module before and after every write
+costs hundreds of COM round-trips to report damage that is already done and
+already visible in the git diff. The useful part was explaining the cause.
 
 ## 🔴 THIS REPOSITORY IS PUBLIC (github.com/unmateria/MCP-Access)
 
@@ -77,9 +71,13 @@ Begin Form
         Begin                <- container
             Begin Label      <- REAL CONTROL
             End
-            Begin Page       <- CONTAINER -- children re-scanned
+            Begin Tab        <- CONTAINER -- the TabControl itself
                 Begin        <- anonymous wrapper
-                    Begin ComboBox  <- child control (parent = Page)
+                    Begin Page          <- CONTAINER (parent = Tab)
+                        Begin           <- anonymous wrapper
+                            Begin ComboBox  <- child control (parent = Page)
+                            End
+                        End
                     End
                 End
             End
@@ -87,7 +85,28 @@ Begin Form
     End
 End Form
 ```
-**Container types** (`_CONTAINER_TYPES = {"Page", "OptionGroup"}`): re-scanned for child controls. Children get a `"parent"` field. `container_stack` tracks nesting.
+**Container types** (`CONTAINER_TYPES = {"Page", "OptionGroup", "Tab"}`): re-scanned for child controls. Children get a `"parent"` field (innermost container wins). `container_stack` tracks nesting.
+
+**The TabControl is `Begin Tab`** (not `TabCtl`), it is `CTRL_TYPE[123]`, and it
+MUST stay in `CONTAINER_TYPES`. The parser skips to the end of the block of any
+recognised type that is not a container, so listing `Tab` without making it a
+container swallows every `Page` inside it and every control on those pages — the
+v0.7.34 regression, re-armed. `tests/test_parse_controls.py` fails loudly if this
+is undone. Consequence of the nesting: a Page's `parent` is its tab control, and
+a control on a page has the Page as `parent` (the innermost container wins).
+
+**Child coordinates are section-absolute.** Measured on Access 2016: a control
+created with `parent="Page1"` at `left=1200` exports `Left =1200`, not an offset
+from the page. So a control's rectangle and its tab control's compare directly —
+which is what `lint.tab_parent_hint` relies on. (The `parent` check in
+`_rule_out_of_bounds` predates this measurement and stays as a conservative
+skip.)
+
+**`ControlType =` absent means "default", not unknown.** Since v0.7.59 the type
+falls back to `CTRL_TYPE_BY_NAME[<Begin token>]` instead of `-1`. For
+WebBrowser/Navigation* that map yields the **AcControlType** number
+`CreateControl` wants, which differs from the SaveAsText one — deliberate, it is
+the number that makes a `get_control` → `create_control` round-trip work.
 
 **Depth counter inside a control block must include `Property = Begin`** (e.g. `GUID = Begin`, `NameMap = Begin`, `ConditionalFormat = Begin`). These open multi-line blocks closed by their own `End`. If the parser only counts plain `Begin <Type>` it decrements depth on the closing `End` of the property block without ever incrementing — the control closes prematurely at the first such `End`, and any controls that follow inside a `Page` / `OptionGroup` are silently lost. Fixed in v0.7.34 (was: `re.match(r"^Begin\b", bl_s)` — now also matches `r"^\w+\s*=\s*Begin\s*$"`, mirroring the form-level loop).
 

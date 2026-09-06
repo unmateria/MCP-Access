@@ -1,5 +1,95 @@
 # Changelog
 
+## 0.7.59 — 2026-09-06
+
+**The server knew the caller had made a mistake and said nothing.** Three of the
+four items in `NEXT-STEPS.md`, all from real production use. None of them change
+what the server *does* — they change what it *tells you* when you are about to
+have a bad day.
+
+### The tab control was invisible
+
+`_parse_controls` only recognises a `Begin <Type>` block whose type is in
+`CTRL_TYPE`, and **123 was never there**. A form's tab control therefore had no
+geometry anywhere in the package: it was absent from `access_list_controls`, and
+its pages did not say which tab they belonged to.
+
+- `CTRL_TYPE` gains `123: "Tab"` (the export token is `Tab`, not `TabCtl`), and
+  `CONTAINER_TYPES` gains it too. **The second half is load-bearing**: a
+  recognised *non*-container makes the parser skip to the end of its block, which
+  would have swallowed every Page and every control on them — the exact
+  regression fixed in v0.7.34. `tests/test_parse_controls.py` fails without it.
+- `CTRL_TYPE_BY_NAME` is derived from `CTRL_TYPE`, so `"tab"` now resolves as a
+  control type name as well.
+- The lint exempts `Tab` from the geometry rules (`_LAYOUT_EXEMPT_TYPES`) and
+  from contrast: a tab control contains its own pages and everything on them, so
+  it overlaps all of it by construction.
+- Visible change: `access_list_controls` now returns the tab control, and each
+  Page carries `parent` with its tab control's name.
+
+### `access_create_control` warns when a control lands on a tab by accident
+
+`parent` (CreateControl's 4th positional argument) is optional and easy to
+forget. Without it the control is created **on the section**, not on the tab
+page, even when its coordinates put it right on top of one. The call succeeded,
+because it *was* a success — just not the one that was meant, and nothing said
+so until somebody opened the form and found the control on every tab.
+
+The result now carries a `warning` when the new control's rectangle falls fully
+inside a tab control in the same section and `parent` was empty. It names the
+tab, lists the pages available on it, and spells out the actual trap: **the page
+name is what `parent` wants, not the tab control's name**.
+
+Nothing is ever re-parented automatically — a control placed over a tab on
+purpose is legitimate, and silently moving things is worse than the original
+problem. Shares the `skip_lint` switch, and costs nothing on top of the lint:
+`_build_model` reads the same cached export.
+
+### `access_get_control` no longer reports `control_type: -1`
+
+Access omits `ControlType =` when it equals the default, which is the normal
+case in modern exports, so the parser fell back to `-1` while `type_name` was
+correct. Round-tripping a control definition therefore produced a number that
+could not be fed back to `access_create_control`. The type is now resolved from
+the `Begin <Type>` token via `CTRL_TYPE_BY_NAME`.
+
+Note: for `WebBrowser` and the two `Navigation*` controls the SaveAsText number
+and the AcControlType number `CreateControl` accepts differ. The resolved value
+is the latter — the one that makes the round-trip work.
+
+### Fixed: the string `"-1"` placed controls at 1 twip
+
+`coerce_prop` maps `"-1"` to `True` (in Access -1 *is* True, and boolean
+properties depend on that), and `int(True)` is 1. Since some MCP clients
+serialise every argument as a string, asking for the automatic position with
+`"-1"` put the control at coordinate 1 instead of letting Access decide.
+`ac_create_control` now converts its four geometry arguments with a dedicated
+numeric helper (`_coord`), and so does the `snap_to_grid` loop in
+`ac_set_control_props`, which had the same bug: it turned an automatic `"-1"`
+into a snapped 0. `coerce_prop` itself is unchanged — removing `"-1"` there would
+break every boolean property that relies on it.
+
+### Documentation, in `access_tips`
+
+Two things the server already knew and never said:
+
+- **`vbe`** — why writing code changes modules nobody touched. The VBA editor
+  keeps one canonical spelling per identifier project-wide, so declaring a name
+  that already exists with different casing rewrites those modules too. Harmless
+  at runtime, loud in version control. Deliberately documented rather than
+  detected: fingerprinting every module on every write would cost hundreds of COM
+  round-trips to report damage that is already done and already visible in the
+  diff.
+- **`design_vbe`** — injecting code rewrites the form-level
+  `Left/Top/Right/Bottom` and `Checksum` in the next text export. That is the
+  design *window*, not the layout. If a diff touches only those and no control's
+  own coordinates, nothing moved.
+
+Also fixed in the `controls` topic: it handed out numbers belonging to other
+controls (it called 106 a ComboBox; 106 is CheckBox). The `access_tips` schema
+listed the topics by hand and had drifted twice. Both are now guarded by tests.
+
+
 ## 0.7.58 — 2026-09-03
 
 **The server hijacked whichever Access instance answered the phone.**

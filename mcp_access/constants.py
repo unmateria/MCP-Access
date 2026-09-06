@@ -42,12 +42,16 @@ CTRL_TYPE: dict[int, str] = {
     118: "Page",
     119: "CustomControl",  # ActiveX in SaveAsText
     122: "Attachment",
+    123: "Tab",           # TabControl; the export token is "Tab", not "TabCtl"
     124: "NavigationButton",
     125: "NavigationControl",
     126: "WebBrowser",
 }
 
-CONTAINER_TYPES = {"Page", "OptionGroup"}
+# Types whose block is re-scanned for child controls. "Tab" MUST be here: a
+# recognised non-container makes _parse_controls skip to the end of its block,
+# which would swallow every Page (and every control inside them) nested in it.
+CONTAINER_TYPES = {"Page", "OptionGroup", "Tab"}
 
 # AcControlType enum values (used by CreateControl/CreateReportControl)
 AC_CONTROL_TYPE_NAMES: dict[str, int] = {

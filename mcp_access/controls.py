@@ -152,6 +152,17 @@ def _parse_controls(form_text: str) -> dict:
                 ctype = int(props.get("ControlType", -1))
             except (ValueError, TypeError):
                 ctype = -1
+            # Modern exports usually omit `ControlType =` (Access drops
+            # properties left at their default), which used to leave the
+            # caller with control_type = -1 while type_name was correct --
+            # a number that could not be fed back to ac_create_control.
+            # Resolve it from the `Begin <Type>` token instead.
+            # NOTE: for WebBrowser and the two Navigation* controls the
+            # SaveAsText number and the AcControlType number CreateControl
+            # wants differ; CTRL_TYPE_BY_NAME yields the latter, which is
+            # the one that makes the round-trip work.
+            if ctype < 0:
+                ctype = CTRL_TYPE_BY_NAME.get(m_ctrl.group(1).lower(), -1)
 
             # Count ConditionalFormat entries in the raw block
             raw_text = "".join(block)
@@ -377,10 +388,10 @@ def ac_create_control(
     section     = _resolve_section(_pop_ci(props, "section",     0))
     parent      = str(_pop_ci(props, "parent",      ""))
     column_name = str(_pop_ci(props, "column_name", ""))
-    left        = int(coerce_prop(_pop_ci(props, "left",   -1)))
-    top         = int(coerce_prop(_pop_ci(props, "top",    -1)))
-    width       = int(coerce_prop(_pop_ci(props, "width",  -1)))
-    height      = int(coerce_prop(_pop_ci(props, "height", -1)))
+    left        = _coord(_pop_ci(props, "left",   -1))
+    top         = _coord(_pop_ci(props, "top",    -1))
+    width       = _coord(_pop_ci(props, "width",  -1))
+    height      = _coord(_pop_ci(props, "height", -1))
 
     # Opt-in: round positional dimensions to the design grid (60 twips). A
     # value of -1 means "let Access decide" — leave those untouched.
@@ -463,8 +474,32 @@ def ac_create_control(
         # Invalidate caches — form changed in Design view
         invalidate_object_caches(object_type, object_name)
 
+    if not parent:
+        _attach_tab_hint(result, db_path, object_type, object_name, skip_lint)
     return _attach_lint(result, db_path, object_type, object_name, skip_lint,
                         focus_controls={result["name"]}, full_lint=full_lint)
+
+
+def _attach_tab_hint(result: dict, db_path: str, object_type: str,
+                     object_name: str, skip_lint: bool) -> None:
+    """Warn if the control just created landed inside a tab control unparented.
+
+    Only called when `parent` was empty — with a parent there is nothing to warn
+    about. Shares the `skip_lint` switch (one "do no extra work" flag) and costs
+    nothing on top of it: _build_model reads the same cached export the lint does.
+
+    Never raises: like _attach_lint, a failure here must not break the mutation.
+    """
+    if skip_lint or object_type not in ("form", "report"):
+        return
+    try:
+        from .lint import _build_model, tab_parent_hint
+        hint = tab_parent_hint(
+            _build_model(db_path, object_type, object_name), result["name"])
+        if hint:
+            result["warning"] = hint
+    except Exception:
+        pass
 
 
 def _attach_lint(result: dict, db_path: str, object_type: str,
@@ -495,6 +530,25 @@ def _attach_lint(result: dict, db_path: str, object_type: str,
     except Exception:
         pass
     return result
+
+
+def _coord(val: Any) -> int:
+    """Coerce a CreateControl geometry argument to int twips (-1 = automatic).
+
+    NOT coerce_prop: that one maps the *string* "-1" to True (in Access -1 IS
+    True, and boolean properties depend on it), and int(True) is 1. Since some
+    MCP clients serialise every argument as a string, asking for the automatic
+    position with "-1" used to place the control at 1 twip instead.
+    """
+    if isinstance(val, bool):
+        return -1 if val else 0
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        try:
+            return int(float(str(val).strip()))
+        except (TypeError, ValueError):
+            return -1
 
 
 def _pop_ci(d: dict, key: str, default: Any) -> Any:
@@ -723,10 +777,7 @@ def ac_set_control_props(
         props = dict(props)
         for k in list(props):
             if k.lower() in ("left", "top", "width", "height"):
-                try:
-                    v = int(coerce_prop(props[k]))
-                except (TypeError, ValueError):
-                    continue
+                v = _coord(props[k])   # not coerce_prop -- see _coord's docstring
                 if v >= 0:
                     props[k] = _snap_grid(v)
 

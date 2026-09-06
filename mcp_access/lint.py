@@ -63,6 +63,7 @@ _NO_CONTRAST_TYPES = {
     "Line", "Rectangle", "Image", "Subform", "PageBreak", "Page",
     "OptionGroup", "CommandButton", "ToggleButton", "WebBrowser",
     "CustomControl", "BoundObjectFrame", "ObjectFrame", "NavigationControl",
+    "Tab",
 }
 
 # Types that legitimately have a zero extent on one axis.
@@ -70,8 +71,9 @@ _ONE_AXIS_TYPES = {"Line", "PageBreak"}
 
 # Container/layout types exempt from geometry rules: tab Pages stack on top of
 # one another by design (so they "overlap"), and containers span large areas —
-# none of that is a layout bug.
-_LAYOUT_EXEMPT_TYPES = {"Page", "OptionGroup"}
+# none of that is a layout bug. A Tab control contains its own Pages and
+# everything on them, so it overlaps all of it by construction.
+_LAYOUT_EXEMPT_TYPES = {"Page", "OptionGroup", "Tab"}
 
 _DEFAULT_PADDING_TWIPS = 120  # internal control padding allowance
 
@@ -1385,6 +1387,57 @@ def ac_lint_form(
 # ---------------------------------------------------------------------------
 # Public: compact lint embedded in design-mutation tool results
 # ---------------------------------------------------------------------------
+
+def tab_parent_hint(model: dict, control_name: str) -> Optional[str]:
+    """Warn when a control sits inside a tab control it is not parented to.
+
+    ``ac_create_control`` takes ``parent`` (CreateControl's 4th positional arg)
+    and it works, but it is optional and easy to forget. Without it the control
+    lands on the section, NOT on the tab page — even when its coordinates put it
+    right on top of one. The call succeeds, because it *was* a success; just not
+    the one that was meant. The form then shows the control on every page, or
+    floating above the tabs, and whoever opens it blames the last edit.
+
+    Deliberately advisory. A control placed over a tab on purpose is legitimate,
+    and silently re-parenting things is worse than the original problem — so this
+    only ever returns a message. ``None`` means there is nothing to say.
+
+    Coordinates compare directly: a control created with ``parent`` set exports
+    section-absolute Left/Top, not an offset from the page (measured on Access
+    2016 — a button created at left=1200 inside a page exports ``Left =1200``).
+    """
+    want = control_name.casefold()
+    target = next((c for c in model["controls"]
+                   if c["name"].casefold() == want), None)
+    if target is None or target.get("parent"):
+        return None
+    if not _has_full_geom(target):
+        return None
+    tx1, ty1, tx2, ty2 = _rect(target)
+
+    for tab in model["controls"]:
+        if tab["type_name"] != "Tab" or tab.get("parent"):
+            continue
+        if tab["section"] != target["section"] or not _has_full_geom(tab):
+            continue
+        bx1, by1, bx2, by2 = _rect(tab)
+        if not (bx1 <= tx1 and by1 <= ty1 and bx2 >= tx2 and by2 >= ty2):
+            continue
+        pages = [c["name"] for c in model["controls"]
+                 if c["type_name"] == "Page"
+                 and c.get("parent", "").casefold() == tab["name"].casefold()]
+        # The page name is what CreateControl wants, not the tab control's —
+        # that distinction is the actual trap, so spell it out.
+        where = (" Pages on it: " + ", ".join(pages) + ".") if pages else ""
+        return (
+            f"'{target['name']}' was created on section '{target['section']}', "
+            f"but its rectangle falls inside the tab control '{tab['name']}', so "
+            f"it will show on every page instead of on one. To put it on a page, "
+            f"pass props.parent with the PAGE name — not the tab control's "
+            f"name.{where} If it is meant to float over the tab, ignore this."
+        )
+    return None
+
 
 def _violation_controls(v: dict) -> set:
     """All control names a violation refers to (its own control + an overlap's pair)."""

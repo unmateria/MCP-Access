@@ -355,6 +355,97 @@ def test_normalize_rules():
 # Plain runner (no pytest required)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# tab_parent_hint — the unparented-control-on-a-tab warning
+# ---------------------------------------------------------------------------
+
+def _tab_model(**kw):
+    """A tab control at (195,600)-(9200,5600) with two pages on it."""
+    ctrls = [
+        _ctrl("tabDetails", "Tab", left=195, top=600, width=9005, height=5000),
+        _ctrl("pagGeneral", "Page", left=270, top=1065, width=8850, height=4455,
+              parent="tabDetails"),
+        _ctrl("pagLines", "Page", left=270, top=1065, width=8850, height=4455,
+              parent="tabDetails"),
+        _ctrl("btPrint", "CommandButton", left=1200, top=1500,
+              width=2000, height=400, **kw),
+    ]
+    return _model(ctrls)
+
+
+def test_tab_hint_fires_for_an_unparented_control_inside_a_tab():
+    msg = L.tab_parent_hint(_tab_model(), "btPrint")
+    assert msg is not None
+    assert "tabDetails" in msg
+    # The trap is that CreateControl wants the PAGE name — say so, and name them.
+    assert "PAGE name" in msg
+    assert "pagGeneral" in msg and "pagLines" in msg
+
+
+def test_tab_hint_silent_when_the_control_is_parented():
+    assert L.tab_parent_hint(_tab_model(parent="pagGeneral"), "btPrint") is None
+
+
+def test_tab_hint_silent_when_the_control_is_outside_the_tab():
+    m = _model([
+        _ctrl("tabDetails", "Tab", left=195, top=600, width=9005, height=5000),
+        _ctrl("btPrint", "CommandButton", left=200, top=6000, width=2000, height=400),
+    ])
+    assert L.tab_parent_hint(m, "btPrint") is None
+
+
+def test_tab_hint_silent_when_only_partly_over_the_tab():
+    """Straddling the edge is an overlap, and _rule_overlap already covers it."""
+    m = _model([
+        _ctrl("tabDetails", "Tab", left=195, top=600, width=9005, height=5000),
+        _ctrl("btPrint", "CommandButton", left=8000, top=1500, width=3000, height=400),
+    ])
+    assert L.tab_parent_hint(m, "btPrint") is None
+
+
+def test_tab_hint_ignores_a_tab_in_another_section():
+    m = _model([
+        _ctrl("tabDetails", "Tab", left=195, top=600, width=9005, height=5000,
+              section="Detail"),
+        _ctrl("btPrint", "CommandButton", left=1200, top=1500, width=2000,
+              height=400, section="FormHeader"),
+    ])
+    assert L.tab_parent_hint(m, "btPrint") is None
+
+
+def test_tab_hint_silent_without_full_geometry():
+    """An absent dimension inherits the form default — unknown, not zero."""
+    m = _model([
+        _ctrl("tabDetails", "Tab", left=195, top=600, width=9005, height=5000),
+        _ctrl("btPrint", "CommandButton", left=1200, top=1500, width=None, height=400),
+    ])
+    assert L.tab_parent_hint(m, "btPrint") is None
+    m2 = _model([
+        _ctrl("tabDetails", "Tab", left=195, top=600, width=None, height=5000),
+        _ctrl("btPrint", "CommandButton", left=1200, top=1500, width=2000, height=400),
+    ])
+    assert L.tab_parent_hint(m2, "btPrint") is None
+
+
+def test_tab_hint_handles_a_missing_control_and_no_tabs():
+    assert L.tab_parent_hint(_tab_model(), "doesNotExist") is None
+    assert L.tab_parent_hint(_model([_ctrl("btPrint", "CommandButton")]),
+                             "btPrint") is None
+
+
+def test_tab_hint_matches_the_name_case_insensitively():
+    assert L.tab_parent_hint(_tab_model(), "BTPRINT") is not None
+
+
+def test_tab_hint_reports_no_pages_gracefully():
+    m = _model([
+        _ctrl("tabDetails", "Tab", left=195, top=600, width=9005, height=5000),
+        _ctrl("btPrint", "CommandButton", left=1200, top=1500, width=2000, height=400),
+    ])
+    msg = L.tab_parent_hint(m, "btPrint")
+    assert msg is not None and "Pages on it" not in msg
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     passed = 0
