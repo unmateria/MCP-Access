@@ -1,5 +1,27 @@
 # CLAUDE.md — mcp-access MCP Server
 
+## 🔴 NEXT UP: the three safety nets in `NEXT-STEPS.md`
+
+That is the agreed next piece of work. All three came out of real use on a large
+production database and they share one shape: **the server does the right thing but
+stays quiet when the caller gets it wrong**, so the damage only surfaces later, in a
+diff or in a form that looks broken.
+
+1. Warn when a new control lands inside a tab page without `parent` — the most
+   valuable of the three.
+2. Warn when writing code changes modules nobody touched (the VBA editor unifies
+   identifier casing project-wide).
+3. Document that injecting code rewrites the form's design-window geometry, and the
+   minor `control_type: -1` in `access_get_control`.
+
+## 🔴 THIS REPOSITORY IS PUBLIC (github.com/unmateria/MCP-Access)
+
+Everything committed here is published. **Nothing from any private project a
+maintainer happens to be working on goes in**: no machine names, IP addresses,
+paths, credentials, database or object names, and no sample data. Examples in docs
+and tests use invented names (`frmOrders`, `tabDetails`, `btPrint`). Check any file
+before committing it, including this one. See `SECURITY.md`.
+
 ## Overview
 
 MCP server for reading and editing Microsoft Access databases (`.accdb`/`.mdb`) via COM automation (pywin32). Runs as stdio MCP server. Entry point: `access_mcp_server.py`. Implementation: `mcp_access/` package (~7500 lines across 20 modules).
