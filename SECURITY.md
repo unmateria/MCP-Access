@@ -65,7 +65,7 @@ The gate is enforced in two layers:
 ### How to enable
 
 Add the variable to this server's `env` block in your MCP client config (e.g.
-the repo's `.mcp.json`) and **restart the server**:
+your `.mcp.json` — see `.mcp.json.example`) and **restart the server**:
 
 ```json
 {

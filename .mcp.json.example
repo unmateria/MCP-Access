@@ -4,7 +4,7 @@
       "type": "stdio",
       "command": "python",
       "args": [
-        "C:\\ruta\\a\\access_mcp_server.py"
+        "C:\\path\\to\\access_mcp_server.py"
       ],
       "env": {}
     }
