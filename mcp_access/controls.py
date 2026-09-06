@@ -369,7 +369,7 @@ def ac_create_control(
     ctype = _resolve_ctrl_type(control_type)
 
     # Extract positional/structural params from props (case-insensitive).
-    # Without this, e.g. {"Parent": "tabGestion"} would be passed to
+    # Without this, e.g. {"Parent": "pagGeneral"} would be passed to
     # setattr(ctrl, "Parent", ...) which Access rejects with
     # "Property 'CreateControl.Parent' can not be set" — even though Parent
     # is the 4th positional arg of CreateControl().

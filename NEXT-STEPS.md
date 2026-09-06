@@ -1,7 +1,7 @@
 # Next steps — safety nets for form editing
 
-Three improvements that came out of real use on a large production database
-(150+ forms, 35+ VBA modules, the VBA dumped to text and versioned in git).
+Three improvements that came out of real production use, on a database large
+enough that its VBA is exported to text and versioned in git.
 
 All three share one theme: **the server already does the right thing, but it stays
 silent when the caller gets it wrong, and the damage only shows up later** — in a

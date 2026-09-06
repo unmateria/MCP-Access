@@ -1098,7 +1098,7 @@ TOOLS = [
                 "db_path": {"type": "string", "description": "Path to .accdb/.mdb file"},
                 "expression": {
                     "type": "string",
-                    "description": "Expression to evaluate (e.g.: 'Forms!frmX.MARGEN_SEG', 'Date()', 'DLookup(\"Empresa\",\"Ventas\",\"numc=1\")')",
+                    "description": "Expression to evaluate (e.g.: 'Forms!frmOrders.Total', 'Date()', 'DLookup(\"Name\",\"Customers\",\"ID=1\")')",
                 },
                 "timeout": {
                     "type": "integer",

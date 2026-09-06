@@ -808,7 +808,7 @@ objectively broken form/report layouts. **65 → 66 tools.**
 
 ### Notes
 
-False-positive guards, hardened against a real 85-control ERP form (findings
+False-positive guards, hardened against a real, densely populated form (findings
 dropped 62 → 10, remainder genuine):
 
 - **Conditional formatting** overrides colours at runtime (binary in the export)
@@ -875,8 +875,8 @@ for the well-formed cases that v0.7.38 already handled.
 
 DX fixes for `access_set_code` on freshly-created forms, `access_create_control`
 with TabControl-Page parents, and the cryptic VBE error you got when the form
-had no code module yet. All real-world tripping points hit while building
-`frmSugerirPedido` for an ERP — see notes below for the actual reproductions.
+had no code module yet. All real-world tripping points hit while building a
+tab-heavy data-entry form — see notes below for the actual reproductions.
 
 ### Fixed
 

@@ -47,8 +47,8 @@ def test_control_characters_truncate_the_value():
 
 def test_legit_paths_pass_through_unchanged():
     for p in (
-        r"C:\Users\admin\Documents\ventas.accdb",
-        r"D:\bases de datos\ERP 2026.mdb",
+        r"C:\data\Documents\sales.accdb",
+        r"D:\shared databases\legacy 2020.mdb",
         "C:/data/x.accdb",
     ):
         assert _sanitize_db_path(p) == p

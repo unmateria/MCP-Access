@@ -2,8 +2,8 @@
 
 ## 🔴 NEXT UP: the three safety nets in `NEXT-STEPS.md`
 
-That is the agreed next piece of work. All three came out of real use on a large
-production database and they share one shape: **the server does the right thing but
+That is the agreed next piece of work. All three came out of real production use
+and they share one shape: **the server does the right thing but
 stays quiet when the caller gets it wrong**, so the damage only surfaces later, in a
 diff or in a form that looks broken.
 
@@ -259,7 +259,7 @@ numeric and the result is attached to mutations whether the model asks or not.
 `measure="auto"|"wizhook"|"heuristic"`. WizHook (`_measure_text_batch`) measures
 exact rendered width in ONE COM round-trip via a temp std module +
 `_invoke_app_run`. It REQUIRES a compiled VBA project (`Application.IsCompiled`);
-during active development the ERP project is usually uncompiled, so it fails and
+during active development a project is usually uncompiled, so it fails and
 falls back to the conservative heuristic (a `note` is added when `measure` was
 explicitly `wizhook`). The embedded lint always uses `heuristic` (fast, no Run
 dependency). Default everywhere leans on the heuristic for reliability.
@@ -374,10 +374,10 @@ Now `ac_set_code` detects VBA-only input (`_looks_like_vba_only`: no
 ac_create_form(db, "frmFoo")
 ac_create_control(db, "form", "frmFoo", "CommandButton",
                   {"left": 100, "top": 100, "width": 1500, "height": 400},
-                  control_name="btCerrar")  # NEW: top-level control_name
+                  control_name="btClose")  # NEW: top-level control_name
 ac_set_code(db, "form", "frmFoo",
             "Option Compare Database\nOption Explicit\n"
-            "Private Sub btCerrar_Click()\n"
+            "Private Sub btClose_Click()\n"
             "    DoCmd.Close acForm, Me.Name\n"
             "End Sub\n")  # routes via VBE, not LoadFromText
 ```
@@ -398,10 +398,10 @@ which Access rejects with `"Property 'CreateControl.Parent' can not be set"`
 
 ```
 ac_create_control(db, "form", "frmFoo", "CommandButton",
-                  {"Parent": "tabGestion",    # case-insensitive special key
+                  {"Parent": "pagGeneral",    # the PAGE name, not the tab control
                    "Left": 100, "Top": 100, "Width": 2000, "Height": 500,
-                   "Caption": "Acción", "OnClick": "[Event Procedure]"},
-                  control_name="btMiAccion")
+                   "Caption": "Print", "OnClick": "[Event Procedure]"},
+                  control_name="btPrint")
 ```
 
 If `Parent` doesn't refer to an existing TabControl Page (or other container
@@ -799,4 +799,4 @@ is not backported to the `v1.x` branch.
 
 ## MCP SDK Patch (local to this machine)
 
-The MCP Python SDK (`mcp/shared/session.py`) swallows all exceptions with a generic `-32602` error. A local patch at `c:\program files\python310\lib\site-packages\mcp\shared\session.py` adds full traceback to `ErrorData.message` and `ErrorData.data`. Re-apply after `pip install --upgrade mcp`.
+The MCP Python SDK (`mcp/shared/session.py`) swallows all exceptions with a generic `-32602` error. A local patch at `<python>\Lib\site-packages\mcp\shared\session.py` adds full traceback to `ErrorData.message` and `ErrorData.data`. Re-apply after `pip install --upgrade mcp`.
