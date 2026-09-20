@@ -1084,6 +1084,10 @@ def ac_vbe_find(
             matches.append({
                 "line": i, "content": raw_line.rstrip("\r"), "proc": owning_proc,
             })
+    if matches:
+        cont_index = _continuation_index(lines)
+        for m in matches:
+            _add_continuation(m, cont_index)
     return {"found": bool(matches), "match_count": len(matches), "matches": matches}
 
 
@@ -1120,7 +1124,8 @@ def ac_vbe_search_all(
                 if not all_code:
                     continue
                 obj_matches: list[dict] = []
-                for i, raw_line in enumerate(all_code.splitlines(), start=1):
+                obj_lines = all_code.splitlines()
+                for i, raw_line in enumerate(obj_lines, start=1):
                     if text_matches(search_text, raw_line, match_case, use_regex):
                         obj_matches.append({"line": i, "content": raw_line.rstrip("\r")})
                         total += 1
@@ -1128,6 +1133,9 @@ def ac_vbe_search_all(
                             truncated = True
                             break
                 if obj_matches:
+                    cont_index = _continuation_index(obj_lines)
+                    for m in obj_matches:
+                        _add_continuation(m, cont_index)
                     results.append({
                         "object_type": obj_type,
                         "object_name": obj_name,
@@ -1211,12 +1219,18 @@ def ac_find_usages(
     vba_matches: list[dict] = []
     for group in vba_result["results"]:
         for m in group["matches"]:
-            vba_matches.append({
+            flat = {
                 "object_type": group["object_type"],
                 "object_name": group["object_name"],
                 "line": m["line"],
                 "content": m["content"],
-            })
+            }
+            # Carry the continued-statement fields through the flattening,
+            # otherwise find_usages re-hides what search_all just surfaced.
+            for key in ("statement_line", "end_line", "content_full"):
+                if key in m:
+                    flat[key] = m[key]
+            vba_matches.append(flat)
     total = len(vba_matches)
     truncated = vba_result.get("truncated", False)
     errors: list[dict] = list(vba_result.get("errors", []))
@@ -1798,20 +1812,21 @@ def _strip_trailing_vba_comment(line: str) -> str:
     return line.rstrip()
 
 
-def _join_continuations(lines: list[str]) -> list[tuple[int, str]]:
+def _join_continuations(lines: list[str]) -> list[tuple[int, int, str]]:
     """Join VBA line continuations (` _` at end of a line) into single
     logical lines.
 
-    Returns a list of ``(first_line_number, joined_text)`` tuples, where
-    ``first_line_number`` is the 1-based line number of the FIRST physical
-    line of the logical statement — so downstream reporting still points at
-    where the declaration starts.
+    Returns a list of ``(first_line_number, last_line_number, joined_text)``
+    tuples, both 1-based and inclusive. ``first_line_number`` is where the
+    logical statement starts — so downstream reporting still points at where
+    the declaration begins — and ``last_line_number`` equals it for an
+    ordinary single-line statement.
 
     A continuation is a line that, after stripping trailing whitespace and
     ignoring a trailing VBA comment, ends with ``_`` preceded by whitespace
     (or is exactly ``_``). Continuations can chain.
     """
-    result: list[tuple[int, str]] = []
+    result: list[tuple[int, int, str]] = []
     i = 0
     n = len(lines)
     while i < n:
@@ -1837,9 +1852,44 @@ def _join_continuations(lines: list[str]) -> list[tuple[int, str]]:
             for idx, p in enumerate(accumulated_parts)
         ]
         joined = " ".join(p for p in pieces if p)
-        result.append((first_idx + 1, joined))
+        result.append((first_idx + 1, i + 1, joined))
         i += 1
     return result
+
+
+def _continuation_index(lines: list[str]) -> dict[int, tuple[int, int, str]]:
+    """Map every physical line of a MULTI-LINE VBA statement to its logical form.
+
+    Single-line statements are deliberately left out of the index: a search
+    match is only enriched when the statement it belongs to actually spans a
+    ` _` continuation chain, so the common case adds no output and no cost.
+
+    Every physical line of the chain maps to the same entry, so a hit on a
+    continuation line resolves to the whole statement too.
+    """
+    index: dict[int, tuple[int, int, str]] = {}
+    for first, last, joined in _join_continuations(lines):
+        if last > first:
+            entry = (first, last, joined)
+            for phys in range(first, last + 1):
+                index[phys] = entry
+    return index
+
+
+def _add_continuation(match: dict, index: dict[int, tuple[int, int, str]]) -> dict:
+    """Attach statement_line / end_line / content_full to a search match whose
+    physical line is part of a continued statement. No-op otherwise.
+
+    The search itself still runs line by line: this only widens what a match
+    REPORTS, never what it matches, so total_matches keeps its old meaning.
+    """
+    entry = index.get(match["line"])
+    if entry:
+        first, last, joined = entry
+        match["statement_line"] = first
+        match["end_line"] = last
+        match["content_full"] = joined
+    return match
 
 
 def ac_find_definition(
@@ -1967,7 +2017,7 @@ def ac_find_definition(
             current_enum = ""
             current_type = ""
 
-            for (i, stripped) in logical:
+            for (i, _last_line, stripped) in logical:
                 if _stop():
                     break
                 # Inside proc — only watch for End, ignore everything else

@@ -219,6 +219,11 @@ TOOLS = [
             "Searches for text or regex in ONE specific VBA module. Returns matches [{line, content, proc}]. "
             "Each match includes 'proc' (procedure name). "
             "Optional: proc_name to limit search to a single procedure. "
+            "When the matched line belongs to a statement continued with ' _', the match also "
+            "carries statement_line, end_line and content_full (the whole statement joined, "
+            "trailing comments removed) — 'content' alone is only the matched PHYSICAL line, so "
+            "read content_full before judging a wrapped statement (an API Declare's return type "
+            "lives on its last continuation line). "
             "To search ALL modules/forms/reports at once, use access_vbe_search_all instead."
         ),
         inputSchema={
@@ -239,7 +244,13 @@ TOOLS = [
     ),
     types.Tool(
         name="access_vbe_search_all",
-        description="Searches for text or regex in ALL VBA modules (modules, forms, reports) in the database.",
+        description=(
+            "Searches for text or regex in ALL VBA modules (modules, forms, reports) in the database. "
+            "When a matched line belongs to a statement continued with ' _', the match also carries "
+            "statement_line, end_line and content_full (the whole statement joined, trailing comments "
+            "removed) — 'content' alone is only the matched PHYSICAL line, so read content_full before "
+            "judging a wrapped statement (an API Declare's return type lives on its last continuation line)."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
@@ -1135,7 +1146,9 @@ TOOLS = [
             "Searches for text or regex in VBA, query SQL and control properties "
             "(ControlSource, RecordSource, RowSource, SourceObject, DefaultValue, ValidationRule, "
             "LinkChildFields, LinkMasterFields). "
-            "Returns results grouped: vba_matches, query_matches, control_matches."
+            "Returns results grouped: vba_matches, query_matches, control_matches. "
+            "A vba_match on a statement continued with ' _' also carries statement_line, "
+            "end_line and content_full (the whole statement joined)."
         ),
         inputSchema={
             "type": "object",

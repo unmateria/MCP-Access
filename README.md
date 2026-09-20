@@ -124,8 +124,8 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 | `access_vbe_get_proc` | Get a procedure's code and position by name |
 | `access_vbe_module_info` | List all procedures with their line numbers |
 | `access_vbe_replace_lines` | Replace/insert/delete lines in a VBA module directly via VBE |
-| `access_vbe_find` | Search text in ONE specific module. To search all modules at once, use `access_vbe_search_all` |
-| `access_vbe_search_all` | Search text across ALL modules/forms/reports in the database at once |
+| `access_vbe_find` | Search text in ONE specific module. A hit on a statement wrapped with ` _` also returns the whole joined statement. To search all modules at once, use `access_vbe_search_all` |
+| `access_vbe_search_all` | Search text across ALL modules/forms/reports in the database at once. A hit on a statement wrapped with ` _` also returns the whole joined statement |
 | `access_vbe_replace_proc` | Replace a full procedure by name (auto-calculates line bounds). Strips misplaced `Option` lines, runs structural health check |
 | `access_vbe_patch_proc` | Surgical find/replace within a procedure. **Atomic by default** (a failed patch writes nothing), case-insensitive anchors, optional `require_unique`, whitespace-tolerant fallback matching + contextual error messages when patches fail. `proc_name='(Declarations)'` targets the declarations section |
 | `access_vbe_append` | Append code at the end of a module. Auto-strips `Option Explicit`/`Option Compare` to prevent misplacement |

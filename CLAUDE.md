@@ -558,6 +558,40 @@ _vbe_line_count(inserted)` so its Check 3 stops being dead code.
 `_vbe_line_count` counts a trailing CRLF as opening a further empty line —
 `"a\r\nb\r\n"` → 3 — because that is what `InsertLines` does.
 
+## Continuation-aware search output (v0.7.60)
+
+Field report by @TvanStiphout-Home: a 64-bit audit read the `Declare` lines that
+`ac_vbe_search_all` returned, found them clean, and missed
+`… As LongPtr) As Long` — the wrong return type was on a continuation line the
+search never returned. The search was reporting the matched **physical** line.
+
+`_join_continuations` now returns `(first, last, text)` triples;
+`_continuation_index(lines)` maps every physical line of a **multi-line only**
+statement to its entry, and `_add_continuation(match, index)` attaches
+`statement_line` / `end_line` / `content_full`. Used by `ac_vbe_find` and
+`ac_vbe_search_all`; `ac_find_usages` copies the three fields through its
+flattening loop (it would otherwise re-hide what `search_all` just surfaced).
+
+- **Only the reporting widened, never the matching.** `text_matches` still runs
+  against the physical line. Matching the joined text instead would change
+  `total_matches` for existing callers and make `max_results` mean something
+  different. Do NOT "improve" this into a logical-line search.
+- **Single-line matches get none of the three fields**, because
+  `_continuation_index` skips statements where `last == first`. That is what
+  keeps the 99% case byte-identical to v0.7.59 and stops a project-wide search
+  from doubling its token cost. Do NOT index every statement "for consistency".
+- **`line` stays the physical hit line.** A hit on a continuation line reports
+  `line: 62, statement_line: 61` — rewriting `line` to the statement start would
+  break every caller that uses it to navigate, and would report a line whose
+  `content` it did not match.
+- **The index is built only for modules that produced a match**, after the match
+  loop. Building it per module up front costs a regex pass over every module in
+  the database to enrich nothing.
+- `content_full` has trailing `'` comments stripped, inherited from
+  `_strip_trailing_vba_comment`. Correct for judging code, wrong for
+  round-tripping source — the schema and `access_tips('vbe')` say so; do not
+  feed `content_full` back into a write.
+
 ## access_vbe_check_syntax (v0.7.52)
 
 The safe alternative to `access_compile_vba`, which is unusable as a post-edit

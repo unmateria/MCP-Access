@@ -1,5 +1,70 @@
 # Changelog
 
+## 0.7.60 — 2026-09-21
+
+**A search hit is a locator, not the source.** Feature request by
+[@TvanStiphout-Home](https://github.com/TvanStiphout-Home), from a real 64-bit
+audit that came back clean and wasn't.
+
+### The problem
+
+`access_vbe_search_all` and `access_vbe_find` match line by line and report the
+matched **physical** line. A VBA statement wrapped with a ` _` continuation
+therefore appeared truncated:
+
+```json
+{ "line": 61, "content": "Private Declare PtrSafe Function apiSelectObject Lib \"gdi32\" Alias \"SelectObject\" _" }
+```
+
+The rest of that declaration — including the return type — sat on lines 62-63
+and never reached the caller:
+
+```vba
+Private Declare PtrSafe Function apiSelectObject Lib "gdi32" Alias "SelectObject" _
+        (ByVal hdc As LongPtr, _
+         ByVal hObject As LongPtr) As Long      ' SelectObject returns a handle -> should be LongPtr
+```
+
+A genuine 64-bit bug (the handle truncates to 32 bits), invisible in the search
+output, and the kind of thing a caller then generalises into "the declares are
+clean".
+
+### The fix
+
+A match whose physical line belongs to a continued statement now also carries:
+
+- `statement_line` — the first physical line of the logical statement
+- `end_line` — its last physical line
+- `content_full` — the statement joined into one line
+
+`line` and `content` are untouched, and a single-line match gets none of the
+three, so **output for an ordinary hit is byte-identical to 0.7.59**. Applies to
+`access_vbe_find`, `access_vbe_search_all` and, through it, the `vba_matches` of
+`access_find_usages`.
+
+A hit on *any* physical line of the chain resolves the whole statement, not just
+a hit on the first one — searching for `hObject` in the example above returns
+`statement_line: 61, end_line: 63` with the full text.
+
+### Notes
+
+- The **matching** is unchanged: still line by line, against the physical line.
+  Only what a match *reports* got wider, so `total_matches` keeps its meaning and
+  no existing call changes its result count.
+- `content_full` drops trailing `'` comments (it is built from
+  `_join_continuations`, which strips them so declarations can be parsed). The
+  raw `content` still carries the comment.
+- The continuation index is built **only for modules that produced a match**, and
+  only multi-line statements enter it. No extra COM round-trips anywhere.
+- `_join_continuations` now returns `(first_line, last_line, text)` triples;
+  `access_find_definition`, its only other caller, already joined continuations
+  and is unaffected.
+- `access_tips('vbe')` documents the rule: a search result locates code, it does
+  not prove its content. For a known symbol,
+  `access_find_definition(kinds=['declare'])` was already continuation-aware and
+  remains the better tool.
+- `tests/test_search_continuations.py` — 10 pure tests, no COM.
+
 ## 0.7.59 — 2026-09-06
 
 **The server knew the caller had made a mistake and said nothing.** Three of the
