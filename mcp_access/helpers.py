@@ -325,12 +325,15 @@ def join_wrapped_value(lines: list[str], idx: int, value: str) -> tuple[str, int
 
     ``idx`` indexes the ``Name =value`` line and ``value`` is the raw right-hand
     side; returns (full value, last index consumed). Fragments are concatenated
-    WITHOUT a separator and their quotes removed by position, which is how
-    Access split them.
+    WITHOUT a separator.
 
-    With no continuation line the result is the plain ``.strip('"')`` of the
-    value — byte-identical to the pre-v0.7.61 behaviour, so the 99% case is
-    untouched.
+    Quotes are removed **by position**, never with ``.strip('"')``: Access
+    writes an embedded quote escaped as ``\\"``, so a value ending in one
+    (``ControlSource ="=\\"Total\\""``) loses its closing quote to a strip,
+    which chews through both trailing quote characters. Measured on a real
+    Access 2016 export — that is v0.7.62's fix, and the only case whose output
+    changed. A value with no quotes of its own is unaffected: ``"Total"`` still
+    yields ``Total``.
     """
     v = value.strip()
     if not v.startswith('"'):
@@ -345,11 +348,22 @@ def join_wrapped_value(lines: list[str], idx: int, value: str) -> tuple[str, int
         frags.append(m.group(1))
         j += 1
 
+    head = _unquote(v)
     if not frags:
-        return v.strip('"'), idx
-
-    head = v[1:-1] if len(v) >= 2 and v.endswith('"') else v[1:]
+        return head, idx
     return head + "".join(frags), j - 1
+
+
+def _unquote(v: str) -> str:
+    """Strip the delimiting quotes of an export value by position.
+
+    Falls back to ``.strip('"')`` for a value that is not a well-formed quoted
+    literal (a truncated or hand-edited export), which is what the parser did
+    before v0.7.62.
+    """
+    if len(v) >= 2 and v.startswith('"') and v.endswith('"'):
+        return v[1:-1]
+    return v.strip('"')
 
 
 def decode_access_escapes(s: str) -> str:

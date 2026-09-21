@@ -128,17 +128,29 @@ in v0.7.60, in the other text format this server reads.
 
 `helpers.join_wrapped_value(lines, idx, value)` re-assembles it. Rules baked in:
 
+- **The split is at exactly 80 characters of value per physical line**,
+  measured on Access 2016 (v0.7.62 verification): independent of the property
+  name and of the indentation, counting the export's own escapes. A 72-char
+  value stays on one line; a 92-char one exports as 80 + 12. Do not look for a
+  line-length threshold — there isn't one.
 - **A continuation line is, after `.strip()`, ONLY a quoted literal**
   (`^"(.*)"\s*$`). At depth 1 inside a control block nothing else has that
   shape, and the joining path is only entered when the value itself starts
   with `"` — a number (`Left =1200`) never consumes the following lines.
-- **Fragments concatenate with no separator**, quotes removed **by position**
-  (`frag[1:-1]`), because that is how Access split them. `.strip('"')` would
-  eat a quote that legitimately ends the value.
-- **With no continuation the result is byte-identical to v0.7.60** (the old
-  `.strip().strip('"')`). Same discipline as v0.7.60: the 99% case gains
-  nothing and costs nothing. `test_control_property_wrap.py` pins the exact
-  key set of an unwrapped control.
+- **Fragments concatenate with no separator**, and the delimiting quotes are
+  removed **by position** (`_unquote`), never with `.strip('"')`. Access
+  escapes an embedded quote as `\"` (CR/LF use octal instead — both conventions
+  coexist in one export), so a value ending in one, e.g.
+  `ControlSource ="=\"Ref: \" & [OrderNo]"`, loses its own closing quote to a
+  strip: it chews through both trailing quote characters. That was a live
+  defect of v0.7.60 and earlier, found by running the new parser against a real
+  export in the v0.7.61 verification, and fixed in **v0.7.62** on both paths at
+  once — short and wrapped values used to disagree. `_unquote` falls back to
+  `.strip('"')` only for a value that is not a well-formed quoted literal.
+- **Otherwise an unwrapped value is unchanged from v0.7.60.** Same discipline
+  as v0.7.60: the 99% case gains nothing and costs nothing.
+  `test_control_property_wrap.py` pins the exact key set of an unwrapped
+  control plus the escaped-quote case on both paths.
 - **Depth tracking is untouched**: continuation lines are neither `Begin` nor
   `End`, so the scan loop advances exactly as before.
 

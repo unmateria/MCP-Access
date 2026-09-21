@@ -5,8 +5,11 @@ Covers:
   * join_wrapped_value / _parse_controls re-assembling a value Access split
     across 2 and 3 physical lines (the v0.7.61 bug: only the first fragment
     was returned, as a syntactically plausible half-expression);
-  * a control WITHOUT any wrap producing exactly the v0.7.60 dict (no new
-    keys, same values) — the non-regression guarantee;
+  * a control WITHOUT any wrap keeping the v0.7.60 shape (no new keys, same
+    values) — the non-regression guarantee;
+  * quotes removed by position, so a value whose own last character is an
+    escaped quote keeps it, on the wrapped path and the plain one alike
+    (v0.7.62, measured on a real export);
   * decode_access_escapes surfacing caption_text only when there IS an escape;
   * _scan_control_properties: name resolved when `Name =` comes AFTER the
     property citing it, scope='form' for form-level properties, and nothing
@@ -85,6 +88,24 @@ FORM_TEXT = "\n".join([
     '                ControlSource ="Total"',
     '                Name ="txtTotal"',
     "            End",
+    "            Begin TextBox",
+    "                Left =5000",
+    "                Top =600",
+    # Access escapes an embedded quote as \" (CR/LF use octal instead), so this
+    # value legitimately ENDS in a quote character. `.strip('"')` chewed through
+    # both trailing quotes and dropped it — the v0.7.62 fix.
+    '                ControlSource ="=\\"Ref: \\" & [OrderNo]"',
+    '                Name ="txtQuoted"',
+    "            End",
+    "            Begin TextBox",
+    "                Left =5000",
+    "                Top =1000",
+    # Same shape, long enough that Access splits it: the short path and the
+    # wrapped path must agree on that closing quote.
+    '                ControlSource ="=\\"Ref: \\" & [OrderNo] & \\" / \\" & [Cus"',
+    '                    "tomerName] & \\" (\\" & [City] & \\")\\""',
+    '                Name ="txtQuotedLong"',
+    "            End",
     "            Begin CommandButton",
     "                Left =6000",
     '                Caption ="Print\\015\\012invoice"',
@@ -140,21 +161,41 @@ def test_three_line_wrap_is_joined():
     assert ctrl["name"] == "cboCustomer"
 
 
-def test_join_wrapped_value_without_continuation_is_a_plain_strip():
+def test_join_wrapped_value_without_continuation_unquotes_by_position():
     lines = ['ControlSource ="Total"', '    Name ="txtTotal"']
     assert join_wrapped_value(lines, 0, '"Total"') == ("Total", 0)
     # A non-quoted value (a number) is untouched too.
     assert join_wrapped_value(["Left =1200"], 0, "1200") == ("1200", 0)
+    # An empty value stays empty.
+    assert join_wrapped_value(['Caption =""'], 0, '""') == ("", 0)
+    # A malformed value (no closing quote) falls back to the old strip.
+    assert join_wrapped_value(['Caption ="oops'], 0, '"oops') == ("oops", 0)
+
+
+def test_escaped_closing_quote_survives_on_both_paths():
+    ctrls = _by_name(_parse_controls(FORM_TEXT))
+    # Short value: `.strip('"')` used to eat the value's own closing quote and
+    # return `=\"Ref: \" & [OrderNo]` minus its last character.
+    assert ctrls["txtQuoted"]["control_source"] == '=\\"Ref: \\" & [OrderNo]'
+    # Long value, split by Access: the two paths must not disagree.
+    assert ctrls["txtQuotedLong"]["control_source"] == (
+        '=\\"Ref: \\" & [OrderNo] & \\" / \\" & [CustomerName] & '
+        '\\" (\\" & [City] & \\")\\"'
+    ), ctrls["txtQuotedLong"]["control_source"]
+    for name in ("txtQuoted", "txtQuotedLong"):
+        assert ctrls[name]["control_source"].startswith('=\\"Ref: ')
 
 
 # ---------------------------------------------------------------------------
 # 2. Non-regression: a control with no wrap is unchanged
 # ---------------------------------------------------------------------------
 
-def test_control_without_wrap_is_byte_identical_to_v0_7_60():
+def test_control_without_wrap_keeps_the_v0_7_60_shape():
     ctrl = _by_name(_parse_controls(FORM_TEXT))["txtTotal"]
     # Exactly the keys v0.7.60 produced for a plain control: no caption_text,
-    # no control_source_text, nothing else added for the 99% case.
+    # no control_source_text, nothing else added for the 99% case. (The one
+    # value v0.7.62 does change is a closing quote the old strip ate — see
+    # test_escaped_closing_quote_survives_on_both_paths.)
     assert set(ctrl) == {
         "name", "control_type", "type_name", "caption", "control_source",
         "left", "top", "width", "height", "visible",

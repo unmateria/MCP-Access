@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.7.62 — 2026-09-21
+
+**A closing quote the parser had been eating since long before v0.7.61.** Found
+by running the new parser of 0.7.61 against a real Access 2016 export instead of
+a fixture.
+
+### The problem
+
+Access escapes a quote embedded in a property value as `\"` (embedded CR/LF use
+octal `\015\012` instead — both conventions coexist in the same export). A value
+whose own last character is a quote therefore ends the line with two of them:
+
+```
+ControlSource ="=\"Ref: \" & [OrderNo] & \"\""
+```
+
+The parser removed the delimiters with `.strip('"')`, which strips *every*
+quote at each end — so it chewed through the value's own closing quote and
+returned `…& \"\` . Silent, and exactly the class of defect 0.7.61 exists to
+close: a value that comes back looking complete and isn't.
+
+0.7.61 made it worse by being inconsistent: a long value, split by Access, went
+through the new by-position code and came back correct, while the same value
+short came back mutilated.
+
+### The fix
+
+`_unquote` removes the delimiting quotes **by position** on both paths.
+`.strip('"')` survives only as the fallback for a value that is not a
+well-formed quoted literal (a truncated or hand-edited export), which is what
+the parser did before.
+
+Output changes **only** for values whose first or last character is a quote of
+their own. `"Total"` still yields `Total`; `""` still yields `""`-as-empty; a
+number is untouched.
+
+### Verification notes (0.7.61, run against a live Access 2016)
+
+- **Access splits a long value at exactly 80 characters per physical line** —
+  independent of the property name and the indentation, counting the export's
+  own escapes. A 72-char value stays on one line; a 92-char one exports as
+  80 + 12. There is no line-length threshold, which is what the code had been
+  assuming without measuring. Recorded in `CLAUDE.md`.
+- `access_search_controls`, `access_find_usages`, `access_list_controls(fields)`
+  and `access_vbe_search_all(context_lines)` were exercised end to end against a
+  throwaway database: a term falling across the split is found, the joined value
+  is identical character for character to what was written, and the form-level
+  `Filter` comes back with `scope: "form"`.
+- The lint was re-run on a form holding an 88-character caption that Access
+  splits: it now measures the whole caption (it used to see 80), flags
+  `truncation` on a button too small for it and stays silent on a roomy one.
+
 ## 0.7.61 — 2026-09-21
 
 **The export has continuation lines too.** Field report from several long
