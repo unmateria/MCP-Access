@@ -15,7 +15,7 @@ from .vbe import (
     ac_vbe_append, ac_vbe_check_syntax, ac_find_usages, ac_find_definition,
 )
 from .controls import (
-    ac_list_controls, ac_get_control, ac_create_control,
+    ac_list_controls, ac_get_control, ac_search_controls, ac_create_control,
     ac_delete_control, ac_set_control_props, ac_set_form_property,
     ac_get_form_property, ac_set_multiple_controls,
     ac_export_text, ac_import_text, ac_manage_tab_order,
@@ -202,6 +202,7 @@ def call_tool_sync(name: str, arguments: dict) -> str:
                 bool(arguments.get("match_case", False)),
                 int(arguments.get("max_results", 100)),
                 bool(arguments.get("use_regex", False)),
+                int(arguments.get("context_lines", 0)),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -260,6 +261,7 @@ def call_tool_sync(name: str, arguments: dict) -> str:
                 arguments["db_path"],
                 arguments["object_type"],
                 arguments["object_name"],
+                arguments.get("fields"),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -269,6 +271,18 @@ def call_tool_sync(name: str, arguments: dict) -> str:
                 arguments["object_type"],
                 arguments["object_name"],
                 arguments["control_name"],
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        elif name == "access_search_controls":
+            result = ac_search_controls(
+                arguments["db_path"],
+                arguments["search_text"],
+                bool(arguments.get("match_case", False)),
+                int(arguments.get("max_results", 100)),
+                bool(arguments.get("use_regex", False)),
+                arguments.get("object_type", "all"),
+                arguments.get("properties"),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 

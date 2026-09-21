@@ -16,7 +16,10 @@ from .constants import (
     AC_DESIGN, AC_FORM, AC_REPORT, AC_SAVE_YES, AC_SAVE_NO,
     CTRL_TYPE_BY_NAME, SECTION_MAP,
 )
-from .helpers import coerce_prop, serialize_value, read_tmp, write_tmp
+from .helpers import (
+    coerce_prop, serialize_value, read_tmp, write_tmp,
+    join_wrapped_value, decode_access_escapes, text_matches,
+)
 from .design_defaults import snap as _snap_grid
 
 
@@ -132,7 +135,16 @@ def _parse_controls(form_text: str) -> dict:
                 if blk_depth == 1:
                     m_prop = re.match(r"^(\w+)\s*=(.*)", bl_s)
                     if m_prop:
-                        props[m_prop.group(1)] = m_prop.group(2).strip().strip('"')
+                        # A long value is split across several quoted physical
+                        # lines by SaveAsText; reading only the first one
+                        # returns a plausible-looking half of the expression.
+                        # join_wrapped_value re-assembles it (and is a no-op,
+                        # byte for byte, when there is no continuation).
+                        # The continuation lines themselves are neither Begin
+                        # nor End, so `j` keeps advancing exactly as before and
+                        # the depth tracking below is unaffected.
+                        val, _last = join_wrapped_value(lines, j, m_prop.group(2))
+                        props[m_prop.group(1)] = val
                 # Track depth — must include "Property = Begin" (GUID, NameMap,
                 # ConditionalFormat, etc.) which open multi-line blocks closed
                 # by their own End. Otherwise the control is closed prematurely
@@ -193,6 +205,16 @@ def _parse_controls(form_text: str) -> dict:
             }
             if fmt_count > 0:
                 ctrl_entry["format_conditions"] = fmt_count
+            # Decoded twins for the two values that routinely carry octal
+            # escapes (\015\012 for a wrapped caption, \042 for a quote).
+            # Added ONLY when the value actually contains an escape, so a
+            # normal control gains no extra field.
+            for prop_key, out_key in (("caption", "caption_text"),
+                                      ("control_source", "control_source_text")):
+                raw_val = ctrl_entry[prop_key]
+                decoded = decode_access_escapes(raw_val)
+                if decoded != raw_val:
+                    ctrl_entry[out_key] = decoded
             # Annotate parent if inside a container
             if container_stack:
                 ctrl_entry["parent"] = container_stack[-1][0]
@@ -231,15 +253,47 @@ def _get_parsed_controls(db_path: str, object_type: str, object_name: str) -> di
 # ac_list_controls / ac_get_control
 # ---------------------------------------------------------------------------
 
-def ac_list_controls(db_path: str, object_type: str, object_name: str) -> dict:
+# Everything _parse_controls can put in an entry, minus raw_block (which is
+# what ac_get_control is for). Used to validate `fields`.
+LIST_CONTROL_FIELDS = (
+    "name", "control_type", "type_name", "caption", "control_source",
+    "left", "top", "width", "height", "visible",
+    "start_line", "end_line", "parent", "format_conditions",
+    "caption_text", "control_source_text",
+)
+
+
+def ac_list_controls(db_path: str, object_type: str, object_name: str,
+                     fields: Optional[list[str]] = None) -> dict:
+    """List the controls of a form/report.
+
+    ``fields`` restricts the keys of each entry (e.g.
+    ``["name", "type_name", "control_source"]``) — a form with 60 controls is
+    mostly geometry nobody reading business logic needs. ``name`` is always
+    included; an unknown field raises instead of silently returning blanks.
+    Without ``fields`` the output is unchanged.
+    """
     if object_type not in ("form", "report"):
         raise ValueError("ac_list_controls only accepts object_type 'form' or 'report'")
+
+    keep: Optional[set] = None
+    if fields:
+        unknown = [f for f in fields if f not in LIST_CONTROL_FIELDS]
+        if unknown:
+            raise ValueError(
+                f"Unknown field(s) in `fields`: {unknown}. "
+                f"Valid fields: {list(LIST_CONTROL_FIELDS)}"
+            )
+        keep = {"name", *fields}
+
     parsed = _get_parsed_controls(db_path, object_type, object_name)
-    controls = [
-        {k: v for k, v in c.items() if k != "raw_block"}
-        for c in parsed["controls"]
-        if c.get("name", "").strip()  # exclude controls without a name
-    ]
+    controls = []
+    for c in parsed["controls"]:
+        if not c.get("name", "").strip():   # exclude controls without a name
+            continue
+        entry = {k: v for k, v in c.items()
+                 if k != "raw_block" and (keep is None or k in keep)}
+        controls.append(entry)
     return {
         "count": len(controls),
         "controls": controls,
@@ -264,6 +318,228 @@ def ac_get_control(
         f"Control '{control_name}' not found in '{object_name}'. "
         f"Available controls: {names}"
     )
+
+
+# ---------------------------------------------------------------------------
+# _scan_control_properties — property-level scan of a SaveAsText export
+# ---------------------------------------------------------------------------
+
+_BEGIN_TYPED_RE = re.compile(r"^Begin\s+(\w+)\s*$")
+_BEGIN_BARE_RE  = re.compile(r"^Begin\s*$")
+_BEGIN_ANY_RE   = re.compile(r"^Begin\b")
+_BEGIN_PROP_RE  = re.compile(r"^\w+\s*=\s*Begin\s*$")
+_PROP_RE        = re.compile(r"^(\w+)\s*=(.*)")
+
+
+def _skip_block(lines: list[str], i: int) -> int:
+    """Return the index just past the `End` that closes the block opening at i."""
+    depth = 0
+    while i < len(lines):
+        s = lines[i].rstrip("\r\n").strip()
+        if _BEGIN_ANY_RE.match(s) or _BEGIN_PROP_RE.match(s):
+            depth += 1
+        elif s == "End":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return len(lines)
+
+
+def _scan_control_properties(text: str,
+                             properties: Optional[frozenset] = None) -> list[dict]:
+    """Property-level scan of a form/report SaveAsText export.
+
+    Returns ``[{control, control_type, property, value, line, scope}]`` with
+    wrapped values already joined (see ``join_wrapped_value``) and ``line`` the
+    1-based physical line where the assignment starts.
+
+    ``properties=None`` means every property of the block; otherwise only the
+    names in the set.
+
+    Two details that a naive line scan gets wrong:
+      - the block's ``Name =`` is not guaranteed to precede the property that
+        cites it, so each block's name is resolved when the block CLOSES;
+      - nested ``Prop = Begin`` blocks (ConditionalFormat, NameMap, GUID) carry
+        their own properties and are skipped whole, same as ``_parse_controls``.
+
+    Properties of the ``Begin Form`` / ``Begin Report`` block itself come back
+    with ``control: ""`` and ``scope: "form"``. Blocks that are neither the
+    form nor a known control type (sections, the defaults block) report
+    nothing, and so do nameless control blocks — those are the defaults block's
+    prototypes, not real controls.
+    """
+    ctrl_type_names = {v for v in CTRL_TYPE.values()}
+    lines = text.splitlines()
+    out: list[dict] = []
+    stack: list[dict] = []
+
+    def _flush(frame: dict) -> None:
+        if not frame["pending"]:
+            return
+        if frame["scope"] == "control" and not frame["name"]:
+            return
+        for entry in frame["pending"]:
+            entry["control"] = frame["name"] if frame["scope"] == "control" else ""
+            entry["control_type"] = frame["token"]
+            entry["scope"] = frame["scope"]
+            out.append(entry)
+
+    i = 0
+    while i < len(lines):
+        s = lines[i].rstrip("\r\n").strip()
+
+        if _BEGIN_PROP_RE.match(s):
+            i = _skip_block(lines, i)
+            continue
+
+        # Below the code-behind marker (or inside the legacy ClassModule block)
+        # there is only VBA: no properties to read, and its `End`/assignment
+        # lines would confuse the block tracking. Stop — the frames still on
+        # the stack are flushed by the fallback after the loop.
+        if s in ("CodeBehindForm", "CodeBehindReport"):
+            break
+
+        m_begin = _BEGIN_TYPED_RE.match(s)
+        if m_begin:
+            token = m_begin.group(1)
+            if token.lower() == "classmodule":
+                break
+            if token in ("Form", "Report"):
+                scope = "form"
+            elif token in ctrl_type_names:
+                scope = "control"
+            else:
+                scope = ""
+            stack.append({"token": token, "scope": scope, "name": "", "pending": []})
+            i += 1
+            continue
+
+        if _BEGIN_BARE_RE.match(s):
+            stack.append({"token": "", "scope": "", "name": "", "pending": []})
+            i += 1
+            continue
+
+        if s == "End":
+            if stack:
+                _flush(stack.pop())
+            i += 1
+            continue
+
+        m_prop = _PROP_RE.match(s)
+        if m_prop and stack:
+            key = m_prop.group(1)
+            value, last = join_wrapped_value(lines, i, m_prop.group(2))
+            frame = stack[-1]
+            if key == "Name" and not frame["name"]:
+                frame["name"] = value
+            if frame["scope"] and (properties is None or key in properties):
+                frame["pending"].append(
+                    {"property": key, "value": value, "line": i + 1}
+                )
+            i = last + 1
+            continue
+
+        i += 1
+
+    while stack:       # unbalanced export — report what was collected anyway
+        _flush(stack.pop())
+
+    out.sort(key=lambda e: e["line"])
+    return out
+
+
+# ---------------------------------------------------------------------------
+# ac_search_controls
+# ---------------------------------------------------------------------------
+
+def ac_search_controls(
+    db_path: str, search_text: str, match_case: bool = False,
+    max_results: int = 100, use_regex: bool = False,
+    object_type: str = "all", properties: Optional[list[str]] = None,
+) -> dict:
+    """Search text/regex in the control (and form-level) properties of every
+    form and/or report of the database.
+
+    Returns {search_text, total_matches, results: [{object_type, object_name,
+    control, control_type, property, value, line, scope}], truncated?}.
+    """
+    if object_type not in ("form", "report", "all"):
+        raise ValueError("object_type must be 'form', 'report' or 'all'")
+
+    from .code import ac_list_objects, ac_get_code
+    from .constants import CONTROL_SEARCH_PROPS_EXTENDED
+    from .vbe import _SEARCH_ERROR_CAP
+
+    prop_filter: Optional[frozenset] = CONTROL_SEARCH_PROPS_EXTENDED
+    if properties:
+        if any(str(p).strip().lower() == "all" for p in properties):
+            prop_filter = None          # every property of the block
+        else:
+            prop_filter = frozenset(properties)
+
+    objects = ac_list_objects(db_path, "all")
+    scan_types = ("form", "report") if object_type == "all" else (object_type,)
+
+    results: list[dict] = []
+    errors: list[dict] = []
+    skipped = 0
+    total = 0
+    truncated = False
+
+    for obj_type in scan_types:
+        if truncated:
+            break
+        for obj_name in objects.get(obj_type, []):
+            if truncated:
+                break
+            try:
+                text = ac_get_code(db_path, obj_type, obj_name)
+                entries = _scan_control_properties(text, prop_filter)
+            except Exception as exc:
+                # Never swallow this: a "0 matches" that hides an object we
+                # could not read is a lie. Same contract as the other
+                # multi-object scans.
+                skipped += 1
+                if len(errors) < _SEARCH_ERROR_CAP:
+                    errors.append({
+                        "object": f"{obj_type}:{obj_name}",
+                        "error": str(exc).splitlines()[0] if str(exc) else repr(exc),
+                    })
+                continue
+            for e in entries:
+                if not text_matches(search_text, e["value"], match_case, use_regex):
+                    continue
+                results.append({
+                    "object_type":  obj_type,
+                    "object_name":  obj_name,
+                    "control":      e["control"],
+                    "control_type": e["control_type"],
+                    "property":     e["property"],
+                    "value":        e["value"],
+                    "line":         e["line"],
+                    "scope":        e["scope"],
+                })
+                total += 1
+                if total >= max_results:
+                    truncated = True
+                    break
+
+    out: dict = {
+        "search_text": search_text,
+        "total_matches": total,
+        "results": results,
+    }
+    if truncated:
+        out["truncated"] = True
+    if skipped:
+        out["objects_skipped"] = skipped
+        out["errors"] = errors
+        out["warning"] = (
+            f"{skipped} object(s) could not be exported — results may be "
+            "incomplete."
+        )
+    return out
 
 
 # ---------------------------------------------------------------------------

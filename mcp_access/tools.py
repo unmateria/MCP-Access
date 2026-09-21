@@ -1,5 +1,5 @@
 """
-MCP Tool definitions (67 tools) and schema utilities.
+MCP Tool definitions (69 tools) and schema utilities.
 """
 
 import mcp.types as types
@@ -261,6 +261,11 @@ TOOLS = [
                                 "description": "Max total matches (default: 100)"},
                 "use_regex": {"type": "boolean", "default": False,
                               "description": "true = interpret search_text as regex"},
+                "context_lines": {"type": "integer", "default": 0,
+                                  "description": (
+                                      "0-10 lines of surrounding code per match, returned as "
+                                      "context: {before, after}. Saves a follow-up read."
+                                  )},
             },
             "required": ["db_path", "search_text"],
         },
@@ -406,20 +411,43 @@ TOOLS = [
     # -- Control-level tools -------------------------------------------------
     types.Tool(
         name="access_list_controls",
-        description="Lists controls of a form/report with name, type, caption, control_source, position.",
+        description=(
+            "Lists controls of a form/report with name, type, caption, control_source, position. "
+            "Long property values that Access splits across several quoted lines in the export "
+            "are returned joined, so control_source/caption are always the WHOLE value. "
+            "Use `fields` to keep only the keys you need (e.g. [\"name\",\"control_source\"]) — "
+            "a 60-control form is mostly geometry. For a property this tool does not return, "
+            "read the control's raw_block with access_get_control."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
                 "db_path": {"type": "string", "description": "Path to .accdb/.mdb file"},
                 "object_type": {"type": "string", "enum": ["form", "report"]},
                 "object_name": {"type": "string", "description": "Form/report name"},
+                "fields": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Optional subset of keys per control: name, control_type, type_name, "
+                        "caption, control_source, left, top, width, height, visible, "
+                        "start_line, end_line, parent, format_conditions, caption_text, "
+                        "control_source_text. 'name' is always included."
+                    ),
+                },
             },
             "required": ["db_path", "object_type", "object_name"],
         },
     ),
     types.Tool(
         name="access_get_control",
-        description="Full definition (Begin...End) of a control by name.",
+        description=(
+            "Full definition (Begin...End) of a control by name. `raw_block` is the "
+            "UNABRIDGED definition exactly as Access exports it — go here when you need a "
+            "property access_list_controls does not return (OnClick, StatusBarText, Format, "
+            "ConditionalFormat...). Note that inside raw_block a long value is still split "
+            "across quoted continuation lines, the way Access wrote it."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
@@ -429,6 +457,43 @@ TOOLS = [
                 "control_name": {"type": "string", "description": "Control name"},
             },
             "required": ["db_path", "object_type", "object_name", "control_name"],
+        },
+    ),
+    types.Tool(
+        name="access_search_controls",
+        description=(
+            "Searches text or regex in the control properties of every form/report "
+            "(ControlSource, RowSource, DefaultValue, ValidationRule, SourceObject, "
+            "LinkChild/MasterFields, Caption, Filter, OrderBy, Tag by default; "
+            "properties=[\"all\"] searches every property of the block, e.g. OnClick or "
+            "StatusBarText). Values split across continuation lines in the export are joined "
+            "BEFORE matching, so a term that falls across the split is still found. "
+            "Each hit carries the owning control, the property, the full value and the line "
+            "in the export (use access_get_code to read around it). Form/report-level "
+            "properties come back with control='' and scope='form'."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Path to .accdb/.mdb file"},
+                "search_text": {"type": "string", "description": "Text or regex pattern to search"},
+                "match_case": {"type": "boolean", "default": False},
+                "max_results": {"type": "integer", "default": 100,
+                                "description": "Max total matches (default: 100)"},
+                "use_regex": {"type": "boolean", "default": False,
+                              "description": "true = interpret search_text as regex"},
+                "object_type": {"type": "string", "enum": ["form", "report", "all"],
+                                "default": "all"},
+                "properties": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Property names to search. Default: the extended control set. "
+                        "[\"all\"] = every property found in the export."
+                    ),
+                },
+            },
+            "required": ["db_path", "search_text"],
         },
     ),
     types.Tool(
@@ -1148,7 +1213,10 @@ TOOLS = [
             "LinkChildFields, LinkMasterFields). "
             "Returns results grouped: vba_matches, query_matches, control_matches. "
             "A vba_match on a statement continued with ' _' also carries statement_line, "
-            "end_line and content_full (the whole statement joined)."
+            "end_line and content_full (the whole statement joined). "
+            "Each control_match carries control_name, property, the full (joined) value and "
+            "the line in the export. For Caption/Tag/Filter/OrderBy, other properties or a "
+            "single form, use access_search_controls instead."
         ),
         inputSchema={
             "type": "object",

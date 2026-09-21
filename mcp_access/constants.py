@@ -173,6 +173,14 @@ CONTROL_SEARCH_PROPS = frozenset({
     "SourceObject", "LinkChildFields", "LinkMasterFields",
 })
 
+# Default haystack of access_search_controls: the set above plus the
+# properties that matter when reading somebody else's application rather than
+# tracing a field. Deliberately NOT used by find_usages — that tool already
+# sweeps VBA + queries + controls and a wider default would only add noise.
+CONTROL_SEARCH_PROPS_EXTENDED = CONTROL_SEARCH_PROPS | frozenset({
+    "Caption", "Filter", "OrderBy", "Tag",
+})
+
 # ---------------------------------------------------------------------------
 # UI design lint (access_lint_form + embedded design-mutation checks)
 # ---------------------------------------------------------------------------

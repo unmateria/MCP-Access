@@ -4,7 +4,7 @@
 
 **Give any AI assistant full control over Microsoft Access databases.**
 
-Create forms, write VBA, design tables, manage controls, run queries, build relationships, and edit every corner of an `.accdb` — all through natural language. 68 tools that turn Access into something you can *talk to*.
+Create forms, write VBA, design tables, manage controls, run queries, build relationships, and edit every corner of an `.accdb` — all through natural language. 69 tools that turn Access into something you can *talk to*.
 
 No Access expertise required. Just describe what you want.
 
@@ -85,7 +85,7 @@ Add to your MCP config file (`.mcp.json`, `mcp.json`, or client-specific setting
 
 Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 
-## Tools (68)
+## Tools (69)
 
 ### Database
 
@@ -125,7 +125,7 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 | `access_vbe_module_info` | List all procedures with their line numbers |
 | `access_vbe_replace_lines` | Replace/insert/delete lines in a VBA module directly via VBE |
 | `access_vbe_find` | Search text in ONE specific module. A hit on a statement wrapped with ` _` also returns the whole joined statement. To search all modules at once, use `access_vbe_search_all` |
-| `access_vbe_search_all` | Search text across ALL modules/forms/reports in the database at once. A hit on a statement wrapped with ` _` also returns the whole joined statement |
+| `access_vbe_search_all` | Search text across ALL modules/forms/reports in the database at once. A hit on a statement wrapped with ` _` also returns the whole joined statement. Optional `context_lines` (0-10) returns the surrounding code with each hit |
 | `access_vbe_replace_proc` | Replace a full procedure by name (auto-calculates line bounds). Strips misplaced `Option` lines, runs structural health check |
 | `access_vbe_patch_proc` | Surgical find/replace within a procedure. **Atomic by default** (a failed patch writes nothing), case-insensitive anchors, optional `require_unique`, whitespace-tolerant fallback matching + contextual error messages when patches fail. `proc_name='(Declarations)'` targets the declarations section |
 | `access_vbe_append` | Append code at the end of a module. Auto-strips `Option Explicit`/`Option Compare` to prevent misplacement |
@@ -134,8 +134,9 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 
 | Tool | Description |
 |------|-------------|
-| `access_list_controls` | List all controls of a form/report with key properties. Controls inside Pages/OptionGroups include a `parent` field |
-| `access_get_control` | Get the full definition block of a specific control (finds controls inside Pages/OptionGroups) |
+| `access_list_controls` | List all controls of a form/report with key properties. Long values split across lines in the export are returned joined. Controls inside Pages/OptionGroups include a `parent` field. Optional `fields` keeps only the keys you ask for |
+| `access_get_control` | Get the full, unabridged definition block of a specific control — where to go for a property `access_list_controls` does not return (finds controls inside Pages/OptionGroups) |
+| `access_search_controls` | Search text or regex in the control properties of every form/report (`ControlSource`, `RowSource`, `Caption`, `Tag`, `Filter`… or `properties=["all"]`). Values split across continuation lines are joined before matching |
 | `access_create_control` | Create a new control via COM in design view. Supports `class_name` for ActiveX (type 119) ProgID initialization. Use type 128 (`acWebBrowser`) for native WebBrowser |
 | `access_delete_control` | Delete a control via COM |
 | `access_set_control_props` | Modify control properties via COM in design view |
@@ -264,7 +265,7 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 
 | Tool | Description |
 |------|-------------|
-| `access_find_usages` | Search a name across VBA code, query SQL, and control properties (ControlSource, RecordSource, RowSource, SourceObject, DefaultValue, ValidationRule, LinkChildFields, LinkMasterFields) in one call |
+| `access_find_usages` | Search a name across VBA code, query SQL, and control properties (ControlSource, RecordSource, RowSource, SourceObject, DefaultValue, ValidationRule, LinkChildFields, LinkMasterFields) in one call. Each control hit carries the owning control, the full value and its line |
 
 ### Knowledge base
 

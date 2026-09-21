@@ -27,7 +27,7 @@ MCP server for reading and editing Microsoft Access databases (`.accdb`/`.mdb`) 
 - **Caches**: `_parsed_controls_cache` (control parsing) and `_Session._cm_cache` (CodeModule COM objects — live COM proxies). Both invalidated on DB switch, object modification, and design operations. There is **no** Python-side cache of VBE text: `_cm_all_code()` always reads via `cm.Lines(1, total)` so external edits (manual VBE edits, Ctrl+Z, add-ins) are picked up immediately. See issue #26 for the reason this cache was removed.
 - **Binary section handling**: `ac_get_code` strips PrtMip/PrtDevMode from form/report exports; `ac_set_code` restores them automatically before import.
 
-## Tools (68 total)
+## Tools (69 total)
 
 | Category | Tools |
 |----------|-------|
@@ -35,7 +35,7 @@ MCP server for reading and editing Microsoft Access databases (`.accdb`/`.mdb`) 
 | **Objects** | `access_list_objects`, `access_get_code`, `access_set_code`, `access_export_structure`, `access_delete_object`, `access_create_form`, `access_build_form`, `access_clone_object` |
 | **SQL/Tables** | `access_execute_sql`, `access_execute_batch`, `access_table_info`, `access_search_queries`, `access_search_data`, `access_create_table`, `access_alter_table` |
 | **VBE line-level** | `access_vbe_get_lines`, `access_vbe_get_proc`, `access_vbe_module_info`, `access_vbe_replace_lines`, `access_vbe_find`, `access_vbe_search_all`, `access_vbe_replace_proc`, `access_vbe_patch_proc`, `access_vbe_append` |
-| **Controls** | `access_list_controls`, `access_get_control`, `access_create_control`, `access_delete_control`, `access_set_control_props`, `access_set_multiple_controls`, `access_manage_tab_order` |
+| **Controls** | `access_list_controls`, `access_get_control`, `access_search_controls`, `access_create_control`, `access_delete_control`, `access_set_control_props`, `access_set_multiple_controls`, `access_manage_tab_order` |
 | **UI lint** | `access_lint_form` |
 | **DB Properties** | `access_get_db_property`, `access_set_db_property`, `access_get_form_property`, `access_set_form_property` |
 | **Text Export/Import** | `access_export_text`, `access_import_text` |
@@ -109,6 +109,57 @@ WebBrowser/Navigation* that map yields the **AcControlType** number
 the number that makes a `get_control` → `create_control` round-trip work.
 
 **Depth counter inside a control block must include `Property = Begin`** (e.g. `GUID = Begin`, `NameMap = Begin`, `ConditionalFormat = Begin`). These open multi-line blocks closed by their own `End`. If the parser only counts plain `Begin <Type>` it decrements depth on the closing `End` of the property block without ever incrementing — the control closes prematurely at the first such `End`, and any controls that follow inside a `Page` / `OptionGroup` are silently lost. Fixed in v0.7.34 (was: `re.match(r"^Begin\b", bl_s)` — now also matches `r"^\w+\s*=\s*Begin\s*$"`, mirroring the form-level loop).
+
+### Wrapped property values in the export (v0.7.61)
+
+`SaveAsText` splits any long quoted value across several physical lines, the
+continuation lines being bare quoted literals:
+
+```
+ControlSource ="=FormatPercent(((Nz([a])+Nz([b])-Nz([c]))*1"
+    "00)/Nz([Total])/100)"
+```
+
+The per-line property regex in `_parse_controls` kept only the first fragment
+and dropped the rest **in silence** — no ellipsis, no `truncated` flag. The
+value it returned was a syntactically valid expression that multiplied by one
+instead of a hundred. Same class of defect as the VBA continuation lines fixed
+in v0.7.60, in the other text format this server reads.
+
+`helpers.join_wrapped_value(lines, idx, value)` re-assembles it. Rules baked in:
+
+- **A continuation line is, after `.strip()`, ONLY a quoted literal**
+  (`^"(.*)"\s*$`). At depth 1 inside a control block nothing else has that
+  shape, and the joining path is only entered when the value itself starts
+  with `"` — a number (`Left =1200`) never consumes the following lines.
+- **Fragments concatenate with no separator**, quotes removed **by position**
+  (`frag[1:-1]`), because that is how Access split them. `.strip('"')` would
+  eat a quote that legitimately ends the value.
+- **With no continuation the result is byte-identical to v0.7.60** (the old
+  `.strip().strip('"')`). Same discipline as v0.7.60: the 99% case gains
+  nothing and costs nothing. `test_control_property_wrap.py` pins the exact
+  key set of an unwrapped control.
+- **Depth tracking is untouched**: continuation lines are neither `Begin` nor
+  `End`, so the scan loop advances exactly as before.
+
+Applied in `_parse_controls` (so `access_list_controls`, `access_get_control`
+and the lint model all see whole values) and in `_scan_control_properties`
+(`access_search_controls` + `ac_find_usages`'s `control_matches`).
+
+**NOT applied in `lint._extract_style`** — deliberately. It reads `_STYLE_KEYS`
+only (colours, font names, sizes), values far too short for Access to split.
+The comment there says so; don't propagate the helper where it does nothing.
+
+`raw_block` still carries the value split, exactly as Access wrote it: that is
+the form `LoadFromText` expects back. `caption_text` / `control_source_text`
+(`decode_access_escapes`, octal escapes like `\015\012` and `\042`) are added
+**only when the value actually contains an escape**, for the same
+don't-grow-the-common-case reason.
+
+`_scan_control_properties` resolves each block's `Name` when the block
+**closes**, not when it is read: Access does not guarantee `Name =` precedes
+the property citing it (in practice it usually follows). Nameless control
+blocks report nothing — those are the defaults block's prototypes.
 
 ### VBE + Design view conflict
 After design operations (`ac_set_control_props`, `ac_create_control`, `ac_delete_control`), the form may remain open in Design view. All VBE write functions close the form first (DoCmd.Close with acSaveYes), invalidate `_cm_cache`, then access VBE. Without this: `"Catastrophic failure" (-2147418113)`. All design operations invalidate all three caches in their `finally` block.

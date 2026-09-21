@@ -194,6 +194,11 @@ def _extract_style(raw_block: str) -> dict:
     Mirrors ``_parse_controls`` depth tracking so colours inside nested
     ``ConditionalFormat = Begin .. End`` (or GUID/NameMap) blocks are ignored —
     only properties at the control's own level (depth 1) are read.
+
+    Deliberately does NOT use ``join_wrapped_value``: it reads ``_STYLE_KEYS``
+    only — colours, font names, sizes and flags — and Access never splits a
+    value that short across continuation lines. The joined values reach the
+    lint anyway, through ``_parse_controls`` (caption, control_source).
     """
     style: dict = {}
     lines = raw_block.splitlines()

@@ -298,3 +298,70 @@ def split_code_behind(code: str) -> tuple[str, str]:
             vba_code = "\n".join(vba_lines).strip()
             return form_part, vba_code
     return code, ""
+
+
+# ---------------------------------------------------------------------------
+# SaveAsText property values: wrapped continuations and octal escapes
+# ---------------------------------------------------------------------------
+
+# A continuation line of a long property value is, after .strip(), ONLY a
+# quoted literal. Inside a control block at depth 1 nothing else has that
+# shape (every other line is `Name =value`, `Begin ...` or `End`).
+_WRAPPED_VALUE_RE = re.compile(r'^"(.*)"\s*$')
+
+_ACCESS_ESCAPE_RE = re.compile(r"\\(\d{3})")
+
+
+def join_wrapped_value(lines: list[str], idx: int, value: str) -> tuple[str, int]:
+    r"""Join the continuation lines SaveAsText writes after a long property value.
+
+    Access splits any long quoted value across several physical lines::
+
+        ControlSource ="=FormatPercent(((Nz([a])+Nz([b])-Nz([c]))*1"
+            "00)/Nz([Total])/100)"
+
+    Reading only the first line yields a syntactically plausible expression that
+    means something else entirely, with nothing in the output to say so.
+
+    ``idx`` indexes the ``Name =value`` line and ``value`` is the raw right-hand
+    side; returns (full value, last index consumed). Fragments are concatenated
+    WITHOUT a separator and their quotes removed by position, which is how
+    Access split them.
+
+    With no continuation line the result is the plain ``.strip('"')`` of the
+    value — byte-identical to the pre-v0.7.61 behaviour, so the 99% case is
+    untouched.
+    """
+    v = value.strip()
+    if not v.startswith('"'):
+        return v.strip('"'), idx
+
+    frags: list[str] = []
+    j = idx + 1
+    while j < len(lines):
+        m = _WRAPPED_VALUE_RE.match(lines[j].rstrip("\r\n").strip())
+        if not m:
+            break
+        frags.append(m.group(1))
+        j += 1
+
+    if not frags:
+        return v.strip('"'), idx
+
+    head = v[1:-1] if len(v) >= 2 and v.endswith('"') else v[1:]
+    return head + "".join(frags), j - 1
+
+
+def decode_access_escapes(s: str) -> str:
+    r"""Decode the octal escapes SaveAsText writes for embedded characters.
+
+    A caption holding a line break exports as ``\015\012`` and an embedded
+    quote as ``\042``. This is for display only — the raw value stays the
+    source of truth, because that is what LoadFromText expects back.
+    """
+    def _sub(m) -> str:
+        try:
+            return chr(int(m.group(1), 8))
+        except ValueError:      # 8 and 9 are not octal digits — leave as-is
+            return m.group(0)
+    return _ACCESS_ESCAPE_RE.sub(_sub, s)

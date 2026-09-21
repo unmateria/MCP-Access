@@ -1,5 +1,105 @@
 # Changelog
 
+## 0.7.61 — 2026-09-21
+
+**The export has continuation lines too.** Field report from several long
+sessions using this server as a read-only archaeology tool: reading an old
+Access application to reimplement its logic elsewhere.
+
+### The problem
+
+`SaveAsText` splits any long quoted property value across several physical
+lines. `_parse_controls` read properties with a per-line regex, so it kept the
+first fragment and dropped the rest **in silence**:
+
+```
+ControlSource ="=FormatPercent(((Nz([a])+Nz([b])-Nz([c]))*1"
+    "00)/Nz([Total])/100)"
+```
+
+`access_list_controls` returned
+`=FormatPercent(((Nz([a])+Nz([b])-Nz([c]))*1` — an expression that parses, that
+looks complete, and that multiplies by one instead of a hundred. No ellipsis, no
+`truncated`, nothing in the payload to say a value had been cut. In the case
+that motivated the report it reached production as figures 100× too large, and a
+person caught it the next day — not a test.
+
+Same class of defect as the VBA ` _` continuations fixed in 0.7.60, in the other
+text format this server reads. Same rule applies: **what the server returns as a
+property's value is the whole property, or it is not returned.**
+
+### The fix
+
+`helpers.join_wrapped_value` re-assembles the value. A continuation line is,
+after `.strip()`, only a quoted literal — at depth 1 inside a control block
+nothing else has that shape — and fragments are concatenated with no separator,
+their quotes removed by position, which is how Access split them.
+
+With no continuation the result is byte-identical to 0.7.60, so the 99% case is
+untouched. Depth tracking is unaffected: continuation lines are neither `Begin`
+nor `End`.
+
+Fixed everywhere the parser feeds: `access_list_controls`,
+`access_get_control`, the lint model, and `access_find_usages`'s
+`control_matches`.
+
+### `access_search_controls` — new tool (69 total)
+
+Searches text or regex in the control properties of every form/report, on a new
+pure scanner (`_scan_control_properties`) shared with `access_find_usages`:
+
+- default haystack `CONTROL_SEARCH_PROPS_EXTENDED` — the existing set plus
+  `Caption`, `Filter`, `OrderBy`, `Tag`; `properties=["all"]` searches every
+  property of the block (`OnClick`, `StatusBarText`, `Picture`…);
+- matching runs on the **joined** value, so a term falling across the split is
+  found — which the old line-by-line loop could not do;
+- each hit carries the owning control, its type, the property, the full value
+  and the physical `line` in the export (feed it to `access_get_code`);
+- form/report-level properties (`RecordSource`, `Filter`, `OrderBy`) come back
+  with `control: ""` and `scope: "form"`;
+- the block's `Name` is resolved when the block **closes** — Access does not
+  guarantee `Name =` precedes the property citing it;
+- same failure contract as the other multi-object scans: `errors`,
+  `objects_skipped`, `warning`. A `total_matches: 0` is never a lie about an
+  object that could not be read.
+
+`access_find_usages`'s `control_matches` now runs on the same scanner: whole
+values, hits it used to miss, plus `control_name` and `line` on every match. Its
+property set stays the narrower `CONTROL_SEARCH_PROPS` — it already sweeps VBA +
+queries + controls and a wider default would only make it noisier.
+
+### Ergonomics
+
+- **`caption_text` / `control_source_text`** — `decode_access_escapes` resolves
+  the octal escapes Access writes for embedded characters (`\015\012` = CRLF,
+  `\042` = quote). Added **only when the value contains an escape**, so no
+  control gains a field for nothing. The raw value stays the source of truth:
+  it is what `LoadFromText` expects back.
+- **`access_list_controls(fields=[...])`** — keep only the keys you need. A
+  60-control form is mostly geometry that whoever is reading business logic
+  never looks at, and pays for on every call. `name` is always included; an
+  unknown field raises and lists the valid ones. Without `fields`, output is
+  unchanged.
+- **`access_vbe_search_all(context_lines=N)`** — 0 to 10 lines of surrounding
+  code per match, as `context: {before, after}`. At 0 (the default) the output
+  is byte-identical. Saves a follow-up read of the whole procedure.
+- **`access_get_control`** now states in its description that `raw_block` is the
+  unabridged definition and the place to go for a property
+  `access_list_controls` does not return.
+- **`access_tips('controls')`** documents the split, the joining, the escapes
+  and when to reach for `access_search_controls`.
+
+### Notes
+
+- `lint._extract_style` deliberately does **not** use the new helper: it reads
+  style keys only (colours, font names, sizes), values far too short for Access
+  to split. A comment there says so.
+- The report also notes what did *not* happen across all those sessions: no
+  hang, no orphaned COM process, no database left locked. Nothing to fix, worth
+  recording.
+- `tests/test_control_property_wrap.py` — 16 pure tests, no COM, including the
+  exact key set of an unwrapped control as a non-regression pin.
+
 ## 0.7.60 — 2026-09-21
 
 **A search hit is a locator, not the source.** Feature request by

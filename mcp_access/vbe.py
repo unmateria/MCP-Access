@@ -7,9 +7,7 @@ only imports updated to point at the refactored package structure.
 
 import difflib
 import html as html_mod
-import os
 import re
-import tempfile
 import threading
 from typing import Any
 
@@ -21,7 +19,7 @@ from .constants import (
     VBE_PREFIX, AC_FORM, AC_REPORT, AC_SAVE_YES, AC_DESIGN,
     CONTROL_SEARCH_PROPS,
 )
-from .helpers import text_matches, read_tmp
+from .helpers import text_matches
 
 
 # ---------------------------------------------------------------------------
@@ -1091,14 +1089,26 @@ def ac_vbe_find(
     return {"found": bool(matches), "match_count": len(matches), "matches": matches}
 
 
+_CONTEXT_LINES_CAP = 10
+
+
 def ac_vbe_search_all(
     db_path: str, search_text: str, match_case: bool = False,
     max_results: int = 100, use_regex: bool = False,
+    context_lines: int = 0,
 ) -> dict:
     """
     Searches text (or regex) in ALL VBA modules (modules, forms, reports) of the database.
     Returns {total_matches, results: [...], truncated?: bool}.
+
+    ``context_lines`` (0..10) adds ``context: {before, after}`` to every match,
+    saving a follow-up read of the surrounding procedure. At 0 — the default —
+    the output is byte-identical to a call without the argument.
     """
+    try:
+        context_lines = max(0, min(int(context_lines), _CONTEXT_LINES_CAP))
+    except (TypeError, ValueError):
+        context_lines = 0
     # Lazy import to avoid circular dependency (code.py may import from vbe.py)
     from .code import ac_list_objects
 
@@ -1136,6 +1146,14 @@ def ac_vbe_search_all(
                     cont_index = _continuation_index(obj_lines)
                     for m in obj_matches:
                         _add_continuation(m, cont_index)
+                        if context_lines:
+                            i0 = m["line"] - 1
+                            m["context"] = {
+                                "before": [l.rstrip("\r") for l in
+                                           obj_lines[max(0, i0 - context_lines):i0]],
+                                "after":  [l.rstrip("\r") for l in
+                                           obj_lines[i0 + 1:i0 + 1 + context_lines]],
+                            }
                     results.append({
                         "object_type": obj_type,
                         "object_name": obj_name,
@@ -1247,10 +1265,16 @@ def ac_find_usages(
         total += qry_result["total_matches"]
         truncated = qry_result.get("truncated", False)
 
-    # 3. Control property matches — search in exports of forms/reports
+    # 3. Control property matches — search in exports of forms/reports.
+    #    Runs on the same pure scanner as access_search_controls: the old
+    #    line-by-line loop compared physical lines, so a term that fell across
+    #    a wrapped value's split was never found and the value it reported was
+    #    the first half only. The property set stays CONTROL_SEARCH_PROPS —
+    #    see access_search_controls for a wider or configurable haystack.
     control_matches: list[dict] = []
     if not truncated:
-        app = _Session.connect(db_path)
+        from .controls import _scan_control_properties
+        from .code import ac_get_code
         objects = ac_list_objects(db_path, "all")
         for obj_type in ("form", "report"):
             if truncated:
@@ -1259,32 +1283,8 @@ def ac_find_usages(
                 if truncated:
                     break
                 try:
-                    fd, tmp = tempfile.mkstemp(suffix=".txt", prefix="access_mcp_")
-                    os.close(fd)
-                    try:
-                        app.SaveAsText(AC_TYPE[obj_type], obj_name, tmp)
-                        raw_text, _enc = read_tmp(tmp)
-                    finally:
-                        try:
-                            os.unlink(tmp)
-                        except OSError:
-                            pass
-                    for line in raw_text.splitlines():
-                        stripped = line.strip()
-                        for prop in CONTROL_SEARCH_PROPS:
-                            if stripped.startswith(prop + " ="):
-                                value_part = stripped[len(prop) + 2:].strip()
-                                if text_matches(search_text, value_part, match_case, use_regex):
-                                    control_matches.append({
-                                        "object_type": obj_type,
-                                        "object_name": obj_name,
-                                        "property": prop,
-                                        "value": value_part,
-                                    })
-                                    total += 1
-                                    if total >= max_results:
-                                        truncated = True
-                                    break
+                    text = ac_get_code(db_path, obj_type, obj_name)
+                    entries = _scan_control_properties(text, CONTROL_SEARCH_PROPS)
                 except Exception as exc:
                     skipped += 1
                     if len(errors) < _SEARCH_ERROR_CAP:
@@ -1293,6 +1293,21 @@ def ac_find_usages(
                             "error": str(exc).splitlines()[0] if str(exc) else repr(exc),
                         })
                     continue
+                for e in entries:
+                    if not text_matches(search_text, e["value"], match_case, use_regex):
+                        continue
+                    control_matches.append({
+                        "object_type":  obj_type,
+                        "object_name":  obj_name,
+                        "control_name": e["control"],
+                        "property":     e["property"],
+                        "value":        e["value"],
+                        "line":         e["line"],
+                    })
+                    total += 1
+                    if total >= max_results:
+                        truncated = True
+                        break
 
     out: dict = {
         "search_text": search_text,
