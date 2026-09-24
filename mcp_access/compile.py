@@ -448,13 +448,13 @@ def _check_blocks_in_module(module_name: str, lines: list, errors: list):
             i += 1
             continue
 
-        if upper == "LOOP" or re.match(r"LOOP\s+(?:WHILE|UNTIL)\s", upper):
+        if re.match(r"LOOP\b", upper):
             if stack and stack[-1][0] == "Do":
                 stack.pop()
             i += 1
             continue
 
-        if upper == "WEND":
+        if re.match(r"WEND\b", upper):
             if stack and stack[-1][0] == "While":
                 stack.pop()
             i += 1

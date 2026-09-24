@@ -5,7 +5,7 @@ Linked tables, relationships, VBA references, indexes.
 import re
 from typing import Any, Optional
 
-from .core import _Session, log
+from .core import _Session, log, _get_vb_project
 from .constants import REL_ATTR, DB_ATTACH_SAVE_PWD
 
 
@@ -371,7 +371,7 @@ def ac_list_references(db_path: str) -> dict:
     """Lists all VBA references in the project."""
     app = _Session.connect(db_path)
     try:
-        refs_col = app.VBE.ActiveVBProject.References
+        refs_col = _get_vb_project(app).References
     except Exception as exc:
         raise RuntimeError(f"Could not access VBE. Error: {exc}")
     def _prop(ref, name, default=None):
@@ -430,7 +430,7 @@ def ac_manage_reference(
     """Adds or removes a VBA reference from the project."""
     app = _Session.connect(db_path)
     try:
-        refs = app.VBE.ActiveVBProject.References
+        refs = _get_vb_project(app).References
     except Exception as exc:
         raise RuntimeError(f"Could not access VBE. Error: {exc}")
 
