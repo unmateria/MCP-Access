@@ -797,6 +797,7 @@ the user to **restart** the server (the var is read at startup).
 - `ProcCountLines` can inflate the last proc's count past end of module — always clamp with `min(count, total - start + 1)`
 - Access must be `Visible = True` for VBE COM access to work
 - *"Trust access to the VBA project object model"* must be enabled in Access Trust Center
+- **Never read `VBE.ActiveVBProject`** — use `_get_vb_project(app)`. A referenced library database is loaded into the same `VBProjects` collection, and right after opening the host the active project is the library (measured, Access 2016). `tests/test_referenced_library.py` fails if it comes back (v0.7.63, PR #40).
 
 ### CreateForm via COM shows "Save As" MsgBox
 - **Do NOT** call `CreateForm()` directly followed by `_save_and_close()`.

@@ -1231,18 +1231,23 @@ def _get_vb_project(app):
     try:
         projects = app.VBE.VBProjects
         count = projects.Count
-        norm_candidates = {
-            os.path.normcase(os.path.abspath(c)) for c in candidates if c
-        }
-        if norm_candidates:
+        if candidates:
+            by_path = {}
             for i in range(1, count + 1):
                 try:
                     proj = projects(i)
                     fname = getattr(proj, "FileName", "") or ""
-                    if fname and os.path.normcase(os.path.abspath(fname)) in norm_candidates:
-                        return proj
+                    if fname:
+                        by_path.setdefault(
+                            os.path.normcase(os.path.abspath(fname)), proj)
                 except Exception:
                     continue
+            # Candidate order is the priority: a stale _db_open that names a
+            # referenced library must not win over the live host path.
+            for c in candidates:
+                proj = by_path.get(os.path.normcase(os.path.abspath(c)))
+                if proj is not None:
+                    return proj
         # Fallback: first project
         return projects(1)
     except Exception:

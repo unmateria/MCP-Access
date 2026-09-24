@@ -82,8 +82,7 @@ def _lint_form_modules(app) -> list:
 
     warnings = []
     try:
-        vbe = app.VBE
-        proj = vbe.ActiveVBProject
+        proj = _get_vb_project(app)
         for comp in proj.VBComponents:
             if comp.Type != 100:  # vbext_ct_Document -- Access form/report modules
                 continue
@@ -258,8 +257,7 @@ def _verify_module_structure(app) -> list:
     """
     errors = []
     try:
-        vbe = app.VBE
-        proj = vbe.ActiveVBProject
+        proj = _get_vb_project(app)
         for comp in proj.VBComponents:
             if comp.Type not in (1, 100):  # standard modules + form/report
                 continue
@@ -287,8 +285,7 @@ def _find_block_mismatches(app) -> list:
 
     errors = []
     try:
-        vbe = app.VBE
-        proj = vbe.ActiveVBProject
+        proj = _get_vb_project(app)
         for comp in proj.VBComponents:
             if comp.Type not in (1, 100):  # standard modules + form/report
                 continue

@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.7.63 — 2026-09-24
+
+**Databases that reference a library database.** Reported and fixed by
+@profesor-franhuertas in PR #40, thanks!
+
+### The problem
+
+Access loads a referenced library's VBA project (`.accda`, `.accde`, or an
+`.accdb` used as a library) into the same `VBE.VBProjects` collection as the
+host database. Measured on Access 2016: right after opening a host that
+references a library, `VBE.ActiveVBProject` is the **library**. Every tool
+that read the active project was working on the wrong one:
+
+- `access_list_references` listed the library's references (and missed the
+  reference to the library itself); `access_manage_reference` could remove a
+  reference from the wrong project.
+- `access_compile_vba`'s structural checks (block mismatches, code outside a
+  procedure) and its form-control event check scanned the library.
+
+Separately, the block checker did not recognise `Loop` or `Wend` followed by a
+comment (`Loop  ' end of pass`), so `access_vbe_check_syntax` and
+`access_compile_vba` reported a false "Block Do without End Do".
+
+### The fix
+
+- `_get_vb_project` matches the project's `FileName` against the live
+  `CurrentProject.FullName` first and the cached `_Session._db_open` second,
+  in that order: a stale cache naming the library can no longer win.
+- `access_list_references`, `access_manage_reference` and the three remaining
+  checks in `compile.py` resolve the project with `_get_vb_project`. No code
+  path reads `VBE.ActiveVBProject` any more, and a test enforces it.
+- `Loop` / `Wend` are matched on a word boundary, so a trailing comment no
+  longer leaves the block open. `LoopCount = …` still does not close a `Do`.
+
+Verified against a live Access 2016 with a host referencing a library:
+before, `access_list_references` returned the library's 4 references and
+`access_vbe_check_syntax` flagged a false error; after, the host's 5 and none.
+
 ## 0.7.62 — 2026-09-21
 
 **A closing quote the parser had been eating since long before v0.7.61.** Found
