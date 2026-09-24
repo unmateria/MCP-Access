@@ -1207,22 +1207,39 @@ def _get_vb_project(app):
     """Return the VBProject that belongs to the current database.
 
     ``app.VBE.VBProjects(1)`` may return the wrong project (e.g. the
-    ``acwzmain`` wizard library) after a decompile+compact cycle.  This
-    helper enumerates all loaded VBProjects and picks the one whose
-    ``.FileName`` matches ``_Session._db_open``.  Falls back to index 1
-    if no match is found (single-project scenario).
+    ``acwzmain`` wizard library after a decompile+compact cycle, or any
+    referenced library database) -- Access flattens
+    every referenced project into the same ``VBProjects`` collection
+    alongside the host, and index 1 is NOT guaranteed to be the host once
+    any library reference is present. This helper enumerates all loaded
+    VBProjects and picks the one whose ``.FileName`` matches the actual
+    open file, matched primarily against the LIVE ``CurrentProject.FullName``
+    (authoritative -- asks Access directly) and secondarily against the
+    cached ``_Session._db_open`` (can desync from the live state). Falls
+    back to index 1 only if neither matches (single-project scenario).
     """
-    db_path = _Session._db_open
+    candidates = []
+    try:
+        cp_path = app.CurrentProject.FullName
+        if cp_path:
+            candidates.append(cp_path)
+    except Exception:
+        pass
+    if _Session._db_open:
+        candidates.append(_Session._db_open)
+
     try:
         projects = app.VBE.VBProjects
         count = projects.Count
-        if db_path:
-            db_norm = os.path.normcase(os.path.abspath(db_path))
+        norm_candidates = {
+            os.path.normcase(os.path.abspath(c)) for c in candidates if c
+        }
+        if norm_candidates:
             for i in range(1, count + 1):
                 try:
                     proj = projects(i)
                     fname = getattr(proj, "FileName", "") or ""
-                    if fname and os.path.normcase(os.path.abspath(fname)) == db_norm:
+                    if fname and os.path.normcase(os.path.abspath(fname)) in norm_candidates:
                         return proj
                 except Exception:
                     continue
