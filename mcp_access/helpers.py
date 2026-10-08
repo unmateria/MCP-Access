@@ -110,41 +110,139 @@ def strip_binary_sections(text: str) -> str:
     return "".join(result)
 
 
-def extract_binary_blocks(text: str) -> dict[str, str]:
+_TOP_BEGIN_RE = re.compile(r"^Begin\s+(?:Form|Report)\s*$", re.IGNORECASE)
+_BINARY_PROP_RE = re.compile(r"^(\s*)(\w+)\s*=\s*Begin\s*$")
+_NAME_RE = re.compile(r'^Name\s*=\s*"(.*)"\s*$')
+_PROP_RE = re.compile(r"^(\w+)\s*=")
+
+
+def _owner_frames(lines: list[str]) -> list[dict]:
     """
-    Extracts binary Begin...End blocks from the original export.
-    Returns {section_name: full_block_text}.
+    Walks a form/report export and returns one record per owner block: the
+    top-level Form/Report (key ""), each section and each control (key = its
+    `Name`, None for the nameless prototypes of the defaults block).  The key
+    is resolved when the owner closes: Access does not guarantee `Name =`
+    comes first.
+
+    Per owner:
+    - `binary`: {block name: (anchor, text)} for its own `X = Begin ... End`
+      binary blocks, `anchor` being the property right before the block
+      ("" = first thing in the owner);
+    - `props`: {property name: index of its last physical line}, wrapped
+      continuation lines included, plus "" for the owner's `Begin` line;
+    - `insert`: its first bare child `Begin`, else its own closing `End`.
+      LoadFromText rejects a property after the child block
+      ("Expected: 'End'. Found: RecSrcDt").
     """
-    blocks: dict[str, str] = {}
-    lines = text.splitlines(keepends=True)
+    frames: list[dict] = []
+    # dict = owner, None = bare `Begin`, str = non-binary `X = Begin` block
+    stack: list[dict | str | None] = []
+    top_seen = False
     i = 0
     while i < len(lines):
-        line = lines[i]
-        rstripped = line.rstrip("\r\n")
-        stripped = rstripped.lstrip()
-        indent = rstripped[: len(rstripped) - len(stripped)]
+        rstripped = lines[i].rstrip("\r\n")
+        s = rstripped.strip()
+        owner = stack[-1] if stack and isinstance(stack[-1], dict) else None
 
-        m = re.match(r"^(\s*)(\w+)\s*=\s*Begin\s*$", rstripped)
-        if m and m.group(2) in BINARY_SECTIONS:
-            section = m.group(2)
-            block_lines = [line]
-            j = i + 1
-            while j < len(lines):
-                bl = lines[j]
-                bl_r = bl.rstrip("\r\n")
-                bl_s = bl_r.lstrip()
-                bl_indent = bl_r[: len(bl_r) - len(bl_s)]
-                block_lines.append(bl)
-                if bl_s == "End" and bl_indent == indent:
-                    break
-                j += 1
-            blocks[section] = "".join(block_lines)
-            i = j + 1
-            continue
-
+        if s == "End":
+            frame = stack.pop() if stack else None
+            if isinstance(frame, dict):
+                if frame["insert"] is None:
+                    frame["insert"] = i
+                frames.append(frame)
+            elif isinstance(frame, str) and stack and isinstance(stack[-1], dict):
+                stack[-1]["props"][frame] = i
+        elif s == "Begin":
+            if owner is not None and owner["insert"] is None:
+                owner["insert"] = i
+            stack.append(None)
+        elif s.startswith("Begin "):
+            is_top = not top_seen and bool(_TOP_BEGIN_RE.match(s))
+            top_seen = top_seen or is_top
+            indent = rstripped[: len(rstripped) - len(rstripped.lstrip())]
+            stack.append({"key": "" if is_top else None, "insert": None,
+                          "indent": indent + "    ", "binary": {},
+                          "props": {"": i}, "last": ""})
+        else:
+            m = _BINARY_PROP_RE.match(rstripped)
+            if m and m.group(2) in BINARY_SECTIONS and owner is not None:
+                j = i + 1
+                while j < len(lines):
+                    bl = lines[j].rstrip("\r\n")
+                    if bl.strip() == "End" and bl[: len(bl) - len(bl.lstrip())] == m.group(1):
+                        break
+                    j += 1
+                owner["binary"][m.group(2)] = (owner["last"], "".join(lines[i:j + 1]))
+                i = j + 1
+                continue
+            if m:
+                if owner is not None:
+                    owner["last"] = m.group(2)
+                stack.append(m.group(2))
+            elif owner is not None:
+                p = _PROP_RE.match(s)
+                if p:
+                    owner["last"] = p.group(1)
+                    if owner["key"] is None and p.group(1) == "Name":
+                        n = _NAME_RE.match(s)
+                        if n:
+                            owner["key"] = n.group(1)
+                if p or s.startswith('"'):
+                    owner["props"][owner["last"]] = i
         i += 1
+    return frames
 
-    return blocks
+
+def extract_binary_blocks(text: str) -> dict[str, dict[str, tuple[str, str]]]:
+    """
+    Extracts the binary Begin...End blocks of an export, grouped by owner:
+    {"": {form-level blocks}, "<section or control name>": {"GUID": ...}},
+    each block as (anchor property, text).
+
+    Sections and controls carry their own `GUID = Begin` blocks.  Keying by
+    block name alone let the last one (the FormFooter's) overwrite the form's
+    GUID and dropped the rest, which Access does not regenerate.
+    """
+    lines = text.splitlines(keepends=True)
+    return {f["key"]: f["binary"] for f in _owner_frames(lines)
+            if f["key"] is not None and f["binary"]}
+
+
+def _reindent(block: str, indent: str) -> str:
+    lines = block.splitlines(keepends=True)
+    base = lines[0][: len(lines[0]) - len(lines[0].lstrip())]
+    text = "".join(indent + l[len(base):] if l.startswith(base) else l for l in lines)
+    return text if text.endswith("\n") else text + "\n"
+
+
+def inject_binary_blocks(code: str, blocks: dict[str, dict[str, tuple[str, str]]]) -> str:
+    """
+    Puts each owner's binary blocks back inside the same owner (matched by
+    name) in `code`, right after the property that preceded them in the
+    original export, so an unedited round trip reproduces Access's own layout
+    byte for byte.  If the anchor property is gone, the block goes before the
+    owner's child block.  Blocks whose owner no longer exists (control
+    renamed or deleted) are dropped.
+    """
+    lines = code.splitlines(keepends=True)
+    inserts: dict[int, list[str]] = {}
+    restored = 0
+    for frame in _owner_frames(lines):
+        found = blocks.get(frame["key"]) if frame["key"] is not None else None
+        if not found:
+            continue
+        restored += 1
+        for anchor, text in found.values():
+            pos = frame["props"][anchor] + 1 if anchor in frame["props"] else frame["insert"]
+            inserts.setdefault(pos, []).append(_reindent(text, frame["indent"]))
+    log.info("inject_binary_blocks: restored blocks for %d of %d owners",
+             restored, len(blocks))
+
+    result: list[str] = []
+    for i, line in enumerate(lines):
+        result.extend(inserts.get(i, ()))
+        result.append(line)
+    return "".join(result)
 
 
 def restore_binary_sections(app: Any, object_type: str, name: str, new_code: str) -> str:
@@ -169,50 +267,7 @@ def restore_binary_sections(app: Any, object_type: str, name: str, new_code: str
     blocks = extract_binary_blocks(original)
     if not blocks:
         return new_code
-
-    # Inject binary blocks before the OUTER closing `End` of the top-level
-    # Form/Report.  Subforms have their own nested Begin Form...End that
-    # would confuse a simple "first End after Begin Form" approach, so we
-    # track full block depth (Begin <Type> AND `prop = Begin` multi-line
-    # values like `NameMap = Begin`).  When depth returns to the level the
-    # outer Form was opened at, that End is the one we want.
-    _top_begin_re = re.compile(r"^Begin\s+(?:Form|Report)\s*$", re.IGNORECASE)
-    _begin_any_re = re.compile(r"^Begin\b")
-    _begin_prop_re = re.compile(r"^\w+\s*=\s*Begin\s*$")
-    lines = new_code.splitlines(keepends=True)
-    result: list[str] = []
-    depth = 0
-    top_depth = -1   # depth at which the outermost Form/Report was opened
-    injected = False
-
-    for line in lines:
-        stripped = line.strip()
-
-        if not injected and top_depth == -1 and _top_begin_re.match(stripped):
-            top_depth = depth
-            depth += 1
-            result.append(line)
-            continue
-        if _begin_any_re.match(stripped) or _begin_prop_re.match(stripped):
-            depth += 1
-            result.append(line)
-            continue
-        if stripped == "End":
-            depth -= 1
-            # The End that brings us back to top_depth closes the outermost
-            # Form/Report — inject the binary blocks right before it.
-            if not injected and top_depth != -1 and depth == top_depth:
-                for block_text in blocks.values():
-                    result.append(block_text)
-                    if not block_text.endswith("\n"):
-                        result.append("\n")
-                injected = True
-            result.append(line)
-            continue
-
-        result.append(line)
-
-    return "".join(result)
+    return inject_binary_blocks(new_code, blocks)
 
 
 # ---------------------------------------------------------------------------

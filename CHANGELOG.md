@@ -1,5 +1,100 @@
 # Changelog
 
+## 0.7.64 — 2026-10-08
+
+**A form exported with `access_get_code` could not be imported back.** Bug
+report, root cause, suggested fix and two follow-up findings by
+[@TvanStiphout-Home](https://github.com/TvanStiphout-Home) (Tom van Stiphout):
+**thank you Tom**, once again a diagnosis that pointed at the exact line.
+No new tool (still **69**).
+
+### The problem
+
+`access_get_code` strips the binary blocks (`RecSrcDt`, `GUID`, `NameMap`,
+`PrtMip`, `PrtDevMode`…) and `access_set_code` restores them from the current
+object before `LoadFromText`. The restore appended them just before the form's
+closing `End`, i.e. after the sections block, where Access accepts nothing but
+`End`:
+
+```
+Error encountered at line 56.
+Expected: 'End'.  Found: RecSrcDt.
+```
+
+So `access_get_code` → `access_set_code`, the round trip the two tools exist
+for, failed on every form and report. The backup was restored, so nothing was
+lost, but each attempt left another `errors*.txt` next to the database.
+
+Tom also suspected, correctly, two problems on the same path. Verified on a
+real export: sections and controls carry their own `GUID = Begin` blocks
+(a minimal form with a header and one text box has five), and
+
+- the restore kept one block per name, so the last `GUID` in the file (the
+  FormFooter's) was the one restored as the **form's** GUID;
+- every section and control GUID was dropped on the round trip, and Access
+  does not regenerate them, not even after a save in Design view.
+
+### The fix
+
+- Binary blocks are now collected **per owner**: the form/report itself, and
+  each section and control by its `Name`.
+- Each block goes back inside the same owner, **right after the property it
+  followed in the original export** (the safest option Tom suggested). The
+  position Tom proposed first, just before the sections `Begin`, is also
+  accepted by Access (tested), but anchoring reproduces Access's own layout
+  exactly instead of relying on it tolerating another order. If that property
+  is gone, the block goes before the owner's child `Begin`, and before its
+  `End` only when it has no children. A wrapped value or a `ConditionalFormat = Begin`
+  block before the anchor is handled, and a control moved into a tab page is
+  re-indented.
+- A block whose owner no longer exists (renamed or deleted control) is
+  dropped, which is all Access would do with it anyway.
+
+Verified against Access (Microsoft 365): `strip` + restore reproduces the
+export **byte for byte** (minus `Checksum`) for a form with header/footer,
+attached label, tab control with a control on a page and an option group,
+and for a report with `PrtMip` / `PrtDevMode`. Tom's repro now imports,
+without `errors.txt`, keeping every GUID.
+
+One thing no fix can change, measured 3 out of 3 times: Access keeps a
+form's `NameMap` (Name AutoCorrect tracking) only when the imported text
+carries a **valid** `Checksum`, i.e. when it was not edited. Any edit
+invalidates it and Access drops the `NameMap`. That includes the
+`access_export_text` → edit → `access_import_text` route. It is not
+regenerated afterwards.
+
+### Added: section properties
+
+Also from Tom: there was no way to set a section's properties.
+`Section(0).BackColor` is not a property name, and pywin32 cannot call the
+parameterized `Form.Section(n)` (`-2147352573 member not found`), so the text
+import was the only route. `access_set_form_property` and
+`access_get_form_property` now take an optional **`section`** (number 0–8 or
+name: `Detail`, `FormHeader`/`ReportHeader`, `PageHeader`, `GroupLevel1Header`…).
+`Section(n)` is invoked through the raw IDispatch, which works for every
+section of forms and reports. The named accessors (`obj.Detail`) are no
+substitute: `ReportHeader` does not resolve on a report. Without `section`
+both tools behave exactly as before.
+
+```
+access_set_form_property(db, "form", "frmOrders", {"BackColor": 15132390, "Height": 6000}, section="Detail")
+```
+
+### Docs
+
+- README: the manual install line was `pip install mcp pywin32`. It missed
+  Pillow (Tom's finding) and, worse, did not pin `mcp<2`, so it installs the
+  v2 SDK, with which the server does not start (see 0.7.57). Now
+  `pip install "mcp>=1.0.0,<2" pywin32 pillow`, matching `pyproject.toml`.
+
+### Tests
+
+- `tests/test_binary_sections.py`: 10 pure tests, no COM. They cover the
+  exact round trip, nothing but `End` after the sections block, the form's
+  GUID not overwritten, the anchors (wrapped value, `ConditionalFormat`), and
+  the fallbacks (anchor gone, owner renamed, owner moved deeper, no sections
+  block).
+
 ## 0.7.63 — 2026-09-24
 
 **Databases that reference a library database.** Reported and fixed by

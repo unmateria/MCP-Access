@@ -1084,12 +1084,40 @@ def ac_set_control_props(
 # ac_set_form_property / ac_get_form_property
 # ---------------------------------------------------------------------------
 
+def _get_section_obj(obj: Any, section) -> Any:
+    """
+    Returns Form/Report.Section(n).  pywin32's late binding cannot call that
+    parameterized property (`obj.Section(0)` raises -2147352573 "member not
+    found"), so it is invoked through the raw IDispatch.  The named accessors
+    are no substitute: `ReportHeader` does not resolve on a report.
+    """
+    import pythoncom
+    import win32com.client
+
+    index = _resolve_section(section)
+    dispid = obj._oleobj_.GetIDsOfNames(0, "Section")
+    try:
+        raw = obj._oleobj_.Invoke(
+            dispid, 0, pythoncom.DISPATCH_PROPERTYGET | pythoncom.DISPATCH_METHOD,
+            True, index)
+    except pythoncom.com_error as exc:
+        raise ValueError(
+            f"Section {section!r} (index {index}) does not exist on this "
+            f"form/report. Header/footer and group sections exist only once "
+            f"they are enabled. Access said: {exc}"
+        ) from None
+    return win32com.client.Dispatch(raw)
+
+
 def ac_set_form_property(
-    db_path: str, object_type: str, object_name: str, props: dict
+    db_path: str, object_type: str, object_name: str, props: dict,
+    section=None,
 ) -> dict:
     """
     Sets properties at the form/report level by opening in Design view.
     Useful for changing RecordSource, Caption, DefaultView, HasModule, etc.
+    With ``section`` (number or name, e.g. 0 / "Detail" / "FormHeader") the
+    properties go to that section instead (BackColor, Height, Visible...).
     props: dict {property: value}. Values are automatically converted to int/bool.
     Returns {"applied": [...], "errors": {...}}.
     """
@@ -1102,6 +1130,8 @@ def ac_set_form_property(
     errors: dict[str, str] = {}
     try:
         obj = _get_design_obj(app, object_type, object_name)
+        if section is not None:
+            obj = _get_section_obj(obj, section)
         for key, val in props.items():
             try:
                 setattr(obj, key, coerce_prop(val))
@@ -1119,9 +1149,11 @@ def ac_set_form_property(
 def ac_get_form_property(
     db_path: str, object_type: str, object_name: str,
     property_names: list[str] | None = None,
+    section=None,
 ) -> dict:
     """
-    Reads properties of a form/report by opening it in Design view.
+    Reads properties of a form/report by opening it in Design view, or of one
+    of its sections when ``section`` is given (number or name).
     If property_names is None, reads all readable properties.
     Returns {"object": str, "type": str, "properties": {...}}.
     """
@@ -1134,6 +1166,8 @@ def ac_get_form_property(
     errors: dict[str, str] = {}
     try:
         obj = _get_design_obj(app, object_type, object_name)
+        if section is not None:
+            obj = _get_section_obj(obj, section)
         if property_names:
             for pname in property_names:
                 try:
@@ -1156,6 +1190,8 @@ def ac_get_form_property(
         "type": object_type,
         "properties": properties,
     }
+    if section is not None:
+        result["section"] = section
     if errors:
         result["errors"] = errors
     return result

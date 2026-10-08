@@ -25,7 +25,7 @@ MCP server for reading and editing Microsoft Access databases (`.accdb`/`.mdb`) 
 - **Singleton COM session** (`_Session`): one `Access.Application` instance shared across all tool calls. Opening a different `.accdb` closes the previous one.
 - **Dedicated COM thread** (`_com_executor`): All tool calls run in a single-threaded `ThreadPoolExecutor` with `CoInitialize()`. This keeps COM in one STA thread while the asyncio event loop stays free to read/write stdio.
 - **Caches**: `_parsed_controls_cache` (control parsing) and `_Session._cm_cache` (CodeModule COM objects — live COM proxies). Both invalidated on DB switch, object modification, and design operations. There is **no** Python-side cache of VBE text: `_cm_all_code()` always reads via `cm.Lines(1, total)` so external edits (manual VBE edits, Ctrl+Z, add-ins) are picked up immediately. See issue #26 for the reason this cache was removed.
-- **Binary section handling**: `ac_get_code` strips PrtMip/PrtDevMode from form/report exports; `ac_set_code` restores them automatically before import.
+- **Binary section handling**: `ac_get_code` strips PrtMip/PrtDevMode/RecSrcDt/GUID/NameMap from form/report exports; `ac_set_code` restores them automatically before import — per owner and anchored, see "Binary block restore" below.
 
 ## Tools (69 total)
 
@@ -172,6 +172,52 @@ don't-grow-the-common-case reason.
 **closes**, not when it is read: Access does not guarantee `Name =` precedes
 the property citing it (in practice it usually follows). Nameless control
 blocks report nothing — those are the defaults block's prototypes.
+
+### Binary block restore (v0.7.64)
+
+Reported by @TvanStiphout-Home: until v0.7.63 the restore appended every block
+before the form's closing `End`, after the sections block, and `LoadFromText`
+rejected it ("Expected: 'End'. Found: RecSrcDt"). So `get_code` → `set_code`
+failed on every form and report. `helpers._owner_frames` is the single walker
+behind `extract_binary_blocks` and `inject_binary_blocks`. Rules, all measured
+on Access (Microsoft 365):
+
+- **Sections and controls have their own `GUID = Begin` blocks** (5 on a
+  minimal form with a header and one text box). Blocks are keyed **per owner**:
+  `""` = the form/report, otherwise the section or control `Name` (resolved
+  when the owner closes). Keying by block name alone made the FormFooter's
+  GUID overwrite the form's. Access does **not** regenerate a dropped
+  section/control GUID, not even on a Design-view save.
+- **Anchored, not just accepted.** Each block goes back right after the
+  property it followed in the original (`anchor`; wrapped continuation lines
+  and non-binary `X = Begin` blocks count as part of that property).
+  "Before the sections `Begin`" is also accepted by Access, but anchoring
+  reproduces the export exactly. (An early measurement blamed position for a
+  lost `NameMap`; it was the `Checksum` rule below.) Fallback when the anchor
+  is gone: the owner's first bare child `Begin`, else its own `End`.
+- **`NameMap` survives only an unedited import.** Access keeps it only when
+  the text carries a valid `Checksum` (3/3: absent or wrong → dropped, never
+  regenerated). Any real edit loses it, `access_import_text` included. Do NOT
+  chase this: the checksum algorithm is not known, and restoring the original
+  `Checksum` only helps a no-op round trip.
+- `strip` + `inject` reproduces an export **byte for byte** minus `Checksum`,
+  pinned by `tests/test_binary_sections.py`. If you touch the walker, that
+  test is the contract.
+- Duplicate `NoSaveCTIWhenDisabled =1` and a changed `PrtDevMode` after a
+  reimport are Access's own doing: it does the same with its own unmodified
+  export. Not ours.
+
+### Section properties (v0.7.64)
+
+`access_set_form_property` / `access_get_form_property` take `section`
+(`_resolve_section`: 0–8 or a `SECTION_MAP` name). `controls._get_section_obj`
+calls `Section(n)` through `_oleobj_.Invoke(dispid, 0,
+DISPATCH_PROPERTYGET | DISPATCH_METHOD, True, n)`, because pywin32 cannot call
+the parameterized property (`obj.Section(0)` → `-2147352573`). The raw invoke
+works for every section of forms and reports. The named accessors that
+`build_form._get_section` prefers do not: `obj.ReportHeader` fails on a
+report. A missing section (header not enabled) raises a ValueError that says
+so.
 
 ### VBE + Design view conflict
 After design operations (`ac_set_control_props`, `ac_create_control`, `ac_delete_control`), the form may remain open in Design view. All VBE write functions close the form first (DoCmd.Close with acSaveYes), invalidate `_cm_cache`, then access VBE. Without this: `"Catastrophic failure" (-2147418113)`. All design operations invalidate all three caches in their `finally` block.

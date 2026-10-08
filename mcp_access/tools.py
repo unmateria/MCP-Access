@@ -621,7 +621,11 @@ TOOLS = [
     ),
     types.Tool(
         name="access_set_form_property",
-        description="Sets form/report-level properties (RecordSource, Caption, DefaultView, HasModule, etc.) via COM in Design view.",
+        description=(
+            "Sets form/report-level properties (RecordSource, Caption, DefaultView, HasModule, etc.) "
+            "via COM in Design view. Pass 'section' to set properties of a section instead "
+            "(BackColor, Height, Visible, ...)."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
@@ -632,6 +636,15 @@ TOOLS = [
                     "type": "object",
                     "description": "Properties to modify: {RecordSource: 'Table', Caption: 'Title', HasModule: true, ...}",
                     "additionalProperties": True,
+                },
+                "section": {
+                    "type": "string",
+                    "description": (
+                        "Optional. Apply props to this section instead of the form/report: "
+                        "number 0-8 or name ('Detail', 'FormHeader'/'ReportHeader', "
+                        "'FormFooter'/'ReportFooter', 'PageHeader', 'PageFooter', "
+                        "'GroupLevel1Header', ...)."
+                    ),
                 },
             },
             "required": ["db_path", "object_type", "object_name", "props"],
@@ -1346,7 +1359,8 @@ TOOLS = [
         description=(
             "Reads properties of a form or report (RecordSource, Caption, DefaultView, "
             "HasModule, etc.). object_type ('form' or 'report') is required. "
-            "If property_names is omitted, returns all readable properties."
+            "If property_names is omitted, returns all readable properties. "
+            "Pass 'section' to read a section's properties instead."
         ),
         inputSchema={
             "type": "object",
@@ -1358,6 +1372,13 @@ TOOLS = [
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "List of properties to read. Omit to read all.",
+                },
+                "section": {
+                    "type": "string",
+                    "description": (
+                        "Optional. Read this section instead of the form/report: "
+                        "number 0-8 or name ('Detail', 'FormHeader', 'PageHeader', ...)."
+                    ),
                 },
             },
             "required": ["db_path", "object_type", "object_name"],

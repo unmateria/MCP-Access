@@ -41,7 +41,7 @@ Works with Claude Code, Cursor, Windsurf, Continue, or any MCP-compatible client
 ## Installation
 
 ```bash
-pip install mcp pywin32
+pip install "mcp>=1.0.0,<2" pywin32 pillow
 ```
 
 ### Enable VBA object model access
@@ -164,8 +164,8 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 |------|-------------|
 | `access_get_db_property` | Read a DB property (`CurrentDb.Properties`) or Access option (`GetOption`) |
 | `access_set_db_property` | Set a DB property or Access option — creates the property if it doesn't exist |
-| `access_get_form_property` | Read form or report properties (RecordSource, Caption, DefaultView, etc.). `object_type` required (`form` or `report`). Omit `property_names` for all |
-| `access_set_form_property` | Set form/report properties (RecordSource, Caption, DefaultView, HasModule, etc.) via COM in Design view |
+| `access_get_form_property` | Read form or report properties (RecordSource, Caption, DefaultView, etc.). `object_type` required (`form` or `report`). Omit `property_names` for all. `section` reads a section instead |
+| `access_set_form_property` | Set form/report properties (RecordSource, Caption, DefaultView, HasModule, etc.) via COM in Design view. `section` (`Detail`, `FormHeader`, 0–8…) targets a section: BackColor, Height, Visible… |
 
 ### Linked tables
 

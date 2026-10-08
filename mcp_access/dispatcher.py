@@ -346,6 +346,7 @@ def call_tool_sync(name: str, arguments: dict) -> str:
                 arguments["object_type"],
                 arguments["object_name"],
                 dict(arguments.get("props", {})),
+                section=arguments.get("section"),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -649,6 +650,7 @@ def call_tool_sync(name: str, arguments: dict) -> str:
                 arguments["object_type"],
                 arguments["object_name"],
                 property_names=arguments.get("property_names"),
+                section=arguments.get("section"),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
