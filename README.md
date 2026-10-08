@@ -35,7 +35,7 @@ Works with Claude Code, Cursor, Windsurf, Continue, or any MCP-compatible client
 
 - Windows (COM automation is Windows-only)
 - Microsoft Access installed (any version that supports VBE, 2010+)
-- Python 3.9+
+- Python 3.10+
 - *"Trust access to the VBA project object model"* enabled in Access Trust Center
 
 ## Installation
