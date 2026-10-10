@@ -771,7 +771,7 @@ class _Session:
 
     @classmethod
     def _detect_office_install(cls) -> None:
-        """Best-effort detection of the installed Office version and MSACCESS.EXE.
+        r"""Best-effort detection of the installed Office version and MSACCESS.EXE.
 
         Populates `cls._office_version` (string like "16.0") and `cls._office_msaccess`
         (absolute path to MSACCESS.EXE, or None).  ALWAYS leaves the class with
