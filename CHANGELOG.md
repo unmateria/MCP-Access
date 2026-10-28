@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Access session lifecycle
+
+Adapted from [Sachin's lifecycle proposal](https://github.com/lunasoft2001/MCP-Access/pull/1):
+
+- Release the session and balance COM initialization on the dedicated worker
+  when the stdio server exits, including transport errors.
+- Keep attached user-owned databases open when switching targets or creating
+  another database, preserving the existing attach-or-spawn policy.
+- Clear child proxies before quitting an MCP-owned instance, pump STA messages
+  while waiting for its PID to exit, and report a timeout without force-killing.
+- Return accurate disconnect/quit messages from `access_close`; an attached
+  instance (including an initially idle one) remains open after disconnect.
+- Add mocked lifecycle regression tests. Explicit compile/decompile and
+  maintenance behavior is unchanged.
+
 ## 0.7.64 — 2026-10-08
 
 **A form exported with `access_get_code` could not be imported back.** Bug

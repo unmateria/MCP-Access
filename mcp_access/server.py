@@ -12,7 +12,7 @@ import mcp.types as types
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 
-from .core import _Session, _com_executor, log
+from .core import _Session, _com_executor, log, shutdown_com_thread
 from .tools import TOOLS, coerce_arguments
 from .security import code_exec_enabled, CODE_EXEC_TOOLS
 
@@ -158,12 +158,21 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
 
 
 async def main() -> None:
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(
-            read_stream,
-            write_stream,
-            server.create_initialization_options(),
-        )
+    try:
+        async with stdio_server() as (read_stream, write_stream):
+            await server.run(
+                read_stream,
+                write_stream,
+                server.create_initialization_options(),
+            )
+    finally:
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(_com_executor, shutdown_com_thread)
+        except Exception as exc:
+            log.warning("Error shutting down COM session: %s", exc)
+        finally:
+            _com_executor.shutdown(wait=True)
 
 
 def cli() -> None:

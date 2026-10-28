@@ -22,8 +22,8 @@ MCP server for reading and editing Microsoft Access databases (`.accdb`/`.mdb`) 
 
 ## Architecture
 
-- **Singleton COM session** (`_Session`): one `Access.Application` instance shared across all tool calls. Opening a different `.accdb` closes the previous one.
-- **Dedicated COM thread** (`_com_executor`): All tool calls run in a single-threaded `ThreadPoolExecutor` with `CoInitialize()`. This keeps COM in one STA thread while the asyncio event loop stays free to read/write stdio.
+- **Singleton COM session** (`_Session`): one `Access.Application` instance shared across all tool calls. Switching databases closes the previous one only in MCP-owned instances; an occupied user-owned instance is released without closing it and another instance is acquired for the target.
+- **Dedicated COM thread** (`_com_executor`): All tool calls run in a single-threaded `ThreadPoolExecutor` with `CoInitialize()`. Server shutdown releases COM proxies and calls `CoUninitialize()` on that same worker, never from `atexit`.
 - **Caches**: `_parsed_controls_cache` (control parsing) and `_Session._cm_cache` (CodeModule COM objects — live COM proxies). Both invalidated on DB switch, object modification, and design operations. There is **no** Python-side cache of VBE text: `_cm_all_code()` always reads via `cm.Lines(1, total)` so external edits (manual VBE edits, Ctrl+Z, add-ins) are picked up immediately. See issue #26 for the reason this cache was removed.
 - **Binary section handling**: `ac_get_code` strips PrtMip/PrtDevMode/RecSrcDt/GUID/NameMap from form/report exports; `ac_set_code` restores them automatically before import — per owner and anchored, see "Binary block restore" below.
 
@@ -56,6 +56,20 @@ MCP server for reading and editing Microsoft Access databases (`.accdb`/`.mdb`) 
 | **Knowledge base** | `access_tips` |
 
 ## Key Implementation Details
+
+### Session disconnect and shutdown
+
+`access_close` reports whether it disconnected from user-owned Access (database
+left open) or quit an MCP-created instance. An idle user-owned instance may open
+the requested database and retains it after disconnect. Database switching and
+creation inspect live attached state, not just `_db_open`, before closing anything.
+
+Owned shutdown clears child COM proxies before `Quit`, releases the application
+proxy, then waits up to 10 seconds for the recorded PID while pumping STA
+messages. A timeout is an error, never a force-kill or a success response. An
+unavailable PID is explicitly reported as an unverified exit. Explicit
+compile/decompile and maintenance operations retain their existing behavior;
+these disconnect protections do not make those operations non-destructive.
 
 ### Encoding in ac_set_code
 - **Modules** (`.bas`): written using the system ANSI codepage (`locale.getpreferredencoding()`, typically `cp1252` on Western Windows) — no BOM.

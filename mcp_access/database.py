@@ -53,9 +53,10 @@ def ac_create_database(db_path: str) -> dict:
     # attaching to an Access instance that has a different database open —
     # the CloseCurrentDatabase below would otherwise shut down the user's
     # own work (issue #38).  The file does not exist yet, so a running
-    # instance can never match it: we always get our own process here.
+    # instance can never match it, but an idle user instance may be reused.
     if _Session._app is None:
         _Session._launch(resolved)
+    _Session._prepare_database_target(resolved)
     app = _Session._app
     # Close any previously open DB
     if _Session._db_open is not None:

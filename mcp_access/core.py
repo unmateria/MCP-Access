@@ -39,11 +39,27 @@ log = logging.getLogger("access-mcp")
 # COM thread pool -- single thread so all COM calls stay in the same STA.
 # ---------------------------------------------------------------------------
 
+_com_thread_state = threading.local()
+
+
 def _com_thread_init():
     """Initializer for the COM worker thread -- calls CoInitialize once."""
     import pythoncom
     pythoncom.CoInitialize()
+    _com_thread_state.initialized = True
     log.info("COM thread initialized (thread=%s)", threading.current_thread().name)
+
+
+def shutdown_com_thread() -> None:
+    """Release COM proxies and balance CoInitialize on the owning STA."""
+    if not getattr(_com_thread_state, "initialized", False):
+        return
+    import pythoncom
+    try:
+        _Session.quit()
+    finally:
+        _com_thread_state.initialized = False
+        pythoncom.CoUninitialize()
 
 _com_executor = concurrent.futures.ThreadPoolExecutor(
     max_workers=1,
@@ -289,7 +305,8 @@ def _shared_open_advisory(path: str, holders: list) -> str:
 def _get_com_pid(app) -> Optional[int]:
     """Get the PID of the Access process behind a COM object via its window handle."""
     try:
-        hwnd = app.hWndAccessApp()
+        window = app.hWndAccessApp
+        hwnd = window() if callable(window) else window
         if not hwnd:
             return None
         pid = ctypes.c_ulong()
@@ -300,13 +317,33 @@ def _get_com_pid(app) -> Optional[int]:
 
 
 def _wait_pid_gone(pid: int, timeout: float = 10.0) -> bool:
-    """Poll until a PID no longer appears in the process list.  Returns True if gone."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if pid not in _list_msaccess_pids():
+    """Wait for process exit while keeping the calling COM apartment responsive."""
+    import pythoncom
+    import pywintypes
+    import win32api
+    import win32event
+
+    try:
+        handle = win32api.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+    except pywintypes.error as exc:
+        if exc.winerror == 87:  # ERROR_INVALID_PARAMETER: process already gone
             return True
-        time.sleep(0.3)
-    return pid not in _list_msaccess_pids()
+        raise RuntimeError(f"Could not verify Access PID {pid} exit: {exc}") from exc
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            result = win32event.WaitForSingleObject(handle, 0)
+            if result == win32event.WAIT_OBJECT_0:
+                return True
+            if result != win32event.WAIT_TIMEOUT:
+                raise RuntimeError(f"Unexpected wait result for Access PID {pid}: {result}")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            pythoncom.PumpWaitingMessages()
+            time.sleep(min(0.05, remaining))
+    finally:
+        handle.Close()
 
 
 def _list_msaccess_pids() -> set[int]:
@@ -339,11 +376,11 @@ def _list_msaccess_pids() -> set[int]:
 class _Session:
     """
     Maintains a single Access.Application instance across tool calls.
-    If a different DB is requested, closes the current one and opens the new one.
+    Switching databases closes the current one only in MCP-owned instances.
     """
     _app: Optional[Any] = None
     _db_open: Optional[str] = None
-    _pid: Optional[int] = None  # captured in _launch() on the COM worker thread (atexit can't query COM)
+    _pid: Optional[int] = None  # captured in _launch() on the COM worker thread
     _wd_thread: Optional[Any] = None  # global dialog watchdog thread
     _wd_stop: Optional[Any] = None    # threading.Event to stop the watchdog
     _cm_cache: dict = {}   # "type:name" -> CodeModule COM object
@@ -405,6 +442,8 @@ class _Session:
                         cls._force_cleanup()
         if cls._app is None:
             cls._launch(resolved)
+        if cls._attached:
+            cls._prepare_database_target(resolved)
         if cls._db_open != resolved:
             cls._switch(resolved)
         return cls._app
@@ -604,10 +643,7 @@ class _Session:
             cls._app.Visible = True   # required for VBE to be accessible via COM
         except Exception as e:
             log.warning("Could not set Visible=True: %s (continuing anyway)", e)
-        # Capture PID HERE on the COM worker thread.  quit() runs in the atexit
-        # main thread where cross-thread COM calls return RPC_E_WRONG_THREAD,
-        # so re-querying the proxy from quit() would silently return None and
-        # disable the taskkill fallback below.
+        # Capture the process identity while the COM proxy is available.
         cls._pid = _get_com_pid(cls._app)
         log.info("Access PID captured: %s (attached=%s)", cls._pid, cls._attached)
         # One-shot Office install detection — populates _office_version and
@@ -699,10 +735,24 @@ class _Session:
         # the MCP_ACCESS_SHIFT_BYPASS opt-out.
         shift_held = _press_shift_bypass("/decompile")
 
-        proc = subprocess.Popen(
-            [msaccess, path, "/decompile"],
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
-        )
+        try:
+            proc = subprocess.Popen(
+                [msaccess, path, "/decompile"],
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            )
+        except Exception as exc:
+            if shift_held:
+                _release_shift()
+            if cls._attached and cls._app is not None:
+                try:
+                    cls._switch(resolved_target)
+                except Exception as reopen_exc:
+                    raise RuntimeError(
+                        f"Could not start /decompile ({exc}); the user's Access "
+                        f"instance remains open, but its database could not be "
+                        f"reopened ({reopen_exc})."
+                    ) from exc
+            raise RuntimeError(f"Could not start /decompile: {exc}") from exc
 
         # Polling loop: 16 × 0.5s = 8s total.  Release SHIFT at ~3s mark
         # and poll for any blocking dialogs (wizards, recovery prompts)
@@ -923,9 +973,47 @@ class _Session:
         return bool(current) and os.path.normcase(str(current)) == os.path.normcase(path)
 
     @classmethod
+    def _prepare_database_target(cls, path: str) -> None:
+        """Leave a user's occupied instance alone when opening another database."""
+        if cls._app is None or not cls._attached:
+            return
+        # Read live state: the user may have changed databases since our last call.
+        current = None
+        db_read_error = None
+        try:
+            db = cls._app.CurrentDb()
+            if db is not None:
+                current = str(Path(db.Name).resolve())
+            db = None
+        except Exception as exc:
+            db_read_error = exc
+        if current is None:
+            try:
+                project_path = cls._app.CurrentProject.FullName
+                if project_path:
+                    current = str(Path(project_path).resolve())
+            except Exception:
+                if db_read_error is not None:
+                    raise RuntimeError(
+                        "Cannot safely determine which database the attached "
+                        "Access instance has open; leaving it untouched."
+                    ) from db_read_error
+        cls._db_open = current
+        if current and os.path.normcase(current) != os.path.normcase(path):
+            log.info("Leaving attached database %s open; launching for %s", current, path)
+            cls._force_cleanup()
+            cls._launch(path)
+
+    @classmethod
     def _switch(cls, path: str) -> None:
         if not os.path.isfile(path):
             raise FileNotFoundError(f"File not found: {path}")
+
+        cls._prepare_database_target(path)
+        if cls._attached and cls._db_open is not None:
+            # The live database already matches; do not close/reopen user work.
+            cls._db_open = path
+            return
 
         exclusive = exclusive_open_enabled()   # read once — used either side of the open
 
@@ -1150,57 +1238,61 @@ class _Session:
         log.info("DB opened OK")
 
     @classmethod
-    def quit(cls) -> None:
+    def quit(cls) -> str:
         cls._stop_dialog_watchdog()
-        if cls._app is not None:
-            if cls._attached:
-                log.info("Releasing attached Access.Application (not quitting user's session)")
-                cls._app = None
-                cls._db_open = None
-                cls._pid = None
-                cls._attached = False
-                cls._cm_cache.clear()
-                cls._decompiled_dbs.clear()
-                _parsed_controls_cache.clear()
-                return
-            _release_shift()
-            pid = cls._pid  # captured in _launch() on the COM worker; safe across threads
-            log.info("Closing Access (PID %s)...", pid)
+        _release_shift()
+        attached = cls._attached
+        pid = cls._pid
+        app = cls._app
+        quit_error = None
+        # Child proxies can keep an owned Access process alive after Quit.
+        cls._cm_cache.clear()
+        _parsed_controls_cache.clear()
+        try:
+            if app is None:
+                return "No Access session is connected."
+            if attached:
+                return "MCP disconnected. The user's Access instance remains open."
+            log.info("Closing owned Access (PID %s)...", pid)
             try:
-                if cls._db_open:
-                    cls._app.CloseCurrentDatabase()
-                cls._app.Quit()
-            except Exception as e:
-                log.warning("Error during Access Quit(): %s", e)
-            finally:
-                cls._app = None
-                cls._db_open = None
-                cls._pid = None
-                cls._attached = False
-                cls._cm_cache.clear()
-                cls._decompiled_dbs.clear()
-                _parsed_controls_cache.clear()
-            if pid:
-                if _wait_pid_gone(pid, timeout=10.0):
-                    log.info("Access PID %s exited cleanly", pid)
-                else:
-                    log.warning("Access PID %s still alive after 10s — killing", pid)
-                    try:
-                        subprocess.run(
-                            ["taskkill", "/F", "/T", "/PID", str(pid)],
-                            capture_output=True, timeout=5,
-                        )
-                        _wait_pid_gone(pid, timeout=3.0)
-                    except Exception as e:
-                        log.warning("taskkill failed for PID %s: %s", pid, e)
-                # Let Windows release file locks
-                time.sleep(0.5)
-            else:
-                time.sleep(1.0)
-            log.info("Access closed OK")
+                app.Quit()
+            except Exception as exc:
+                quit_error = exc
+        finally:
+            cls._force_cleanup()
+            app = None
 
-
-atexit.register(_Session.quit)
+        if not pid:
+            if quit_error is not None:
+                raise RuntimeError(
+                    "Could not quit the owned Access instance, and its process "
+                    f"exit could not be verified because the PID is unavailable: {quit_error}"
+                ) from quit_error
+            message = "Access Quit requested, but process exit could not be verified (PID unavailable)."
+            log.warning(message)
+            return message
+        try:
+            exited = _wait_pid_gone(pid, timeout=10.0)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not verify whether owned Access PID {pid} exited: {exc}"
+            ) from exc
+        if not exited:
+            if quit_error is not None:
+                raise RuntimeError(
+                    f"Could not quit the owned Access instance ({quit_error}); "
+                    f"PID {pid} is still running. It was not force-killed."
+                ) from quit_error
+            raise RuntimeError(
+                f"Owned Access PID {pid} did not exit within 10 seconds after Quit. "
+                "It was not force-killed. Check Access for pending dialogs or external COM references."
+            )
+        if quit_error is not None:
+            raise RuntimeError(
+                f"Access PID {pid} exited, but Application.Quit reported an error: {quit_error}"
+            ) from quit_error
+        log.info("Access PID %s exited cleanly", pid)
+        return "Access session closed; owned Access process exited successfully."
 
 
 def _get_vb_project(app):

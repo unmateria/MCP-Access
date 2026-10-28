@@ -92,7 +92,7 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 | Tool | Description |
 |------|-------------|
 | `access_create_database` | Create a new empty `.accdb` database file |
-| `access_close` | Close the COM session and release the `.accdb` file |
+| `access_close` | Disconnect MCP; leave user-owned Access open, quit only an MCP-created instance |
 
 ### Database objects
 
@@ -282,7 +282,7 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 2. access_vbe_module_info   → get procedure list and line numbers
 3. access_vbe_get_proc      → read the specific procedure
 4. access_vbe_replace_lines → apply targeted line-level changes
-5. access_close             → release the file when done
+5. access_close             → disconnect; leave user-owned Access open
 ```
 
 ### Full object replacement (forms, reports, modules)
@@ -372,8 +372,9 @@ single visible failure when the database is opened.
 It is off by default because it is genuinely exclusive: the session holds the
 database between tool calls, so while the server is connected **nobody else can
 open it**. That is right for a build or a development machine and wrong for a
-shared front-end. `access_close` releases the database without stopping the
-server.
+shared front-end. `access_close` disconnects the MCP session; an MCP-owned
+Access instance is quit, while a user-owned instance and its database remain
+open.
 
 The switch also verifies the mode instead of trusting it. Access treats
 `Exclusive:=True` as a request: with the file already in use it opens it
