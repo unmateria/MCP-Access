@@ -998,6 +998,20 @@ class _Session:
                         "Cannot safely determine which database the attached "
                         "Access instance has open; leaving it untouched."
                     ) from db_read_error
+        previous = cls._db_open
+        if (
+            previous
+            and current
+            and os.path.normcase(str(Path(previous).resolve()))
+            != os.path.normcase(current)
+        ):
+            log.info(
+                "Attached Access database changed from %s to %s; invalidating COM caches",
+                previous,
+                current,
+            )
+            cls._cm_cache.clear()
+            _parsed_controls_cache.clear()
         cls._db_open = current
         if current and os.path.normcase(current) != os.path.normcase(path):
             log.info("Leaving attached database %s open; launching for %s", current, path)

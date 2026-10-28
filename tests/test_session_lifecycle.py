@@ -126,6 +126,29 @@ def test_same_attached_database_is_not_closed(session, tmp_path):
     assert session._db_open == str(target)
 
 
+def test_manual_switch_to_requested_database_invalidates_stale_caches(
+    session, tmp_path,
+):
+    database_a = tmp_path / "database_a.accdb"
+    database_b = tmp_path / "database_b.accdb"
+    app = Mock()
+    app.Visible = True
+    app.CurrentDb.return_value = SimpleNamespace(Name=str(database_b))
+    session._app = app
+    session._attached = True
+    session._db_open = str(database_a)
+    session._cm_cache["module:modSharedName"] = object()
+    core._parsed_controls_cache["form:frmSharedName"] = {"source": "database A"}
+
+    assert session.connect(str(database_b)) is app
+
+    assert session._db_open == str(database_b)
+    assert not session._cm_cache
+    assert not core._parsed_controls_cache
+    app.CloseCurrentDatabase.assert_not_called()
+    app.OpenCurrentDatabase.assert_not_called()
+
+
 def test_attached_database_can_be_reopened_when_currentdb_is_unavailable(
     session, monkeypatch, tmp_path,
 ):
