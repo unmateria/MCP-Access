@@ -9,13 +9,16 @@ Adapted from [Sachin's lifecycle proposal](https://github.com/lunasoft2001/MCP-A
 - Release the session and balance COM initialization on the dedicated worker
   when the stdio server exits, including transport errors.
 - Keep attached user-owned databases open when switching targets or creating
-  another database, preserving the existing attach-or-spawn policy.
+  another database; reuse an idle attached instance for subsequent switches
+  when the MCP itself opened its current database.
 - Clear child proxies before quitting an MCP-owned instance, pump STA messages
-  while waiting for its PID to exit, and report a timeout without force-killing.
+  while the dialog watchdog remains active, and force-terminate only an
+  MCP-owned process that remains after the 10-second graceful shutdown wait.
 - Return accurate disconnect/quit messages from `access_close`; an attached
   instance (including an initially idle one) remains open after disconnect.
 - Add mocked lifecycle regression tests. Explicit compile/decompile and
-  maintenance behavior is unchanged.
+  maintenance behavior is unchanged. Restore an attached database if launching
+  the `/decompile` subprocess fails.
 
 ## 0.7.64 — 2026-10-08
 

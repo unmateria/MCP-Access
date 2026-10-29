@@ -49,11 +49,10 @@ def ac_create_database(db_path: str) -> dict:
         raise FileExistsError(
             f"'{resolved}' already exists. Use access_execute_sql to modify it."
         )
-    # Ensure Access is running.  Passing the target keeps _launch from
-    # attaching to an Access instance that has a different database open —
-    # the CloseCurrentDatabase below would otherwise shut down the user's
-    # own work (issue #38).  The file does not exist yet, so a running
-    # instance can never match it, but an idle user instance may be reused.
+    # Ensure Access is running. Passing the target keeps _launch from attaching
+    # to an Access instance that has a different database open. The live-state
+    # check below reuses an attached instance only when its current database
+    # was opened by this MCP session.
     if _Session._app is None:
         _Session._launch(resolved)
     _Session._prepare_database_target(resolved)
@@ -65,6 +64,7 @@ def ac_create_database(db_path: str) -> dict:
         except Exception:
             pass
         _Session._db_open = None
+        _Session._opened_in_attached = None
     try:
         app.NewCurrentDatabase(resolved)
     except Exception as exc:
@@ -91,12 +91,16 @@ def ac_create_database(db_path: str) -> dict:
         pass
     if not db_alive:
         _Session._db_open = None
+        _Session._opened_in_attached = None
         raise RuntimeError(
             f"Database file was created at {resolved} but could not be "
             "reopened afterwards. Open it with access_execute_sql or "
             "access_list_objects to continue working with it."
         )
     _Session._db_open = resolved
+    _Session._opened_in_attached = (
+        resolved if _Session._attached else None
+    )
     invalidate_all_caches()
     size = os.path.getsize(resolved) if os.path.exists(resolved) else 0
     return {"db_path": resolved, "status": "created", "size_bytes": size}

@@ -374,7 +374,9 @@ database between tool calls, so while the server is connected **nobody else can
 open it**. That is right for a build or a development machine and wrong for a
 shared front-end. `access_close` disconnects the MCP session; an MCP-owned
 Access instance is quit, while a user-owned instance and its database remain
-open.
+open. If an MCP-owned instance does not exit within 10 seconds, the server
+terminates that process as a last resort; it never force-terminates an
+instance attached from the user's Access session.
 
 The switch also verifies the mode instead of trusting it. Access treats
 `Exclusive:=True` as a request: with the file already in use it opens it

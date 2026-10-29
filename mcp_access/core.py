@@ -386,6 +386,7 @@ class _Session:
     _cm_cache: dict = {}   # "type:name" -> CodeModule COM object
     _decompiled_dbs: set = set()  # DBs already decompiled in this session
     _attached: bool = False  # True if we attached via GetActiveObject; False if we spawned via DispatchEx
+    _opened_in_attached: Optional[str] = None  # DB opened by MCP in an attached instance
     # time.monotonic() when a tool call entered the COM executor; None when
     # idle.  Set/cleared by server.call_tool around run_in_executor.  Lets the
     # global dialog watchdog distinguish a modal raised by OUR blocked COM
@@ -449,14 +450,16 @@ class _Session:
         return cls._app
 
     @classmethod
-    def _force_cleanup(cls):
+    def _force_cleanup(cls, stop_dialog_watchdog: bool = True):
         """Reset state without calling methods on a dead COM object."""
-        cls._stop_dialog_watchdog()
+        if stop_dialog_watchdog:
+            cls._stop_dialog_watchdog()
         _release_shift()
         cls._app = None
         cls._db_open = None
         cls._pid = None
         cls._attached = False
+        cls._opened_in_attached = None
         cls._cm_cache.clear()
         cls._decompiled_dbs.clear()
         _parsed_controls_cache.clear()
@@ -560,6 +563,7 @@ class _Session:
         attach-anything behaviour for callers with no destination.
         """
         cls._suppress_recovery_dialog()
+        cls._opened_in_attached = None
         try:
             import win32com.client
         except ImportError:
@@ -999,6 +1003,7 @@ class _Session:
                         "Access instance has open; leaving it untouched."
                     ) from db_read_error
         previous = cls._db_open
+        opened_in_attached = cls._opened_in_attached
         if (
             previous
             and current
@@ -1012,11 +1017,32 @@ class _Session:
             )
             cls._cm_cache.clear()
             _parsed_controls_cache.clear()
+        if opened_in_attached and (
+            not current
+            or os.path.normcase(str(Path(opened_in_attached).resolve()))
+            != os.path.normcase(current)
+        ):
+            cls._opened_in_attached = None
         cls._db_open = current
         if current and os.path.normcase(current) != os.path.normcase(path):
-            log.info("Leaving attached database %s open; launching for %s", current, path)
-            cls._force_cleanup()
-            cls._launch(path)
+            if (
+                opened_in_attached
+                and os.path.normcase(str(Path(opened_in_attached).resolve()))
+                == os.path.normcase(current)
+            ):
+                log.info(
+                    "Switching MCP-opened database %s to %s in the attached instance",
+                    current,
+                    path,
+                )
+            else:
+                log.info(
+                    "Leaving attached database %s open; launching for %s",
+                    current,
+                    path,
+                )
+                cls._force_cleanup()
+                cls._launch(path)
 
     @classmethod
     def _switch(cls, path: str) -> None:
@@ -1024,7 +1050,12 @@ class _Session:
             raise FileNotFoundError(f"File not found: {path}")
 
         cls._prepare_database_target(path)
-        if cls._attached and cls._db_open is not None:
+        if (
+            cls._attached
+            and cls._db_open is not None
+            and os.path.normcase(str(Path(cls._db_open).resolve()))
+            == os.path.normcase(str(Path(path).resolve()))
+        ):
             # The live database already matches; do not close/reopen user work.
             cls._db_open = path
             return
@@ -1059,6 +1090,7 @@ class _Session:
                 cls._app.CloseCurrentDatabase()
             except Exception as e:
                 log.warning("Error closing previous DB: %s", e)
+            cls._opened_in_attached = None
         log.info("Opening DB%s: %s", " EXCLUSIVELY" if exclusive else "", path)
 
         cls._suppress_recovery_dialog()
@@ -1233,6 +1265,9 @@ class _Session:
                       "database was already in use"))
 
         cls._db_open = path
+        cls._opened_in_attached = (
+            str(Path(path).resolve()) if cls._attached else None
+        )
 
         # Close any auto-opened forms (safety net)
         try:
@@ -1253,7 +1288,6 @@ class _Session:
 
     @classmethod
     def quit(cls) -> str:
-        cls._stop_dialog_watchdog()
         _release_shift()
         attached = cls._attached
         pid = cls._pid
@@ -1262,6 +1296,8 @@ class _Session:
         # Child proxies can keep an owned Access process alive after Quit.
         cls._cm_cache.clear()
         _parsed_controls_cache.clear()
+        if app is None or attached:
+            cls._stop_dialog_watchdog()
         try:
             if app is None:
                 return "No Access session is connected."
@@ -1273,40 +1309,86 @@ class _Session:
             except Exception as exc:
                 quit_error = exc
         finally:
-            cls._force_cleanup()
+            cls._force_cleanup(stop_dialog_watchdog=False)
             app = None
 
-        if not pid:
-            if quit_error is not None:
-                raise RuntimeError(
-                    "Could not quit the owned Access instance, and its process "
-                    f"exit could not be verified because the PID is unavailable: {quit_error}"
-                ) from quit_error
-            message = "Access Quit requested, but process exit could not be verified (PID unavailable)."
-            log.warning(message)
-            return message
         try:
-            exited = _wait_pid_gone(pid, timeout=10.0)
-        except Exception as exc:
-            raise RuntimeError(
-                f"Could not verify whether owned Access PID {pid} exited: {exc}"
-            ) from exc
-        if not exited:
+            if not pid:
+                if quit_error is not None:
+                    raise RuntimeError(
+                        "Could not quit the owned Access instance, and its process "
+                        "exit could not be verified because the PID is unavailable: "
+                        f"{quit_error}"
+                    ) from quit_error
+                message = (
+                    "Access Quit requested, but process exit could not be verified "
+                    "(PID unavailable)."
+                )
+                log.warning(message)
+                return message
+            try:
+                exited = _wait_pid_gone(pid, timeout=10.0)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Could not verify whether owned Access PID {pid} exited: {exc}"
+                ) from exc
+            if not exited:
+                log.warning(
+                    "Owned Access PID %s did not exit within 10 seconds; "
+                    "terminating the MCP-owned process",
+                    pid,
+                )
+                try:
+                    result = subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(pid)],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    raise RuntimeError(
+                        f"Owned Access PID {pid} did not exit within 10 seconds, "
+                        f"and taskkill could not terminate it: {exc}"
+                    ) from exc
+                if result.returncode != 0:
+                    detail = result.stderr.strip() or result.stdout.strip()
+                    if not detail:
+                        detail = f"taskkill exited with code {result.returncode}"
+                    raise RuntimeError(
+                        f"Owned Access PID {pid} did not exit within 10 seconds, "
+                        f"and taskkill failed: {detail}"
+                    )
+                try:
+                    terminated = _wait_pid_gone(pid, timeout=5.0)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"taskkill completed for owned Access PID {pid}, but its "
+                        f"exit could not be verified: {exc}"
+                    ) from exc
+                if not terminated:
+                    raise RuntimeError(
+                        f"taskkill reported success, but owned Access PID {pid} "
+                        "is still running."
+                    )
+                if quit_error is not None:
+                    raise RuntimeError(
+                        f"Owned Access PID {pid} did not exit within 10 seconds "
+                        "and was terminated with taskkill; Application.Quit "
+                        f"reported an error: {quit_error}"
+                    ) from quit_error
+                return (
+                    f"Owned Access PID {pid} did not exit within 10 seconds; "
+                    "the MCP-owned process was terminated with taskkill."
+                )
             if quit_error is not None:
                 raise RuntimeError(
-                    f"Could not quit the owned Access instance ({quit_error}); "
-                    f"PID {pid} is still running. It was not force-killed."
+                    f"Access PID {pid} exited, but Application.Quit reported "
+                    f"an error: {quit_error}"
                 ) from quit_error
-            raise RuntimeError(
-                f"Owned Access PID {pid} did not exit within 10 seconds after Quit. "
-                "It was not force-killed. Check Access for pending dialogs or external COM references."
-            )
-        if quit_error is not None:
-            raise RuntimeError(
-                f"Access PID {pid} exited, but Application.Quit reported an error: {quit_error}"
-            ) from quit_error
-        log.info("Access PID %s exited cleanly", pid)
-        return "Access session closed; owned Access process exited successfully."
+            log.info("Access PID %s exited cleanly", pid)
+            return "Access session closed; owned Access process exited successfully."
+        finally:
+            cls._stop_dialog_watchdog()
 
 
 def _get_vb_project(app):

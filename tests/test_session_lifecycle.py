@@ -4,7 +4,7 @@ import asyncio
 import concurrent.futures
 import threading
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -16,6 +16,7 @@ def session(monkeypatch):
     for name, value in (
         ("_app", None), ("_db_open", None), ("_pid", None),
         ("_attached", False), ("_cm_cache", {}),
+        ("_opened_in_attached", None),
         ("_decompiled_dbs", set()), ("_shared_open_warning", None),
     ):
         monkeypatch.setattr(core._Session, name, value)
@@ -25,22 +26,29 @@ def session(monkeypatch):
     return core._Session
 
 
-def test_attached_disconnect_preserves_database_and_clears_proxies(session):
+def test_attached_disconnect_preserves_database_and_clears_proxies(
+    session, monkeypatch,
+):
     app = Mock()
     session._app = app
     session._attached = True
     session._db_open = "example.accdb"
     session._pid = 1234
+    session._opened_in_attached = "example.accdb"
     session._cm_cache["module:modExample"] = object()
     core._parsed_controls_cache["form:frmOrders"] = {}
+    run = Mock()
+    monkeypatch.setattr(core.subprocess, "run", run)
 
     result = session.quit()
 
     app.CloseCurrentDatabase.assert_not_called()
     app.Quit.assert_not_called()
+    run.assert_not_called()
     assert "remains open" in result
     assert session._app is None
     assert session._pid is None
+    assert session._opened_in_attached is None
     assert not session._cm_cache
     assert not core._parsed_controls_cache
 
@@ -69,20 +77,72 @@ def test_owned_quit_releases_children_before_quit_and_app_before_wait(session, m
     assert session._pid is None
 
 
-def test_owned_timeout_is_reported_without_killing(session, monkeypatch):
+def test_owned_timeout_terminates_process_after_graceful_quit_timeout(
+    session, monkeypatch,
+):
     app = Mock()
     session._app = app
     session._pid = 1234
-    monkeypatch.setattr(core, "_wait_pid_gone", Mock(return_value=False))
-    run = Mock()
+    wait = Mock(side_effect=[False, True])
+    monkeypatch.setattr(core, "_wait_pid_gone", wait)
+    run = Mock(return_value=SimpleNamespace(returncode=0, stdout="", stderr=""))
     monkeypatch.setattr(core.subprocess, "run", run)
 
-    with pytest.raises(RuntimeError, match="did not exit within 10 seconds"):
-        session.quit()
+    result = session.quit()
 
-    run.assert_not_called()
+    assert "did not exit within 10 seconds" in result
+    assert "terminated with taskkill" in result
+    run.assert_called_once_with(
+        ["taskkill", "/F", "/T", "/PID", "1234"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert wait.call_args_list == [
+        call(1234, timeout=10.0),
+        call(1234, timeout=5.0),
+    ]
     assert session._app is None
     assert session._pid is None
+
+
+def test_attached_instance_reuses_database_opened_by_mcp(
+    session, monkeypatch, tmp_path,
+):
+    database_a = tmp_path / "database_a.accdb"
+    database_b = tmp_path / "database_b.accdb"
+    database_a.touch()
+    database_b.touch()
+    current = [None]
+    app = Mock()
+    app.Visible = True
+    app.CurrentDb.side_effect = lambda: (
+        SimpleNamespace(Name=current[0]) if current[0] else None
+    )
+    app.CloseCurrentDatabase.side_effect = lambda: current.__setitem__(0, None)
+    app.OpenCurrentDatabase.side_effect = lambda path: current.__setitem__(0, path)
+    app.Forms.Count = 0
+    app.hWndAccessApp = 0
+    session._app = app
+    session._attached = True
+    monkeypatch.delenv("MCP_ACCESS_EXCLUSIVE", raising=False)
+    monkeypatch.setattr(core, "_lock_file_in_use", lambda path: False)
+    monkeypatch.setattr(core, "_press_shift_bypass", lambda context: False)
+    monkeypatch.setattr(session, "_suppress_recovery_dialog", Mock())
+    launch = Mock()
+    monkeypatch.setattr(session, "_launch", launch)
+
+    assert session.connect(str(database_a)) is app
+    assert session._opened_in_attached == str(database_a)
+    assert session.connect(str(database_b)) is app
+
+    launch.assert_not_called()
+    app.CloseCurrentDatabase.assert_called_once_with()
+    assert app.OpenCurrentDatabase.call_args_list == [
+        call(str(database_a)),
+        call(str(database_b)),
+    ]
+    assert session._opened_in_attached == str(database_b)
 
 
 def test_quit_failure_is_not_reported_as_success(session):
@@ -97,13 +157,42 @@ def test_quit_failure_still_checks_if_process_exited(session, monkeypatch):
     session._app = Mock()
     session._app.Quit.side_effect = OSError("quit failed")
     session._pid = 1234
-    wait = Mock(return_value=False)
+    wait = Mock(side_effect=[False, False])
     monkeypatch.setattr(core, "_wait_pid_gone", wait)
+    run = Mock(return_value=SimpleNamespace(returncode=0, stdout="", stderr=""))
+    monkeypatch.setattr(core.subprocess, "run", run)
 
-    with pytest.raises(RuntimeError, match="PID 1234 is still running"):
+    with pytest.raises(RuntimeError, match="still running"):
         session.quit()
 
-    wait.assert_called_once_with(1234, timeout=10.0)
+    assert wait.call_args_list == [
+        call(1234, timeout=10.0),
+        call(1234, timeout=5.0),
+    ]
+    run.assert_called_once()
+
+
+def test_owned_quit_keeps_dialog_watchdog_running_until_pid_wait_finishes(
+    session, monkeypatch,
+):
+    events = []
+    app = Mock()
+    session._app = app
+    session._pid = 1234
+    app.Quit.side_effect = lambda: events.append("quit")
+    stop_watchdog = Mock(side_effect=lambda: events.append("stop"))
+    monkeypatch.setattr(session, "_stop_dialog_watchdog", stop_watchdog)
+
+    def wait(pid, timeout):
+        assert events == ["quit"]
+        events.append("wait")
+        return True
+
+    monkeypatch.setattr(core, "_wait_pid_gone", wait)
+
+    assert "exited" in session.quit()
+
+    assert events == ["quit", "wait", "stop"]
 
 
 def test_unknown_pid_is_not_reported_as_verified_exit(session):
@@ -287,6 +376,35 @@ def test_create_does_not_close_attached_database(session, monkeypatch, tmp_path)
     app.CloseCurrentDatabase.assert_not_called()
     app.NewCurrentDatabase.assert_not_called()
     launch.assert_called_once_with(target)
+
+
+def test_create_database_tracks_new_database_in_attached_instance(
+    session, monkeypatch, tmp_path,
+):
+    previous = tmp_path / "mcp_opened.accdb"
+    previous.touch()
+    target = tmp_path / "created.accdb"
+    current = [str(previous)]
+    app = Mock()
+    app.CurrentDb.side_effect = lambda: (
+        SimpleNamespace(Name=current[0]) if current[0] else None
+    )
+    app.CurrentProject.FullName = ""
+    app.CloseCurrentDatabase.side_effect = lambda: current.__setitem__(0, None)
+    app.NewCurrentDatabase.side_effect = lambda path: current.__setitem__(0, path)
+    app.OpenCurrentDatabase.side_effect = lambda path: current.__setitem__(0, path)
+    session._app = app
+    session._attached = True
+    session._db_open = str(previous)
+    session._opened_in_attached = str(previous)
+
+    result = database.ac_create_database(str(target))
+
+    assert result["db_path"] == str(target)
+    assert session._db_open == str(target)
+    assert session._opened_in_attached == str(target)
+    assert app.CloseCurrentDatabase.call_count == 2
+    app.NewCurrentDatabase.assert_called_once_with(str(target))
 
 
 def test_shutdown_balances_com_on_worker_thread(session, monkeypatch):
