@@ -16,7 +16,7 @@ def session(monkeypatch):
     for name, value in (
         ("_app", None), ("_db_open", None), ("_pid", None),
         ("_attached", False), ("_cm_cache", {}),
-        ("_opened_in_attached", None),
+        ("_opened_in_attached", None), ("_user_db_in_attached", None),
         ("_decompiled_dbs", set()), ("_shared_open_warning", None),
     ):
         monkeypatch.setattr(core._Session, name, value)
@@ -143,6 +143,53 @@ def test_attached_instance_reuses_database_opened_by_mcp(
         call(str(database_b)),
     ]
     assert session._opened_in_attached == str(database_b)
+
+
+def test_users_database_reopened_after_maintenance_close_stays_users(
+    session, monkeypatch, tmp_path,
+):
+    users_db = tmp_path / "users.accdb"
+    other_db = tmp_path / "other.accdb"
+    users_db.touch()
+    other_db.touch()
+    current = [str(users_db)]
+    app = Mock()
+    app.Visible = True
+    app.CurrentDb.side_effect = lambda: (
+        SimpleNamespace(Name=current[0]) if current[0] else None
+    )
+    app.CurrentProject.FullName = ""
+    app.CloseCurrentDatabase.side_effect = lambda: current.__setitem__(0, None)
+    app.OpenCurrentDatabase.side_effect = lambda path: current.__setitem__(0, path)
+    app.Forms.Count = 0
+    app.hWndAccessApp = 0
+    session._app = app
+    session._attached = True
+    monkeypatch.delenv("MCP_ACCESS_EXCLUSIVE", raising=False)
+    monkeypatch.setattr(core, "_lock_file_in_use", lambda path: False)
+    monkeypatch.setattr(core, "_press_shift_bypass", lambda context: False)
+    monkeypatch.setattr(session, "_suppress_recovery_dialog", Mock())
+
+    session.connect(str(users_db))
+    # What compact/compile/decompile do before reopening through connect().
+    app.CloseCurrentDatabase()
+    session._db_open = None
+    session.connect(str(users_db))
+
+    assert current[0] == str(users_db)
+    assert session._opened_in_attached is None
+
+    class StopAfterLaunch(Exception):
+        pass
+
+    launch = Mock(side_effect=StopAfterLaunch)
+    monkeypatch.setattr(session, "_launch", launch)
+    with pytest.raises(StopAfterLaunch):
+        session.connect(str(other_db))
+
+    assert current[0] == str(users_db)
+    assert app.CloseCurrentDatabase.call_count == 1
+    launch.assert_called_once_with(str(other_db))
 
 
 def test_quit_failure_is_not_reported_as_success(session):
@@ -581,3 +628,30 @@ def test_server_cleans_up_on_worker_after_stdio_exit(session, monkeypatch, fail)
     assert events[0] != threading.get_ident()
     with pytest.raises(RuntimeError, match="shutdown"):
         executor.submit(lambda: None)
+
+
+@pytest.mark.parametrize(
+    "app, attached, pid, killed",
+    [
+        (object(), False, 1234, True),    # owned instance nobody closed
+        (object(), True, 1234, False),    # the user's Access: never
+        (None, False, 1234, False),       # already quit by the server
+        (object(), False, None, False),   # no PID to target
+    ],
+)
+def test_exit_safety_net_only_kills_an_unclosed_owned_instance(
+    session, monkeypatch, app, attached, pid, killed,
+):
+    session._app = app
+    session._attached = attached
+    session._pid = pid
+    run = Mock()
+    monkeypatch.setattr(core.subprocess, "run", run)
+
+    core._kill_orphaned_owned_instance()
+
+    if killed:
+        run.assert_called_once_with(["taskkill", "/F", "/T", "/PID", "1234"],
+                                    capture_output=True, timeout=10)
+    else:
+        run.assert_not_called()

@@ -387,6 +387,7 @@ class _Session:
     _decompiled_dbs: set = set()  # DBs already decompiled in this session
     _attached: bool = False  # True if we attached via GetActiveObject; False if we spawned via DispatchEx
     _opened_in_attached: Optional[str] = None  # DB opened by MCP in an attached instance
+    _user_db_in_attached: Optional[str] = None  # DB seen open by the user in that instance
     # time.monotonic() when a tool call entered the COM executor; None when
     # idle.  Set/cleared by server.call_tool around run_in_executor.  Lets the
     # global dialog watchdog distinguish a modal raised by OUR blocked COM
@@ -460,6 +461,7 @@ class _Session:
         cls._pid = None
         cls._attached = False
         cls._opened_in_attached = None
+        cls._user_db_in_attached = None
         cls._cm_cache.clear()
         cls._decompiled_dbs.clear()
         _parsed_controls_cache.clear()
@@ -564,6 +566,7 @@ class _Session:
         """
         cls._suppress_recovery_dialog()
         cls._opened_in_attached = None
+        cls._user_db_in_attached = None
         try:
             import win32com.client
         except ImportError:
@@ -1023,6 +1026,10 @@ class _Session:
             != os.path.normcase(current)
         ):
             cls._opened_in_attached = None
+        if current and cls._opened_in_attached is None:
+            # Remembered so that reopening it after a maintenance close
+            # (compile/compact/decompile) does not make it ours.
+            cls._user_db_in_attached = current
         cls._db_open = current
         if current and os.path.normcase(current) != os.path.normcase(path):
             if (
@@ -1265,8 +1272,15 @@ class _Session:
                       "database was already in use"))
 
         cls._db_open = path
+        resolved_path = str(Path(path).resolve())
+        user_db = cls._user_db_in_attached
         cls._opened_in_attached = (
-            str(Path(path).resolve()) if cls._attached else None
+            resolved_path
+            if cls._attached and not (
+                user_db
+                and os.path.normcase(user_db) == os.path.normcase(resolved_path)
+            )
+            else None
         )
 
         # Close any auto-opened forms (safety net)
@@ -1389,6 +1403,28 @@ class _Session:
             return "Access session closed; owned Access process exited successfully."
         finally:
             cls._stop_dialog_watchdog()
+
+
+def _kill_orphaned_owned_instance() -> None:
+    """Process-exit safety net for library use (scripts calling call_tool_sync).
+
+    The stdio server quits on the COM worker in main()'s finally, which leaves
+    _app None and makes this a no-op.  A script that dies without calling
+    access_close would otherwise leave an MCP-owned Access holding the file
+    lock forever.  No COM calls here: atexit may run on a foreign thread.
+    """
+    pid = _Session._pid
+    if _Session._app is None or _Session._attached or not pid:
+        return
+    log.warning("Process exiting with MCP-owned Access PID %s still open; terminating it", pid)
+    try:
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                       capture_output=True, timeout=10)
+    except Exception as exc:
+        log.warning("taskkill failed for PID %s: %s", pid, exc)
+
+
+atexit.register(_kill_orphaned_owned_instance)
 
 
 def _get_vb_project(app):

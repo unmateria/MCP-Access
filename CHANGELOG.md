@@ -1,8 +1,13 @@
 # Changelog
 
-## Unreleased
+## 0.7.65 — 2026-10-31
 
 ### Access session lifecycle
+
+**The MCP no longer closes your own database or quits your own Access.**
+Contributed in PR #42 by [@lunasoft2001](https://github.com/lunasoft2001)
+(Juanjo Luna), who also tested it against real Access: **thank you Juanjo**.
+No new tool (still **69**).
 
 Adapted from [Sachin's lifecycle proposal](https://github.com/lunasoft2001/MCP-Access/pull/1):
 
@@ -19,6 +24,21 @@ Adapted from [Sachin's lifecycle proposal](https://github.com/lunasoft2001/MCP-A
 - Add mocked lifecycle regression tests. Explicit compile/decompile and
   maintenance behavior is unchanged. Restore an attached database if launching
   the `/decompile` subprocess fails.
+
+Follow-ups found while verifying #42 on Access 2016:
+
+- **Compiling or compacting your database no longer made it the MCP's.**
+  Those operations close the database and reopen it through the normal path,
+  which marked it as opened by the MCP; asking for another database next
+  closed it in your Access window. The session now remembers the database it
+  found open there (`_user_db_in_attached`) and never claims it on reopen.
+- **A script that exits without `access_close` no longer leaves Access
+  running.** The server already quits on its own worker thread, but library
+  use (`call_tool_sync` from a script) had lost its exit hook, so a crash left
+  an MCP-owned Access holding the file lock. A COM-free `atexit` safety net now
+  terminates that instance by PID; it never touches an attached one.
+- `CLAUDE.md` described the ownership tracking as something not to do; it now
+  documents it, plus the remaining A→B→A limitation.
 
 ## 0.7.64 — 2026-10-08
 
